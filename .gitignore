@@ -1,0 +1,50 @@
+# ── 编译产物 ──
+*.o
+*.a
+*.so
+*.so.*
+*.ko
+*.elf
+*.bin
+*.map
+*.d
+obj/
+build/
+out/
+
+# ── 可执行文件(无扩展名, 按名字排除) ──
+ipc_camera
+sample_venc
+sample_vio
+rtp_test
+nalu_dump
+
+# ── 测试/调试产物 ──
+*.log
+*.h264
+*.h265
+*.mp4
+*.yuv
+*.pcm
+*.jpg
+*.png
+core
+core.*
+*.tmp
+
+# ── 编辑器/IDE ──
+.vscode/
+.idea/
+*.swp
+*~
+.cache/
+compile_commands.json
+
+# ── 系统 ──
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ── 本项目的临时脚本(重构/转换用, 不入库) ──
+_refactor.py
+_tmp*.py

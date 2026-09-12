@@ -1,0 +1,47 @@
+# ─────────────────────────────────────────────────────────────────────
+#  换行符策略 —— 强制 LF
+# ─────────────────────────────────────────────────────────────────────
+#
+# 为什么必须写这个文件:
+#   本机 Git 的 core.autocrlf = true(系统级), 会把文件在签出时转成 CRLF。
+#   而本项目目标平台是 Linux —— CRLF 会导致:
+#     · Makefile 报 "missing separator"
+#     · shell 脚本报 "bad interpreter: No such file or directory"
+#     · 交叉编译出的字符串常量里混入 \r
+#
+#   .gitattributes 的优先级高于 core.autocrlf, 所以这里锁死 LF 后
+#   无论在 Windows 还是 Linux 上签出, 得到的都是 LF。
+#
+# ─────────────────────────────────────────────────────────────────────
+
+# 所有文本文件: 仓库内存 LF, 签出也用 LF
+* text=auto eol=lf
+
+# ── C 源码 ──
+*.c      text eol=lf
+*.h      text eol=lf
+*.cpp    text eol=lf
+
+# ── 构建脚本(对 CRLF 最敏感) ──
+Makefile    text eol=lf
+*.mk        text eol=lf
+*.mak       text eol=lf
+*.sh        text eol=lf
+
+# ── 文档 ──
+*.md     text eol=lf
+*.txt    text eol=lf
+
+# ── 二进制(不做任何转换) ──
+*.png    binary
+*.jpg    binary
+*.jpeg   binary
+*.gif    binary
+*.mp4    binary
+*.h264   binary
+*.h265   binary
+*.a      binary
+*.so     binary
+*.o      binary
+*.ko     binary
+*.bin    binary
