@@ -83,11 +83,13 @@ Network
 
 ```c
 /* 发送抽象 —— 让 RTP 层不关心底层是 UDP 还是 TCP */
-typedef struct {
+typedef struct infra_sender infra_sender_t;   /* 不透明句柄, 定义在 infra_netio.h */
+
+struct infra_sender {
     int  (*send)(void *ctx, const void *buf, size_t len);
-    void (*destroy)(void *ctx);
+    void (*destroy)(infra_sender_t **ps);     /* 用法: s->destroy(&s); */
     void  *ctx;
-} infra_sender_t;
+};
 
 /* 两个实现 */
 infra_sender_t *infra_sender_udp(const struct sockaddr_in *dst, int sockfd);
@@ -98,6 +100,21 @@ infra_sender_t *infra_sender_tcp_interleaved(int fd, uint8_t rtp_channel);
 1. **协议逻辑与传输解耦** —— `proto_rtp.c` 只管打包,不管怎么发
 2. 将来加 TCP interleaved 只影响 `infra_netio.c`
 3. 单测时可以注入一个"计数 sender",统计发了多少字节而不用真发网络
+
+> **⚠️ `destroy` 为什么收 `infra_sender_t **` 而不是 `void *ctx`(2026-02-12 修订)**
+>
+> 初版签名是 `void (*destroy)(void *ctx)`,即要求调用方传 `s->ctx`。
+> 但调用方手上拿的是 `s`,**极易写成 `s->destroy(s)`** —— 本项目在 M1-6 单测里
+> 就真的这么写了, 结果 `free()` 了一个野指针, AddressSanitizer 报
+> `SEGV ... in tcp_destroy`。
+>
+> 改成收二级指针后:
+> - 调用方只需 `s->destroy(&s)`,**不可能传错**
+> - destroy 内部一次性完成"释放 ctx + 释放 sender 本身 + 把 `s` 置 NULL",
+>   **也不会漏掉释放 sender 本身**(初版签名下 sender 结构体会泄漏)
+>
+> **教训: 接口设计要顺着调用方的直觉,而不是要求调用方记住内部结构。**
+> 这类"用错就崩"的签名,靠注释是防不住的。
 
 ---
 
@@ -197,7 +214,8 @@ VENC 的编码缓冲有限(实测 `HI_MPI_VENC_GetStream` 后必须尽快 `Relea
 | `proto_sdp` | `sdp_build_video(buf, size, params)` | 无 |
 | `proto_rtsp` | `rtsp_parse_request()`, `rtsp_build_response()` | 无 |
 | `infra_queue` | `queue_create()`, `queue_push()`, `queue_pop()`, `queue_destroy()` | 无 |
-| `infra_netio` | `infra_sender_udp()`, `infra_sender_tcp_interleaved()` | 无 |
+| `infra_netio` | `infra_sender_udp()`, `infra_sender_tcp_interleaved()`, `infra_tcp_listen()`, `infra_udp_bind()` | 无 |
+| `infra_poll` | `infra_poller_create()`, `infra_poller_add()`, `infra_poller_wait()` | epoll(Linux) |
 | `infra_log` | `log_info()`, `log_warn()`, `log_error()` | 无 |
 | `bsp_mpp` | `bsp_mpp_init()`, `bsp_mpp_get_frame()`, `bsp_mpp_release_frame()` | MPP |
 | `svc_media` | `svc_media_start()`, `svc_media_stop()` | `bsp_mpp`, `proto_nalu` |
@@ -220,7 +238,7 @@ ipc_camera/
 │   ├── service/ svc_media.c/h  svc_net.c/h  svc_record.c/h
 │   ├── protocol/ proto_nalu.c/h  proto_rtp.c/h
 │   │             proto_sdp.c/h   proto_rtsp.c/h
-│   └── infra/   infra_queue.c/h  infra_netio.c/h  infra_log.c/h
+│   └── infra/   infra_queue.c/h  infra_netio.c/h  infra_poll.c/h  infra_log.c/h
 ├── tools/               ← 可在 PC 上原生编译的测试工具
 │   ├── nalu_dump.c
 │   ├── rtp_test.c
@@ -238,7 +256,9 @@ ipc_camera/
 | 1 | `proto_sdp.c` SDP 生成 | ✅ 能 |
 | 2 | `proto_rtsp.c` RTSP 解析/构造 | ✅ 能 |
 | 3 | `infra_queue.c` 环形队列 | ✅ 能 |
-| 4 | `infra_netio.c` 发送抽象 | ✅ 能 |
+| 4 | `infra_netio.c` 发送抽象 + socket 助手 | ✅ 能 |
+| 4b | `infra_poll.c` epoll 封装 | ✅ 能(需 Linux, 在 VM 上测) |
+| 4c | `infra_log.c` 分级日志 | ✅ 能 |
 | 5 | `svc_net.c` epoll 事件循环 | ⚠️ 部分 |
 | 6 | `bsp_mpp.c` + `svc_media.c` | ❌ 只能板上 |
 | 7 | `app_main.c` 集成 | ❌ |
