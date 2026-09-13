@@ -10,6 +10,7 @@
  */
 #include "proto_sdp.h"
 #include "proto_rtp.h"      /* 复用 PROTO_RTP_PT_H264 / PT_H265 与时钟频率 */
+#include "proto_str.h"      /* 与 proto_rtsp.c 共用的"整数转文本 + 追加"工具 */
 
 #include <string.h>
 
@@ -67,17 +68,12 @@ int proto_sdp_base64(const uint8_t *in, size_t in_len, char *out, size_t cap)
 
 /* ─────────────────── ② 带容量检查的追加助手 ─────────────────── */
 
-/** 就地把一行文本追加到缓冲; 超容量返回 -1。 */
-static int append(char *out, size_t cap, size_t *used, const char *text)
-{
-    size_t len = strlen(text);
-
-    if (*used + len + 1 > cap)
-        return -1;
-    memcpy(out + *used, text, len + 1);
-    *used += len;
-    return 0;
-}
+/*
+ * append / append_u32 只是给 proto_str_* 起个短名字 —— 本文件里调用次数很多,
+ * 短名字让模板部分更好读。真正的实现是共用的(见 proto_str.c)。
+ */
+#define append(out, cap, used, text)        proto_str_append((out), (cap), (used), (text))
+#define append_u32(out, cap, used, v)       proto_str_append_u32((out), (cap), (used), (v))
 
 /** 追加 "前缀 + Base64(参数集)"; 参数集为空时整行跳过。 */
 static int append_param(char *out, size_t cap, size_t *used,
@@ -101,22 +97,12 @@ static int append_param(char *out, size_t cap, size_t *used,
 /* ─────────────────── ③ 两套 SDP 模板 ─────────────────── */
 
 /**
- * 把载荷类型数字写成文本(动态 PT 只可能是 96~127, 所以最多三位)。
- * 之所以手写而不是 snprintf: 本模块保持"零依赖、零变参", 更容易单测。
+ * 把载荷类型数字追加到输出(动态 PT 只可能是 96~127)。
+ * @note 直接复用 proto_str_append_u32, 不再手写十进制转换。
  */
 static int append_pt(char *out, size_t cap, size_t *used, uint8_t pt)
 {
-    char num[4];
-    int  i = 0;
-
-    if (pt >= 100)
-        num[i++] = (char)('0' + pt / 100);
-    if (pt >= 10)
-        num[i++] = (char)('0' + (pt / 10) % 10);
-    num[i++] = (char)('0' + pt % 10);
-    num[i]   = '\0';
-
-    return append(out, cap, used, num);
+    return append_u32(out, cap, used, (uint32_t)pt);
 }
 
 /** 写入两个协议共有的头几行(v= o= s= c= t= m=)。 */

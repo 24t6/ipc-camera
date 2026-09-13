@@ -20,6 +20,7 @@ rtp_test
 nalu_dump
 rtp_header_dump
 sdp_test
+rtsp_test
 
 # ── 测试/调试产物 ──
 *.log
