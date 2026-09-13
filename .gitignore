@@ -18,6 +18,8 @@ sample_venc
 sample_vio
 rtp_test
 nalu_dump
+rtp_header_dump
+sdp_test
 
 # ── 测试/调试产物 ──
 *.log
