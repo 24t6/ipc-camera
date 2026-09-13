@@ -199,8 +199,9 @@ int proto_rtp_send_nalu(int sockfd, const struct sockaddr *dst, socklen_t dstlen
         return 0;
 
     /*
-     * 一个小优化: 小于 8 字节的 NALU(如 AUD)通常不承载图像数据,
-     * 单包发送即可, 且不值得为它启动分片逻辑。
+     * 不分片的上限就是载荷上限(1400)。
+     * 只要 NALU 塞得进一个包, 就走单包模式 —— 少 2 字节分片头, 也少一层状态。
+     * 只有大 NALU 才需要分片: 实测关键帧 55KB(H.264)/ 115KB(H.265)。
      */
     if (n->len <= PROTO_RTP_MAX_PAYLOAD)
         return send_single(sockfd, dst, dstlen, s, n, is_last);
