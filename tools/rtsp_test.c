@@ -19,6 +19,7 @@
  * 用法: ./rtsp_test
  */
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "proto_nalu.h"
@@ -48,6 +49,29 @@ static int has_line(const char *resp, const char *line)
         p = after;
     }
     return 0;
+}
+
+/** 数响应里有几个 Content-Length 头(应该是**恰好 1 个**) */
+static int count_content_length(const char *resp)
+{
+    const char *p = resp;
+    int         n = 0;
+
+    while ((p = strstr(p, "Content-Length:")) != NULL) {
+        n++;
+        p += 15;
+    }
+    return n;
+}
+
+/** 取出 Content-Length 的值; 没有则返回 -1 */
+static int get_content_length(const char *resp)
+{
+    const char *p = strstr(resp, "Content-Length:");
+
+    if (p == NULL)
+        return -1;
+    return atoi(p + 15);
 }
 
 /** 解析请求并断言成功 */
@@ -188,8 +212,10 @@ int main(int argc, char **argv)
         check("缺 CSeq → 明确报错(-3) 而不是静默继续", rc == -3);
 
         rc = proto_rtsp_parse_request("FOOBAR /live RTSP/1.0\r\nCSeq: 1\r\n\r\n", 36, &bad);
-        check("不认识的方法 → -2(且 method_name 保留供日志)",
-              rc == -2 && strcmp(bad.method_name, "FOOBAR") == 0);
+        check("不认识的方法 → -4(请求行合法 → 调用方该回 405 而不是 400)",
+              rc == -4 && strcmp(bad.method_name, "FOOBAR") == 0);
+        check("不认识的方法也要留住 CSeq(才能回对响应)",
+              rc == -4 && bad.cseq_present && bad.cseq == 1);
 
         rc = proto_rtsp_parse_request("OPTIONS /live RTSP/1.0\r\nCSeq: 9\n\n", 34, &bad);
         check("LF-only(不带 CR)也能解析(容错)", rc == 0 && bad.cseq == 9);
@@ -257,8 +283,77 @@ int main(int argc, char **argv)
     }
     printf("\n");
 
-    /* ═══ ⑥ 缓冲安全 ═══ */
-    printf("⑥ 缓冲安全(必须报错而不是溢出)\n");
+    /* ═══ ⑥ ★ 回归防线:每个响应都必须带 Content-Length ═══
+     *
+     * 这一段是 B017 逼出来的, 也是本次重构的验收标准。
+     * 原来五个构造函数各写各的头, 结果 options/setup/play_pause/teardown
+     * 四个都漏了 Content-Length:
+     *   · curl 挂到超时才返回
+     *   · 客户端反复重连(服务端日志里 4 个连接、CSeq 全是 1)
+     * 根因是"没有长度、又不关连接" = 客户端不知道消息体在哪结束。
+     *
+     * 现在响应统一从 resp_finish() 这一个出口出去。但**光改设计还不够**:
+     * 必须有断言把"每个构造函数都带 Content-Length"钉死,
+     * 否则以后新增一个构造函数, 同样的坑会再踩一次。
+     */
+    printf("⑥ ★ 每个响应构造函数都必须带 Content-Length(B017 回归防线)\n");
+    {
+        proto_rtsp_request_t r;
+        char  small_sdp[] = "v=0\r\n";
+        int   n, i;
+
+        struct {
+            const char *name;
+            int         n;
+        } cases[6];
+
+        parse_ok("(准备 OPTIONS 请求)", REQ_OPTIONS, &r);
+        cases[0].name = "OPTIONS";      cases[0].n = proto_rtsp_build_options(&r, out, sizeof(out));
+
+        parse_ok("(准备 DESCRIBE 请求)", REQ_DESCRIBE, &r);
+        cases[1].name = "DESCRIBE";     cases[1].n = proto_rtsp_build_describe(&r, small_sdp, 5, out, sizeof(out));
+
+        parse_ok("(准备 SETUP/UDP 请求)", REQ_SETUP_UDP, &r);
+        cases[2].name = "SETUP(UDP)";   cases[2].n = proto_rtsp_build_setup(&r, 12345678u, 6000, out, sizeof(out));
+
+        parse_ok("(准备 SETUP/TCP 请求)", REQ_SETUP_TCP, &r);
+        cases[3].name = "SETUP(TCP)";   cases[3].n = proto_rtsp_build_setup(&r, 12345678u, 6000, out, sizeof(out));
+
+        parse_ok("(准备 PLAY 请求)", REQ_PLAY, &r);
+        cases[4].name = "PLAY/PAUSE";   cases[4].n = proto_rtsp_build_play_pause(&r, 12345678u, out, sizeof(out));
+
+        parse_ok("(准备 TEARDOWN 请求)", REQ_TEARDOWN, &r);
+        cases[5].name = "TEARDOWN";     cases[5].n = proto_rtsp_build_teardown(&r, 12345678u, out, sizeof(out));
+
+        for (i = 0; i < 6; i++) {
+            int   cl;
+            char  label[96];
+            size_t body;
+
+            snprintf(label, sizeof(label), "%s 响应含一个 Content-Length 头", cases[i].name);
+            cl = count_content_length(out);
+            if (!check(label, cases[i].n > 0 && cl == 1))
+                continue;
+
+            body = strlen(strstr(out, "\r\n\r\n") + 4);
+            snprintf(label, sizeof(label), "%s 的 Content-Length = 消息体字节数", cases[i].name);
+            check(label, (size_t)get_content_length(out) == body);
+        }
+
+        /* 错误响应也不能漏 —— 客户端同样要靠它判断消息结束 */
+        {
+            proto_rtsp_request_t e;
+            memset(&e, 0, sizeof(e));
+            e.cseq = 9;
+            proto_rtsp_build_error(&e, 454, "Session Not Found", out, sizeof(out));
+            check("错误响应也含 Content-Length", count_content_length(out) == 1);
+            check("错误响应的 Content-Length = 0", get_content_length(out) == 0);
+        }
+    }
+    printf("\n");
+
+    /* ═══ ⑦ 缓冲安全 ═══ */
+    printf("⑦ 缓冲安全(必须报错而不是溢出)\n");
     {
         proto_rtsp_request_t r;
         char small[16];
@@ -274,8 +369,8 @@ int main(int argc, char **argv)
     }
     printf("\n");
 
-    /* ═══ ⑦ 串联:DESCRIBE 的响应体用真实 SDP ═══ */
-    printf("⑦ 串联测试:DESCRIBE 响应体 = proto_sdp 的真实输出\n");
+    /* ═══ ⑧ 串联:DESCRIBE 的响应体用真实 SDP ═══ */
+    printf("⑧ 串联测试:DESCRIBE 响应体 = proto_sdp 的真实输出\n");
     if (argc < 2) {
         printf("   (跳过: 未提供码流文件, 无法取得真实 SPS/PPS)\n");
         printf("   用法: %s <file.h264>\n", argv[0]);

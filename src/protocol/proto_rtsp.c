@@ -218,8 +218,18 @@ int proto_rtsp_parse_request(const char *buf, size_t len, proto_rtsp_request_t *
 
     if (first)
         return -2;                      /* 一行都没读到 */
-    if (req->method == PROTO_RTSP_METHOD_UNKNOWN)
-        return -2;                      /* 方法名不认识 */
+    if (req->method == PROTO_RTSP_METHOD_UNKNOWN) {
+        /*
+         * 请求行语法是好的(方法/URL/版本都在), 只是这个方法我们不认识。
+         * 这跟"报文畸形"是两回事: 前者该回 **405 Method Not Allowed**,
+         * 后者才是 400 Bad Request。所以这里单独给一个错误码 -4。
+         *
+         * 为什么值得专门区分: 客户端拿到 405 会知道"服务器在, 只是不支持这个动作",
+         * 拿到 400 则会怀疑自己报文写错了 —— 排障方向完全不同。
+         * method_name 已经被原样保留下来, 调用方可以直接拿去打日志或报错。
+         */
+        return -4;
+    }
     if (req->cseq_present == 0)
         return -3;                      /* 没有 CSeq: 无法构造可对应上的响应 */
 
@@ -248,9 +258,12 @@ const char *proto_rtsp_method_name(proto_rtsp_method_t m)
 /* ─────────────── ③ 响应构造 ─────────────── */
 
 /**
- * 写状态行 + 必备的 CSeq 头。
+ * 写状态行 + 必备的 CSeq 头(**不写结尾空行**)。
+ *
  * @note **每个响应都必须回 CSeq**, 且值要和请求一致 ——
  *       否则客户端无法把响应和请求对应起来, 会一直等或直接断开。
+ * @note 之所以不在这里写结尾空行: 响应头还没写完(后面还要加 Content-Length
+ *       和各自的头), 空行必须留到最后由 resp_finish() 来补。
  */
 static int status_and_cseq(char *out, size_t cap, size_t *used,
                            int code, const char *reason, int cseq)
@@ -268,6 +281,75 @@ static int status_and_cseq(char *out, size_t cap, size_t *used,
     return append(out, cap, used, "\r\n");
 }
 
+/** 消息体的 MIME 类型(只有 DESCRIBE 有体)。用枚举而不是字符串, 防止拼错。 */
+typedef enum {
+    RES_TYPE_NONE = 0,          /* 没有消息体 → 不发 Content-Type */
+    RES_TYPE_SDP,               /* application/sdp */
+} resp_body_type_t;
+
+static const char *content_type_text(resp_body_type_t t)
+{
+    switch (t) {
+    case RES_TYPE_SDP: return "application/sdp";
+    default:           return NULL;
+    }
+}
+
+/**
+ * ★★ 所有响应的**唯一出口** —— 由它保证"每个响应都带 Content-Length"。
+ *
+ * @param extra       额外的头(可以为 NULL), 必须以 "\r\n" 结尾
+ * @param body_type   消息体的 MIME 类型(无体就传 RES_TYPE_NONE)
+ * @param body        消息体(可以为 NULL)
+ * @param body_len    消息体字节数
+ *
+ * @note **为什么必须做成唯一出口**(来自 B017):
+ *       原来五个构造函数各写各的头, 结果 `build_options` / `build_setup` /
+ *       `build_play_pause` / `build_teardown` 四个都**漏了 Content-Length**。
+ *       实测后果:curl 挂到超时、同一客户端反复重连(CSeq 全是 1)。
+ *       RTSP(和 HTTP 一样)里"没有长度、又不关连接" = 客户端不知道消息体
+ *       在哪结束 → 只能一直等。
+ *       **靠"每个分支都记得写"的设计是脆弱的设计**; 改成唯一出口之后,
+ *       想漏都漏不掉。这和 B015(接口设计逼着调用方用错)是同一类问题。
+ *
+ * @note 消息体长度按**字节**算, 不是字符数 —— 写错了客户端会一直等。
+ * @note 非阻塞、不分配内存; 缓冲不够返回 -1(调用方负责断连, 不能截断发送)。
+ */
+static int resp_finish(char *out, size_t cap, size_t *used,
+                       const char *extra, resp_body_type_t body_type,
+                       const char *body, size_t body_len)
+{
+    const char *ct = content_type_text(body_type);
+
+    if (body == NULL && body_len > 0)
+        return -1;
+    if (extra != NULL && append(out, cap, used, extra) != 0)
+        return -1;
+    if (ct != NULL && append(out, cap, used, "Content-Type: ") != 0)
+        return -1;
+    if (ct != NULL && append(out, cap, used, ct) != 0)
+        return -1;
+    if (ct != NULL && append(out, cap, used, "\r\n") != 0)
+        return -1;
+
+    /* ↓ 这一行就是"唯一出口"的核心:任何响应都躲不过它 */
+    if (append(out, cap, used, "Content-Length: ") != 0)
+        return -1;
+    if (append_u32(out, cap, used, (uint32_t)body_len) != 0)
+        return -1;
+    if (append(out, cap, used, "\r\n\r\n") != 0)        /* 空行: 头结束 */
+        return -1;
+
+    if (body_len > 0) {
+        if (*used + body_len + 1 > cap)
+            return -1;
+        memcpy(out + *used, body, body_len);
+        *used += body_len;
+        out[*used] = '\0';
+    }
+    return (int)*used;
+}
+
 int proto_rtsp_build_options(const proto_rtsp_request_t *req, char *out, size_t cap)
 {
     size_t used = 0;
@@ -277,13 +359,9 @@ int proto_rtsp_build_options(const proto_rtsp_request_t *req, char *out, size_t 
     if (status_and_cseq(out, cap, &used, 200, "OK", req->cseq) != 0)
         return -1;
     /* 列出我们真正实现的方法; VLC 靠这个决定界面按钮 */
-    if (append(out, cap, &used, "Public: OPTIONS, DESCRIBE, SETUP, PLAY, "
-                                "PAUSE, TEARDOWN\r\n") != 0)
-        return -1;
-    if (append(out, cap, &used, "\r\n") != 0)
-        return -1;
-
-    return (int)used;
+    return resp_finish(out, cap, &used,
+                       "Public: OPTIONS, DESCRIBE, SETUP, PLAY, PAUSE, TEARDOWN\r\n",
+                       RES_TYPE_NONE, NULL, 0);
 }
 
 int proto_rtsp_build_describe(const proto_rtsp_request_t *req,
@@ -296,22 +374,7 @@ int proto_rtsp_build_describe(const proto_rtsp_request_t *req,
         return -1;
     if (status_and_cseq(out, cap, &used, 200, "OK", req->cseq) != 0)
         return -1;
-    if (append(out, cap, &used, "Content-Type: application/sdp\r\n") != 0)
-        return -1;
-    if (append(out, cap, &used, "Content-Length: ") != 0)
-        return -1;
-    if (append_u32(out, cap, &used, (uint32_t)sdp_len) != 0)
-        return -1;
-    if (append(out, cap, &used, "\r\n\r\n") != 0)       /* 空行: 头结束 */
-        return -1;
-    if (sdp_len > 0) {
-        if (used + sdp_len + 1 > cap)
-            return -1;
-        memcpy(out + used, sdp, sdp_len);
-        used += sdp_len;
-        out[used] = '\0';
-    }
-    return (int)used;
+    return resp_finish(out, cap, &used, NULL, RES_TYPE_SDP, sdp, sdp_len);
 }
 
 int proto_rtsp_build_setup(const proto_rtsp_request_t *req, uint32_t session_id,
@@ -360,10 +423,10 @@ int proto_rtsp_build_setup(const proto_rtsp_request_t *req, uint32_t session_id,
         if (append_u32(out, cap, &used, (uint32_t)(server_rtp_port + 1)) != 0)
             return -1;
     }
-    if (append(out, cap, &used, "\r\n\r\n") != 0)
+    if (append(out, cap, &used, "\r\n") != 0)
         return -1;
 
-    return (int)used;
+    return resp_finish(out, cap, &used, NULL, RES_TYPE_NONE, NULL, 0);
 }
 
 int proto_rtsp_build_play_pause(const proto_rtsp_request_t *req, uint32_t session_id,
@@ -379,10 +442,10 @@ int proto_rtsp_build_play_pause(const proto_rtsp_request_t *req, uint32_t sessio
         return -1;
     if (append_u32(out, cap, &used, session_id) != 0)
         return -1;
-    if (append(out, cap, &used, "\r\n\r\n") != 0)
+    if (append(out, cap, &used, "\r\n") != 0)
         return -1;
 
-    return (int)used;
+    return resp_finish(out, cap, &used, NULL, RES_TYPE_NONE, NULL, 0);
 }
 
 int proto_rtsp_build_teardown(const proto_rtsp_request_t *req, uint32_t session_id,
@@ -398,10 +461,10 @@ int proto_rtsp_build_teardown(const proto_rtsp_request_t *req, uint32_t session_
         return -1;
     if (append_u32(out, cap, &used, session_id) != 0)
         return -1;
-    if (append(out, cap, &used, "\r\n\r\n") != 0)
+    if (append(out, cap, &used, "\r\n") != 0)
         return -1;
 
-    return (int)used;
+    return resp_finish(out, cap, &used, NULL, RES_TYPE_NONE, NULL, 0);
 }
 
 int proto_rtsp_build_error(const proto_rtsp_request_t *req, int code,
@@ -415,8 +478,6 @@ int proto_rtsp_build_error(const proto_rtsp_request_t *req, int code,
     if (status_and_cseq(out, cap, &used, code, reason,
                         req ? req->cseq : -1) != 0)
         return -1;
-    if (append(out, cap, &used, "Content-Length: 0\r\n\r\n") != 0)
-        return -1;
 
-    return (int)used;
+    return resp_finish(out, cap, &used, NULL, RES_TYPE_NONE, NULL, 0);
 }

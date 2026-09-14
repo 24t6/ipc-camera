@@ -93,10 +93,15 @@ typedef struct {
  * @param len   buf 长度
  * @param req   输出:解析结果(失败时也会尽量填上已解析到的部分, 便于打日志)
  * @return 0=成功; 负值为错误:
- *         -1 = 参数非法, -2 = 不是合法的 RTSP 请求行, -3 = 缺少 CSeq(不可恢复)
+ *         -1 = 参数非法
+ *         -2 = 不是合法的 RTSP 请求行(畸形)
+ *         -3 = 缺少 CSeq(不可恢复)
+ *         -4 = 方法名不认识(**请求行本身是合法的** → 调用方应回 405, 不是 400)
  *
  * @note 只解析本项目需要的字段; 未知的头**直接忽略**(协议允许, 也让实现更健壮)。
  * @note 不阻塞、不分配内存、无静态状态(可重入)。
+ * @note 返回 -2/-3/-4 时, `req->method_name` 里仍是**原样保留的原始方法名**,
+ *       方便调用方打日志。
  */
 int proto_rtsp_parse_request(const char *buf, size_t len, proto_rtsp_request_t *req);
 
