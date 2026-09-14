@@ -72,12 +72,72 @@ static void classify_h265(proto_nalu_t *n)
     }
 }
 
+/**
+ * 算出一个 NALU 的右边界。
+ *
+ * @param nalu_start NALU 第一个字节(已在起始码之后)
+ * @param end        整段缓冲的末尾
+ * @param next       find_start_code() 找到的**下一个**起始码位置; NULL = 这是最后一个
+ * @return 右边界指针(不含)
+ *
+ * @note 两件事, 都容易写错, 所以单独放一处:
+ *   ① 下一个起始码可能带 3 字节或 4 字节版本, find_start_code 返回的是
+ *      "00 00 01" 里那个 `01` 的位置, 所以要 **-3** 才算上一个 NALU 的结束。
+ *   ② 4 字节起始码(`00 00 00 01`)会把多出来的那个 `00` 留在**上一个** NALU
+ *      的尾巴上, 必须裁掉 —— 否则 NALU 会长出一个字节的 0x00。
+ */
+static const uint8_t *nalu_right_edge(const uint8_t *nalu_start,
+                                      const uint8_t *end,
+                                      const uint8_t *next)
+{
+    const uint8_t *nalu_end = next ? (next - 3) : end;
+
+    while (nalu_end > nalu_start && nalu_end[-1] == 0x00)
+        nalu_end--;
+    return nalu_end;
+}
+
+/** 回调的三种意图 —— emit_nalu 的返回值 */
+#define EMIT_SKIPPED  0     /* 长度不够放下 NALU 头, 跳过(不算一个 NALU) */
+#define EMIT_DELIVERED 1    /* 已回调, 回调说"继续" */
+#define EMIT_STOP     2     /* 回调要求提前终止 */
+
+/**
+ * 给一个 NALU 分类并回调。
+ *
+ * @return EMIT_SKIPPED / EMIT_DELIVERED / EMIT_STOP
+ *
+ * @note 回调的返回值**必须原样传出去** —— 上层靠它支持"只想看前 N 个 NALU"
+ *       (我们的 rtsp_test 就是用它找到 SPS/PPS 就停)。第一版重构时我把这个
+ *       返回值吞掉了, 幸好立刻发现 —— 这正是"重构必须重跑测试"的理由:
+ *       **这类语义丢失, 编译器不会报错, 类型也对。**
+ */
+static int emit_nalu(const uint8_t *start, size_t nlen, int is_h265,
+                     proto_nalu_cb_t cb, void *user)
+{
+    proto_nalu_t n;
+
+    if (nlen < (size_t)(is_h265 ? 2 : 1))
+        return EMIT_SKIPPED;
+
+    memset(&n, 0, sizeof(n));
+    n.data    = start;
+    n.len     = nlen;
+    n.is_h265 = is_h265;
+
+    if (is_h265)
+        classify_h265(&n);
+    else
+        classify_h264(&n);
+
+    return (cb(&n, user) != 0) ? EMIT_STOP : EMIT_DELIVERED;
+}
+
 int proto_nalu_foreach(const uint8_t *buf, size_t len, int is_h265,
                  proto_nalu_cb_t cb, void *user)
 {
     const uint8_t *end;
     const uint8_t *nalu_start;
-    size_t         min_hdr = is_h265 ? 2 : 1;
     int            count = 0;
 
     if (buf == NULL || len < 4 || cb == NULL)
@@ -91,41 +151,24 @@ int proto_nalu_foreach(const uint8_t *buf, size_t len, int is_h265,
         return 0;               /* 整段没有起始码 —— 不是 Annex-B */
 
     for (;;) {
-        const uint8_t *next;    /* 下一个起始码之后的位置 */
+        const uint8_t *next;    /* 下一个起始码的位置 */
         const uint8_t *nalu_end;
-        size_t         nlen;
-        proto_nalu_t         n;
+        int            r;
 
         /* 2) 找下一个起始码, 它就是当前 NALU 的右边界 */
         next     = find_start_code(nalu_start, end);
-        nalu_end = next ? (next - 3) : end;
+        nalu_end = nalu_right_edge(nalu_start, end, next);
 
-        /* 3) 裁掉起始码前可能存在的 00 填充(4 字节起始码的情形) */
-        while (nalu_end > nalu_start && nalu_end[-1] == 0x00)
-            nalu_end--;
-
-        nlen = (size_t)(nalu_end - nalu_start);
-
-        /* 4) 长度至少要能放下 NALU 头才有效 */
-        if (nlen >= min_hdr) {
-            memset(&n, 0, sizeof(n));
-            n.data    = nalu_start;
-            n.len     = nlen;
-            n.is_h265 = is_h265;
-
-            if (is_h265)
-                classify_h265(&n);
-            else
-                classify_h264(&n);
-
-            if (cb(&n, user) != 0)
-                return count + 1;   /* 回调要求提前终止 */
+        /* 3) 分类 + 回调 */
+        r = emit_nalu(nalu_start, (size_t)(nalu_end - nalu_start), is_h265,
+                      cb, user);
+        if (r == EMIT_STOP)
+            return count + 1;   /* 回调要求提前终止 */
+        if (r == EMIT_DELIVERED)
             count++;
-        }
 
         if (next == NULL)
             break;
-
         nalu_start = next;
     }
 

@@ -44,6 +44,8 @@
  *       这是纪律②(framing)的物理基础。
  */
 typedef struct {
+    int      index;                     /* 自己在 g.clients[] 里的下标 ——
+                                           缓存下来, 免得各处反复用 (c - g.clients) 指针运算 */
     int      fd;                        /* -1 = 槽位空闲 */
     size_t   rlen;                      /* rbuf 里已累积的字节数 */
     char     rbuf[SVC_NET_READ_BUF_SIZE];
@@ -120,6 +122,7 @@ static int client_alloc(int fd)
             svc_net_client_t *c = &g.clients[i];
 
             memset(c, 0, sizeof(*c));
+            c->index       = i;
             c->fd          = fd;
             c->last_active = time(NULL);
             return i;
@@ -208,102 +211,134 @@ static int send_all(int fd, const char *buf, size_t len)
 /* ═══════════════ ③ 请求处理 ═══════════════ */
 
 /**
- * 处理一个**完整的** RTSP 请求并回应。
+ * 拼一个错误响应并发出去。
  *
- * @param req_buf 请求文本(已被截断到边界处, 保证以 '\0' 结尾)
- * @param req_len 请求字节数
- * @return 0 已回应; -1 = 连接应当关闭(发送失败或不可恢复)
- *
- * @note 本函数**不构造任何报文文本**, 只做"解析 → 分派 → 发送"。
+ * @return 0 已回应(连接保留); -1 发送失败(应当断开)
+ * @note 抽出来的理由: 原来 400/405/454 三个分支各自重复"构造 + 判断 + 发送"三段,
+ *       重复三遍就是三处可能漏掉返回值检查的地方。
  */
-static int handle_request(svc_net_client_t *c, const char *req_buf, size_t req_len)
+static int reply_error(svc_net_client_t *c, const proto_rtsp_request_t *req,
+                       int code, const char *reason)
 {
-    proto_rtsp_request_t req;
-    char                 resp[SVC_NET_RESP_BUF_SIZE];
-    int                  n = -1;
-    int                  rc;
+    char resp[SVC_NET_RESP_BUF_SIZE];
+    int  n = proto_rtsp_build_error(req, code, reason, resp, sizeof(resp));
 
-    rc = proto_rtsp_parse_request(req_buf, req_len, &req);
-    if (rc != 0) {
-        g.stats.parse_errors++;
-
-        /*
-         * 两类失败要分开对待(错误码见 proto_rtsp.h):
-         *   -3: 缺 CSeq → 连"回给谁"都对不上, 静默丢弃
-         *   -4: 请求行合法但方法不认识 → 必须回 405, 不能让客户端蒙在鼓里
-         *   其它: 报文畸形 → 400
-         */
-        if (rc == -3) {
-            LOG_WARN("RTSP 请求缺 CSeq, 无法回应, 丢弃");
-            return 0;
-        }
-        if (rc == -4) {
-            LOG_WARN("不支持的方法 '%s' → 405", req.method_name);
-            n = proto_rtsp_build_error(&req, 405, "Method Not Allowed",
-                                       resp, sizeof(resp));
-        } else {
-            LOG_WARN("RTSP 请求解析失败 rc=%d → 400(连接保留)", rc);
-            n = proto_rtsp_build_error(&req, 400, "Bad Request",
-                                       resp, sizeof(resp));
-        }
-        if (n <= 0)
-            return 0;
-        return (send_all(c->fd, resp, (size_t)n) == 0) ? 0 : -1;
+    if (n <= 0) {
+        g.stats.send_errors++;
+        return -1;                      /* 构造不出来 = 缓冲出问题, 断连比装死好 */
     }
+    return (send_all(c->fd, resp, (size_t)n) == 0) ? 0 : -1;
+}
 
-    g.stats.requests++;
+/**
+ * 处理解析失败的请求。
+ *
+ * @return 0 已处理完(连接保留); -1 已回应但发送失败, 必须断开
+ *
+ * @note 三类失败要分开(错误码见 proto_rtsp.h):
+ *       -3 缺 CSeq → 连"回给谁"都对不上, **静默丢弃**(回了也没意义)
+ *       -4 请求行合法但方法不认识 → **405**(让客户端知道是"不支持"而不是"写错了")
+ *       其它 → **400 Bad Request**
+ */
+static int handle_parse_failure(svc_net_client_t *c,
+                                const proto_rtsp_request_t *req, int rc)
+{
+    g.stats.parse_errors++;
 
-    switch (req.method) {
+    if (rc == -3) {
+        LOG_WARN("RTSP 请求缺 CSeq, 无法回应, 丢弃");
+        return 0;
+    }
+    if (rc == -4) {
+        LOG_WARN("不支持的方法 '%s' → 405", req->method_name);
+        return reply_error(c, req, 405, "Method Not Allowed");
+    }
+    LOG_WARN("RTSP 请求解析失败 rc=%d → 400(连接保留)", rc);
+    return reply_error(c, req, 400, "Bad Request");
+}
+
+/**
+ * 处理 SETUP: 记录会话与传输通道。
+ *
+ * @note 会话号 = 槽位下标 + 基准值: 同一连接每次 SETUP 都得到确定的号,
+ *       而槽位下标天然唯一 → 不会和别的连接撞上。
+ * @note 交错通道号只在客户端要 TCP 时才有意义; UDP 时填默认值,
+ *       这样上层(发 RTP)不必再判断传输方式。
+ */
+static void setup_session(svc_net_client_t *c, const proto_rtsp_request_t *req)
+{
+    int tcp = (req->transport == PROTO_RTSP_TRANSPORT_TCP_INTERLEAVED);
+
+    c->session_id       = 1000u + (uint32_t)c->index;
+    c->session_assigned = 1;
+    c->rtp_channel      = tcp ? req->interleaved_rtp  : SVC_NET_RTP_CHANNEL;
+    c->rtcp_channel     = tcp ? req->interleaved_rtcp : SVC_NET_RTCP_CHANNEL;
+}
+
+/**
+ * 处理 PLAY / PAUSE(两者只差 playing 标志和要不要通知上层)。
+ *
+ * @return 同 handle_request
+ */
+static int handle_play_pause(svc_net_client_t *c, const proto_rtsp_request_t *req)
+{
+    char resp[SVC_NET_RESP_BUF_SIZE];
+    int  playing = (req->method == PROTO_RTSP_METHOD_PLAY);
+    int  n;
+
+    if (!c->session_assigned)
+        return reply_error(c, req, 454, "Session Not Found");
+
+    c->playing = playing;
+    n = proto_rtsp_build_play_pause(req, c->session_id, resp, sizeof(resp));
+    if (n <= 0) {
+        g.stats.send_errors++;
+        return -1;
+    }
+    if (send_all(c->fd, resp, (size_t)n) != 0)
+        return -1;
+
+    /* 先把响应发出去, 再通知上层 —— 否则上层的回调若阻塞, 客户端会先等到超时 */
+    if (playing && g.on_play != NULL)
+        g.on_play(c->index, g.user);
+    return 0;
+}
+
+/**
+ * 按方法分派, 把响应文本拼进 out。
+ *
+ * @return >0 = 响应字节数; 0 = 这个请求不需要普通响应(见 out_kind);
+ *         -1 = 构造失败或断连
+ * @param[out] out_teardown 置 1 表示"回完就该断开"(TEARDOWN)
+ *
+ * @note 与 handle_request 分成两个函数的理由: 前者是**纯粹的"请求 → 响应文本"**,
+ *       后者负责"解析和收尾(统计/发送/断开判定)"。混在一起时, switch 的
+ *       缩进和 return 路径会互相纠缠, 函数很快就长到读不完。
+ */
+static int build_response(svc_net_client_t *c, const proto_rtsp_request_t *req,
+                          char *out, size_t cap, int *out_teardown)
+{
+    *out_teardown = 0;
+
+    switch (req->method) {
     case PROTO_RTSP_METHOD_OPTIONS:
-        n = proto_rtsp_build_options(&req, resp, sizeof(resp));
-        break;
+        return proto_rtsp_build_options(req, out, cap);
 
     case PROTO_RTSP_METHOD_DESCRIBE:
-        n = proto_rtsp_build_describe(&req, g.sdp, g.sdp_len, resp, sizeof(resp));
-        break;
+        return proto_rtsp_build_describe(req, g.sdp, g.sdp_len, out, cap);
 
-    case PROTO_RTSP_METHOD_SETUP: {
-        /* 会话号用"槽位下标 + 基准值"生成: 同一连接的每次 SETUP 得到确定的号,
-           同时又不会和别的连接撞上(槽位下标天然唯一) */
-        c->session_id       = 1000u + (uint32_t)(c - g.clients);
-        c->session_assigned = 1;
-        c->rtp_channel      = (req.transport == PROTO_RTSP_TRANSPORT_TCP_INTERLEAVED)
-                              ? req.interleaved_rtp : SVC_NET_RTP_CHANNEL;
-        c->rtcp_channel     = (req.transport == PROTO_RTSP_TRANSPORT_TCP_INTERLEAVED)
-                              ? req.interleaved_rtcp : SVC_NET_RTCP_CHANNEL;
-        n = proto_rtsp_build_setup(&req, c->session_id, 0, resp, sizeof(resp));
-        break;
-    }
+    case PROTO_RTSP_METHOD_SETUP:
+        setup_session(c, req);
+        return proto_rtsp_build_setup(req, c->session_id, 0, out, cap);
 
-    case PROTO_RTSP_METHOD_PLAY:
-        if (!c->session_assigned) {
-            n = proto_rtsp_build_error(&req, 454, "Session Not Found",
-                                       resp, sizeof(resp));
-            break;
-        }
-        c->playing = 1;
-        n = proto_rtsp_build_play_pause(&req, c->session_id, resp, sizeof(resp));
-        if (n > 0 && g.on_play != NULL)
-            g.on_play((int)(c - g.clients), g.user);
-        break;
+    case PROTO_RTSP_METHOD_TEARDOWN: {
+        int n = proto_rtsp_build_teardown(req, c->session_id, out, cap);
 
-    case PROTO_RTSP_METHOD_PAUSE:
-        if (!c->session_assigned) {
-            n = proto_rtsp_build_error(&req, 454, "Session Not Found",
-                                       resp, sizeof(resp));
-            break;
-        }
-        c->playing = 0;
-        n = proto_rtsp_build_play_pause(&req, c->session_id, resp, sizeof(resp));
-        break;
-
-    case PROTO_RTSP_METHOD_TEARDOWN:
-        n = proto_rtsp_build_teardown(&req, c->session_id, resp, sizeof(resp));
-        if (n > 0 && send_all(c->fd, resp, (size_t)n) != 0)
-            return -1;
         c->playing          = 0;
         c->session_assigned = 0;
-        return 1;                       /* 1 = 回完就该断开 */
+        *out_teardown       = 1;
+        return n;
+    }
 
     case PROTO_RTSP_METHOD_GET_PARAMETER:
         /*
@@ -312,22 +347,53 @@ static int handle_request(svc_net_client_t *c, const char *req_buf, size_t req_l
          * 借 build_error 来拼一个"空体的成功响应"(它的作用就是状态码+空体),
          * 免得在 svc_net 里又出现一处手拼报文的地方(纪律①)。
          */
-        n = proto_rtsp_build_error(&req, 200, "OK", resp, sizeof(resp));
-        break;
+        return proto_rtsp_build_error(req, 200, "OK", out, cap);
 
     default:
-        g.stats.parse_errors++;
-        n = proto_rtsp_build_error(&req, 405, "Method Not Allowed",
-                                   resp, sizeof(resp));
-        break;
+        /* 正常走不到这里: 不认识的方法在解析阶段就返回 -4 了。
+           留着是为了"以后新增方法枚举但忘了加分支"时行为明确。 */
+        return proto_rtsp_build_error(req, 405, "Method Not Allowed", out, cap);
     }
+}
 
+/**
+ * 处理一个**完整的** RTSP 请求并回应。
+ *
+ * @param req_buf 请求文本(已被截断到边界处, 保证以 '\0' 结尾)
+ * @param req_len 请求字节数
+ * @return 0 已回应(连接保留); -1 连接应当关闭; 1 = 收到 TEARDOWN, 回完就断
+ *
+ * @note 本函数**不构造任何报文文本**, 只做"解析 → 分派 → 发送"。
+ */
+static int handle_request(svc_net_client_t *c, const char *req_buf, size_t req_len)
+{
+    proto_rtsp_request_t req;
+    char                 resp[SVC_NET_RESP_BUF_SIZE];
+    int                  teardown = 0;
+    int                  n;
+    int                  rc;
+
+    rc = proto_rtsp_parse_request(req_buf, req_len, &req);
+    if (rc != 0)
+        return handle_parse_failure(c, &req, rc);
+
+    g.stats.requests++;
+
+    /* PLAY/PAUSE 要"发完响应再通知上层", 单独处理 */
+    if (req.method == PROTO_RTSP_METHOD_PLAY ||
+        req.method == PROTO_RTSP_METHOD_PAUSE)
+        return handle_play_pause(c, &req);
+
+    n = build_response(c, &req, resp, sizeof(resp), &teardown);
     if (n <= 0) {
         LOG_ERROR("响应构造失败(缓冲 %d 字节是否够?)", SVC_NET_RESP_BUF_SIZE);
         g.stats.send_errors++;
         return -1;
     }
-    return (send_all(c->fd, resp, (size_t)n) == 0) ? 0 : -1;
+    if (send_all(c->fd, resp, (size_t)n) != 0)
+        return -1;
+
+    return teardown ? 1 : 0;
 }
 
 /* ═══════════════ ② 收字节 + framing ═══════════════ */
@@ -487,6 +553,35 @@ static void on_accept(void)
              cfd, idx, client_count());
 }
 
+/**
+ * 分派一个就绪事件。
+ *
+ * @note 抽出来的理由有二: 让 loop_thread 只剩"等 → 内务 → 分派"三步;
+ *       以及把"fd → 槽位"的查找集中在一处(fd 号会被内核复用,
+ *       散在多处查是 bug 的温床)。
+ */
+static void dispatch_event(const infra_poll_event_t *ev)
+{
+    int idx;
+
+    if (ev->fd == g.listen_fd) {
+        if (ev->events & INFRA_POLL_IN)
+            on_accept();
+        return;
+    }
+
+    idx = client_find(ev->fd);
+    if (idx < 0)
+        return;                         /* 已经被前面的内务检查清理掉了 */
+
+    if (ev->events & INFRA_POLL_ERR) {
+        client_free(idx);
+        return;
+    }
+    if ((ev->events & INFRA_POLL_IN) && read_client(&g.clients[idx]) != 0)
+        client_free(idx);
+}
+
 /** 事件循环主体 */
 static void *loop_thread(void *arg)
 {
@@ -511,29 +606,8 @@ static void *loop_thread(void *arg)
          */
         reap_idle();
 
-        for (i = 0; i < n; i++) {
-            int fd = events[i].fd;
-
-            if (fd == g.listen_fd) {
-                on_accept();
-                continue;
-            }
-            if (events[i].events & (INFRA_POLL_ERR)) {
-                int idx = client_find(fd);
-
-                if (idx >= 0)
-                    client_free(idx);
-                continue;
-            }
-            if (events[i].events & INFRA_POLL_IN) {
-                int idx = client_find(fd);
-
-                if (idx < 0)
-                    continue;           /* 已经被别的事件清理掉了 */
-                if (read_client(&g.clients[idx]) != 0)
-                    client_free(idx);
-            }
-        }
+        for (i = 0; i < n; i++)
+            dispatch_event(&events[i]);
     }
 
     LOG_INFO("RTSP 事件循环退出");
@@ -542,25 +616,49 @@ static void *loop_thread(void *arg)
 
 /* ═══════════════ ⑤ 生命周期 ═══════════════ */
 
-int svc_net_start(const svc_net_cfg_t *cfg)
+/**
+ * 释放启动阶段申请过的一切(无论启动成功与否都可用)。
+ *
+ * @note ⚠️ **清理顺序必须是申请顺序的反序** —— 这是统一清理函数唯一要守的纪律。
+ *       这里的申请顺序是: ①槽位表/读缓冲 → ②SDP 副本 → ③监听 fd → ④epoll。
+ *       所以关闭时: 先关所有客户端 fd → 销毁 epoll → 关监听 fd → free SDP → free 槽位表。
+ *
+ * @note 抽出来的理由: 原来 svc_net_start 里有 **5 条失败路径各自手写一遍"
+ *       关 fd + free + 置 NULL"**, 一共 25 行重复代码。
+ *       那种写法只要有一条路径漏了某一步, 就是内存泄漏或重复关闭 ——
+ *       而且新增一条失败路径时要记得同步 5 处。**统一出口一次就够。**
+ */
+static void release_all(void)
 {
     int i;
 
-    if (g.running)
-        return 0;                       /* 幂等 */
-    if (cfg == NULL)
-        return -1;
+    if (g.clients != NULL) {
+        for (i = 0; i < SVC_NET_MAX_CLIENTS; i++) {
+            if (g.clients[i].fd != -1)
+                infra_close(&g.clients[i].fd);
+        }
+    }
+    if (g.poller != NULL) {
+        infra_poller_destroy(g.poller);
+        g.poller = NULL;
+    }
+    if (g.listen_fd != -1)
+        infra_close(&g.listen_fd);
 
-    memset(&g, 0, sizeof(g));
-    g.listen_fd = -1;
-    g.port      = cfg->port;
-    g.idle_timeout_sec = (cfg->idle_timeout_sec > 0)
-                         ? cfg->idle_timeout_sec : SVC_NET_IDLE_TIMEOUT_SEC;
-    g.on_play     = cfg->on_play;
-    g.on_teardown = cfg->on_teardown;
-    g.user        = cfg->user;
+    free(g.sdp);
+    free(g.clients);
+    g.sdp     = NULL;
+    g.clients = NULL;
+}
 
-    /* ── 槽位表 + 读缓冲: 一次性分配, 运行期不再 malloc ── */
+/**
+ * 第 1 步: 分配槽位表 + 拷贝 SDP。
+ * @return 0 成功; -3 内存不足(失败时不会留下半成品)
+ */
+static int start_alloc(const svc_net_cfg_t *cfg)
+{
+    int i;
+
     g.clients = (svc_net_client_t *)malloc(sizeof(svc_net_client_t) *
                                            SVC_NET_MAX_CLIENTS);
     if (g.clients == NULL) {
@@ -569,23 +667,37 @@ int svc_net_start(const svc_net_cfg_t *cfg)
     }
     for (i = 0; i < SVC_NET_MAX_CLIENTS; i++) {
         memset(&g.clients[i], 0, sizeof(g.clients[i]));
-        g.clients[i].fd = -1;
+        g.clients[i].fd    = -1;
+        g.clients[i].index = i;
     }
 
-    /* ── SDP 拷贝一份: 调用方传进来的字符串随时可能失效 ── */
+    /* SDP 拷贝一份: 调用方传进来的字符串随时可能失效 */
     if (cfg->sdp != NULL && cfg->sdp_len > 0) {
         g.sdp = (char *)malloc(cfg->sdp_len + 1);
         if (g.sdp == NULL) {
-            free(g.clients);
-            g.clients = NULL;
+            LOG_ERROR("SDP 副本分配失败");
+            release_all();
             return -3;
         }
         memcpy(g.sdp, cfg->sdp, cfg->sdp_len);
         g.sdp[cfg->sdp_len] = '\0';
         g.sdp_len = cfg->sdp_len;
     }
+    return 0;
+}
 
-    /* ── 监听 socket ── */
+/**
+ * 第 2 步: 建监听 socket(非阻塞)并问出真实端口。
+ * @return 0 成功; -2 建不起来(端口被占用?); -3 epoll 建不起来
+ *
+ * @note 端口传 0 时由内核分配 —— 必须用 getsockname 问回真实值,
+ *       否则日志和测试都不知道服务在哪个端口上。
+ */
+static int start_listen(const svc_net_cfg_t *cfg)
+{
+    struct sockaddr_in sa;
+    socklen_t          sl = sizeof(sa);
+
     g.listen_fd = infra_tcp_listen(cfg->listen_ip ? cfg->listen_ip : "0.0.0.0",
                                   cfg->port,
                                   cfg->backlog > 0 ? cfg->backlog : 8);
@@ -593,64 +705,59 @@ int svc_net_start(const svc_net_cfg_t *cfg)
         LOG_ERROR("监听 %s:%u 失败(端口被占用?)",
                   cfg->listen_ip ? cfg->listen_ip : "0.0.0.0",
                   (unsigned)cfg->port);
-        free(g.sdp);
-        free(g.clients);
-        g.sdp     = NULL;
-        g.clients = NULL;
         return -2;
     }
     if (infra_set_nonblocking(g.listen_fd) != 0) {
-        infra_close(&g.listen_fd);
-        free(g.sdp);
-        free(g.clients);
-        g.sdp     = NULL;
-        g.clients = NULL;
+        LOG_ERROR("监听 socket 设非阻塞失败");
         return -2;
     }
+    if (getsockname(g.listen_fd, (struct sockaddr *)&sa, &sl) == 0)
+        g.port = ntohs(sa.sin_port);
 
-    /* 端口传 0 时问内核要真实端口, 便于测试与日志 */
-    {
-        struct sockaddr_in sa;
-        socklen_t          sl = sizeof(sa);
-
-        if (getsockname(g.listen_fd, (struct sockaddr *)&sa, &sl) == 0)
-            g.port = ntohs(sa.sin_port);
-    }
-
-    /* ── epoll ── */
     g.poller = infra_poller_create();
     if (g.poller == NULL) {
-        infra_close(&g.listen_fd);
-        free(g.sdp);
-        free(g.clients);
-        g.sdp     = NULL;
-        g.clients = NULL;
+        LOG_ERROR("epoll 实例创建失败");
         return -3;
     }
     if (infra_poller_add(g.poller, g.listen_fd, INFRA_POLL_IN) != 0) {
-        infra_poller_destroy(g.poller);
-        infra_close(&g.listen_fd);
-        free(g.sdp);
-        free(g.clients);
-        g.poller  = NULL;
-        g.sdp     = NULL;
-        g.clients = NULL;
+        LOG_ERROR("监听 fd 注册进 epoll 失败");
         return -2;
     }
+    return 0;
+}
 
-    /* ── 事件循环线程 ── */
+int svc_net_start(const svc_net_cfg_t *cfg)
+{
+    int rc;
+
+    if (g.running)
+        return 0;                       /* 幂等 */
+    if (cfg == NULL)
+        return -1;
+
+    memset(&g, 0, sizeof(g));
+    g.listen_fd        = -1;
+    g.port             = cfg->port;
+    g.idle_timeout_sec = (cfg->idle_timeout_sec > 0)
+                         ? cfg->idle_timeout_sec : SVC_NET_IDLE_TIMEOUT_SEC;
+    g.on_play          = cfg->on_play;
+    g.on_teardown      = cfg->on_teardown;
+    g.user             = cfg->user;
+
+    if ((rc = start_alloc(cfg)) != 0)       /* rc 已经是 -3 */
+        return rc;
+    if ((rc = start_listen(cfg)) != 0) {
+        release_all();
+        return rc;
+    }
+
+    /* 先置 running 再起线程: 否则线程可能先跑起来, 而 running 还是 0 */
     g.stop_requested = 0;
     g.running        = 1;
     if (pthread_create(&g.thread, NULL, loop_thread, NULL) != 0) {
         LOG_ERROR("事件循环线程创建失败");
-        infra_poller_destroy(g.poller);
-        infra_close(&g.listen_fd);
-        free(g.sdp);
-        free(g.clients);
-        g.poller   = NULL;
-        g.sdp      = NULL;
-        g.clients  = NULL;
-        g.running  = 0;
+        g.running = 0;
+        release_all();
         return -4;
     }
     g.thread_valid = 1;
@@ -662,8 +769,6 @@ int svc_net_start(const svc_net_cfg_t *cfg)
 
 void svc_net_stop(void)
 {
-    int i;
-
     if (!g.running)
         return;
 
@@ -674,20 +779,7 @@ void svc_net_stop(void)
     }
     g.running = 0;
 
-    for (i = 0; i < SVC_NET_MAX_CLIENTS; i++) {
-        if (g.clients != NULL && g.clients[i].fd != -1)
-            infra_close(&g.clients[i].fd);
-    }
-    if (g.poller != NULL)
-        infra_poller_destroy(g.poller);
-    if (g.listen_fd != -1)
-        infra_close(&g.listen_fd);
-
-    free(g.sdp);
-    free(g.clients);
-    g.sdp     = NULL;
-    g.clients = NULL;
-    g.poller  = NULL;
+    release_all();
 
     LOG_INFO("RTSP 服务已停止(累计 %llu 连接 / %llu 请求 / %llu 响应)",
              (unsigned long long)g.stats.conns_accepted,

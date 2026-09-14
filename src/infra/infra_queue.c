@@ -157,6 +157,39 @@ int infra_queue_push(infra_queue_t *q, const void *data, size_t len)
     return rc;
 }
 
+/**
+ * 队列空时按 timeout_ms 等一次。
+ *
+ * @return 0 = 可以再检查一次队列了; 1 = 确定超时(调用方应当放弃)
+ *
+ * @note 抽出来的理由: 这段"三种等待方式"的逻辑嵌在 while + if/else 里,
+ *       加上防虚假唤醒的内层 if, 一共 **5 层缩进**。
+ *       内核 coding-style 第 6 节: "超过 3 层缩进你就完了, 该改程序" —— 这就是那个情况。
+ *       **拆出去之后, 等待策略变成一张扁平的 if 表, 反而更好读。**
+ *
+ * @note 调用时必须已持有 q->lock。
+ */
+static int queue_wait_for_data(infra_queue_t *q, int timeout_ms)
+{
+    if (timeout_ms == 0)
+        return 1;                       /* 不等待: 空就是空 */
+
+    if (timeout_ms < 0) {
+        pthread_cond_wait(&q->not_empty, &q->lock);     /* 一直等 */
+        return 0;
+    }
+
+    {
+        struct timespec ts;
+
+        ms_to_abstime(timeout_ms, &ts);
+        if (pthread_cond_timedwait(&q->not_empty, &q->lock, &ts) == ETIMEDOUT &&
+            q->count == 0)
+            return 1;                   /* 超时了, 且再确认一次确实还是空的 */
+    }
+    return 0;
+}
+
 int infra_queue_pop(infra_queue_t *q, void *buf, size_t cap,
                     size_t *out_len, int timeout_ms)
 {
@@ -170,27 +203,12 @@ int infra_queue_pop(infra_queue_t *q, void *buf, size_t cap,
     pthread_mutex_lock(&q->lock);
 
     /* ── 等数据(队列空时)── */
-    while (q->count == 0) {
-        if (timeout_ms == 0) {
-            rc = 1;                     /* 不等待, 直接报超时 */
-            break;
-        }
-        if (timeout_ms < 0) {
-            pthread_cond_wait(&q->not_empty, &q->lock);     /* 一直等 */
-        } else {
-            struct timespec ts;
-            ms_to_abstime(timeout_ms, &ts);
-            if (pthread_cond_timedwait(&q->not_empty, &q->lock, &ts)
-                == ETIMEDOUT) {
-                if (q->count == 0) {    /* 再确认一次(防虚假唤醒) */
-                    rc = 1;
-                    break;
-                }
-            }
-        }
-    }
+    while (q->count == 0 && queue_wait_for_data(q, timeout_ms) == 0)
+        ;                               /* 条件变量可能被虚假唤醒, 所以回到 while 再查 */
 
-    if (rc == 0) {
+    if (q->count == 0) {
+        rc = 1;                         /* 等不到数据(纯超时或非阻塞) */
+    } else {
         size_t len = q->lens[q->head];
 
         memcpy(buf, slot_at(q, q->head), len);
