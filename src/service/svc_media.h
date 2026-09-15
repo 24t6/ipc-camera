@@ -64,7 +64,7 @@ typedef struct {
     uint32_t len;          /**< 码流字节数 */
     uint32_t cap;          /**< 槽位容量(便于发送端判断有没有被截断) */
     uint32_t frame_index;  /**< 帧序号(从 0 开始递增。**不是** RTP 序列号) */
-    uint64_t pts;          /**< 编码器给的时间戳(90kHz 单位)—— B012 的正解 */
+    uint64_t pts;          /**< 编码器给的时间戳。**单位 1 MHz**(实测, 见下) */
     uint32_t session_id;   /**< 预留: 将来多路流时可区分 */
     uint32_t reserved;     /**< 备用字段(不是"填充到 24 字节", 见下) */
 } svc_media_frame_hdr_t;
@@ -112,6 +112,15 @@ typedef struct {
  * @note 帧头为什么不用 `#pragma pack` 压到更小: 压包会让 `pts` 变成
  *       **非对齐访问**, ARMv7 上要么变慢、要么触发对齐异常。
  *       为省几字节冒这个险不值得 —— 槽位本来就是 256 KB 级。
+ *
+ * @note ⚠️ **`pts` 的单位是 1 MHz, 不是 90 kHz**(2026-09-15 实测更正)。
+ *       这里原来写的是"90kHz 单位", 那是照抄的一般说法, **没核实过**。
+ *       板上实测: 相邻帧 PTS 间隔稳定在 33323~33343(标称 33333),
+ *       按 `33333 × 30fps ≈ 999,990` 反推 → **1 MHz**。
+ *       (90kHz/30fps 应当是 3000, 差 11 倍。)
+ *       消费方(`proto_rtp`)必须按 `PROTO_RTP_PTS_HZ` 换算成 90kHz,
+ *       **不能直接把这个值当 RTP 时间戳**。
+ *       实测脚本: `ipc_camera/tools/media_smoke.c`(会打印标称间隔并反推时基)。
  */
 #define SVC_MEDIA_HDR_SIZE ((int)sizeof(svc_media_frame_hdr_t))
 

@@ -53,9 +53,6 @@
 #include <stddef.h>
 #include <stdint.h>
 
-/** 我们要取的那一路编码通道。0 = H.265 1080p,1 = H.264 720p */
-#define BSP_MPP_VENC_CHN 1
-
 /** 取流缓冲的建议大小(单帧最大字节数)。架构预算里给的 256 KB */
 #define BSP_MPP_FRAME_MAX_BYTES (256 * 1024)
 
@@ -94,8 +91,24 @@ typedef struct {
 typedef struct {
     bsp_mpp_pack_t packs[BSP_MPP_MAX_PACKS];    /**< 各段(按 pack 顺序) */
     int            pack_count;                  /**< 实际 pack 数 */
-    uint64_t       pts;                         /**< 编码器给的时间戳(90kHz) */
+    uint64_t       pts;                         /**< 编码器时间戳。★ 时基**实测 = 1 MHz**
+                                                 *   (相邻两帧差 33333 = 1e6/30),
+                                                 *   不是 90 kHz —— RTP 换算见 `proto_rtp.c` */
 } bsp_mpp_frame_t;
+
+/**
+ * 选择要取的那一路编码通道。**必须在 `bsp_mpp_init()` 之前调用。**
+ *
+ * @param is_h265 非 0 = H.265 1080p(VENC chn0); 0 = H.264 720p(VENC chn1)
+ *
+ * @note ⚠️ 为什么是"选一路"而不是"两路都开、取的时候挑一路" —— 这是 **B027**:
+ *   曾经两路都启动、只取 chn1, 结果**没人取的 chn0** 把码流缓冲塞满
+ *   (`BusyCnt=200 / FreeCnt=0`), 它自己停编码, 输入图像队列随之占满,
+ *   于是 **VPSS 被拖住**, 连正在取的 chn1 也一起在 **205 帧**处死掉。
+ *   板子 `/proc/umap/venc` 里 chn0 的 `Full=640` 与 `UserGet=0` 是直接铁证。
+ *   **结论: 通路上不许出现没有消费者的通道。**
+ */
+void bsp_mpp_select_encoder(int is_h265);
 
 /**
  * 初始化 MPP 视频通路(系统/VB → VI → VPSS → VENC)。
@@ -104,6 +117,7 @@ typedef struct {
  *
  * @note **阻塞**,约 5~10 秒(要等 ISP 起来)。**不要在网络线程里调**。
  * @note 重复调用(已初始化)返回 0,不做任何事。
+ * @note 只启动 `bsp_mpp_select_encoder()` 选中的那一路(默认 H.264 720p)。
  */
 int bsp_mpp_init(void);
 
@@ -144,6 +158,14 @@ typedef struct {
     uint64_t bytes;         /**< 累计字节数 */
     uint64_t timeouts;      /**< 超时次数(不等于错误,只是"当时没帧") */
     uint64_t errors;        /**< 真错误次数 */
+    /**
+     * 取流时"码流缓冲已满"(`u32LeftStreamFrames == 0`)却仍然取走的次数。
+     *
+     * @note ★ 这个计数是 B027 的**判据**:它 > 0 就证明"缓冲满 → 必须继续取流排空"
+     *       这条路径被走到过。若它一直是 0, 说明压根没碰过缓冲满,
+     *       那次"205 帧卡死"就是别的原因。
+     */
+    uint64_t drained_full;
 } bsp_mpp_stats_t;
 
 /** 取统计快照。 */

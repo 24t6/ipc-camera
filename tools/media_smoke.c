@@ -376,6 +376,7 @@ static void check_one_frame(const uint8_t *slot, size_t n, int is_h265,
 int main(int argc, char **argv)
 {
     int             secs = SMOKE_DEFAULT_SEC;
+    int             is_h265 = 0;        /* 默认 H.264(chn1); -h265 切 H.265(chn0) */
     infra_queue_t  *q;
     svc_media_stats_t ms;
     infra_queue_stats_t qs;
@@ -393,13 +394,28 @@ int main(int argc, char **argv)
     double          sec_measured;        /* 测量窗口时长(不含最后的抽干) */
     unsigned long long got_at_deadline;  /* 测量窗口结束时的帧数 */
 
-    if (argc > 1)
+    if (argc > 1 && argv[1][0] != '-')
         secs = atoi(argv[1]);
     if (secs <= 0 || secs > 120)
         secs = SMOKE_DEFAULT_SEC;
+    /*
+     * `-h265` 切到 H.265 那一路(chn0)。
+     * 为什么需要这个开关: 2026-09-15 发现取流会在 **~205 帧**后冻结,
+     * 需要分清"只有 chn1(H.264)有问题"还是"整个 VENC 都这样" ——
+     * 换一路跑一次就能判定, 比读代码猜快得多。
+     */
+    {
+        int i;
+
+        for (i = 1; i < argc; i++) {
+            if (strcmp(argv[i], "-h265") == 0)
+                is_h265 = 1;
+        }
+    }
 
     printf("===== M1-9 板端集成冒烟: MPP → svc_media → 队列 → 消费端 =====\n");
-    printf("计划跑 %d 秒;每槽位 %d 字节(%d 帧头 + %d 码流)× %d 槽 = %.2f MB\n",
+    printf("编码: %s(chn%d);计划跑 %d 秒;每槽位 %d 字节(%d 帧头 + %d 码流)× %d 槽 = %.2f MB\n",
+           is_h265 ? "H.265" : "H.264", is_h265 ? 0 : 1,
            secs, SMOKE_SLOT_BYTES, SVC_MEDIA_HDR_SIZE, SMOKE_SLOT_DATA,
            SMOKE_CAPACITY,
            (double)SMOKE_SLOT_BYTES * SMOKE_CAPACITY / 1024.0 / 1024.0);
@@ -424,7 +440,7 @@ int main(int argc, char **argv)
     /* ── 启动取流(内部会做 MPP 初始化, 约 5~10 秒)── */
     printf("\n【1】svc_media_start() —— 含 MPP 初始化, 请稍等…\n");
     t0 = now_ms();
-    rc = svc_media_start(q, 0);             /* 0 = H.264, 与 bsp_mpp 的 chn1 一致 */
+    rc = svc_media_start(q, is_h265);       /* 必须和 bsp_mpp 编的那一路一致 */
     if (rc != 0) {
         printf("❌ svc_media_start 失败 rc=%d\n", rc);
         infra_queue_destroy(q);
@@ -444,7 +460,7 @@ int main(int argc, char **argv)
 
         rc = infra_queue_pop(q, slot, SMOKE_SLOT_BYTES, &n, SMOKE_POP_WAIT_MS);
         if (rc == 0)
-            check_one_frame(slot, n, 0, &a);
+            check_one_frame(slot, n, is_h265, &a);
 
         if (now_ms() >= t_next_report) {
             svc_media_get_stats(&ms);
@@ -486,7 +502,7 @@ int main(int argc, char **argv)
             rc = infra_queue_pop(q, slot, SMOKE_SLOT_BYTES, &n, 0);  /* 不等待 */
             if (rc != 0)
                 break;                      /* 空了(或出错), 抽干结束 */
-            check_one_frame(slot, n, 0, &a);
+            check_one_frame(slot, n, is_h265, &a);
             drained++;
         }
         printf("   抽干取出 %d 帧(已计入对账, 但不计入帧率)\n", drained);

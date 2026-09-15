@@ -334,6 +334,12 @@ int svc_media_start(void *queue, int is_h265)
         return -3;
     }
 
+    /*
+     * ★ 先告诉 bsp "取哪一路", **再**初始化 —— bsp 只会启动被选中的那一路。
+     *   两路都开的话, **没人取的那一路**会塞满自己的码流缓冲并把 VPSS 拖住,
+     *   最终连我们在取的那一路一起死掉(实测死在 205 帧)。详见 B027 / bsp_mpp.h。
+     */
+    bsp_mpp_select_encoder(g.is_h265);
     if (bsp_mpp_init() != 0) {
         LOG_ERROR("MPP 通路初始化失败");
         free(g.slot);
