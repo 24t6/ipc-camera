@@ -352,6 +352,37 @@ int main(void)
                   infra_queue_pop(NULL, out, sizeof(out), NULL, 0) == -1);
         }
     }
+    printf("\n");
+
+    /* ═══ ⑨ 统计里要能读到"槽位字节数" ═══ */
+    printf("⑨ 统计字段 slot_size 可读(2026-09-14 新增)\n");
+    {
+        /*
+         * 为什么要测这个:
+         *   svc_media 要把一帧裸流塞进队列槽位, 且要在前面加一个 24 字节帧头;
+         *   它必须知道**一个槽位有多少字节**, 否则算不出"裸流最多能放多长"。
+         *   原来 infra_queue_stats_t 只报槽位**个数**(capacity), 不报字节数 →
+         *   消费方只能自己另存一份, 两处一旦不一致就是隐蔽的越界。
+         *   现在队列自己报出来, 这个测试就是防它被改回去。
+         */
+        infra_queue_t       *q = infra_queue_create(7, 4096);
+        infra_queue_stats_t  st;
+
+        infra_queue_get_stats(q, &st);
+        check("★ slot_size 报的是创建时给的字节数(4096)",
+              st.slot_size == 4096);
+        check("capacity 报的是槽位个数(7), 别和 slot_size 搞混",
+              st.capacity == 7);
+        infra_queue_destroy(q);
+
+        /* 换个"怪尺寸"再验一次: 确认它不是只对 2 的幂凑巧对 */
+        q = infra_queue_create(3, 1234);
+        check("换 slot_size=1234 的队列也能创建", q != NULL);
+        infra_queue_get_stats(q, &st);
+        check("  slot_size == 1234(如实报出, 不取整、不对齐)",
+              st.slot_size == 1234);
+        infra_queue_destroy(q);
+    }
 
     printf("\n===== 结果: %s(%d 项失败)=====\n",
            g_fails == 0 ? "全部通过" : "有失败", g_fails);

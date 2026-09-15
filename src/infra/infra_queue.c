@@ -248,5 +248,6 @@ void infra_queue_get_stats(infra_queue_t *q, infra_queue_stats_t *out)
     out->depth     = q->count;
     out->capacity  = q->capacity;
     out->max_depth = q->max_depth;
+    out->slot_size = q->slot_size;
     pthread_mutex_unlock(&q->lock);
 }

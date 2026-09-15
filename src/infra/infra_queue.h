@@ -56,8 +56,18 @@ typedef struct {
     uint64_t dropped;       /* 因队满而丢弃的最旧帧数 */
     uint64_t rejected;      /* 因单帧超长被拒绝的入队次数 */
     size_t   depth;         /* 当前深度(即刻可读水位) */
-    size_t   capacity;      /* 总容量 */
+    size_t   capacity;      /* 总槽位数 */
     size_t   max_depth;     /* 历史最高水位 —— 用来判断"够不够用" */
+    /**
+     * 每个槽位的**字节数**(即创建时传入的 slot_size)。
+     *
+     * @note 2026-09-14 补:`capacity` 只说明"有几个槽位",
+     *       消费方还需要知道"一个槽位能装多少字节" ——
+     *       例如 `svc_media` 要在槽位头部放一个帧头,
+     *       就得算 `slot_size - 帧头大小` 才是真正能放的裸流长度。
+     *       让队列自己报出来, 消费方就不必再自己存一份(避免两处不一致)。
+     */
+    size_t   slot_size;
 } infra_queue_stats_t;
 
 /**
