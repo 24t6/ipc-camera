@@ -45,6 +45,41 @@ static int g_fails;
 static int g_passes;
 static uint16_t g_port;
 
+/*
+ * ── on_play 回调的捕获器(M1-9 新增)──
+ *
+ * 为什么要"捕获"而不是只让回调非 NULL:
+ *   加了参数之后, **只验证回调被调到是不够的** —— 如果上层拿到的目的地
+ *   是错的(比如端口填成了 RTSP 端口), 回调照样"被调到了"。
+ *   所以要把传进来的 sockaddr_in **存下来**, 再断言它的 IP 和端口。
+ *   这是本项目的老规矩: 断言要能证伪, 不能只断言"函数被调了"。
+ */
+static int                 g_play_calls;      /* on_play 被调了几次 */
+static int                 g_play_index = -1; /* 最后一次的 client_index */
+static struct sockaddr_in  g_play_dst;        /* 最后一次收到的 RTP 目的地 */
+static int                 g_play_dst_null;   /* 收到过 NULL 目的地的次数(应为 0) */
+static int                 g_teardown_calls;
+
+static void fake_on_play(int client_index, const struct sockaddr_in *rtp_dst,
+                         void *user)
+{
+    (void)user;
+    g_play_calls++;
+    g_play_index = client_index;
+    if (rtp_dst == NULL) {
+        g_play_dst_null++;
+        return;
+    }
+    g_play_dst = *rtp_dst;
+}
+
+static void fake_on_teardown(int client_index, void *user)
+{
+    (void)client_index;
+    (void)user;
+    g_teardown_calls++;
+}
+
 static void check(const char *name, int cond, const char *detail)
 {
     if (cond) {
@@ -254,6 +289,10 @@ int main(int argc, char **argv)
     cfg.sdp_len          = sdp_len;
     cfg.idle_timeout_sec = 2;           /* 测空闲超时, 用短的 */
 
+    /* 注册回调 —— ⑦-2 要靠它验证"RTP 目的地真的传出来了" */
+    cfg.on_play     = fake_on_play;
+    cfg.on_teardown = fake_on_teardown;
+
     check("svc_net_start 返回 0", svc_net_start(&cfg) == 0, NULL);
     check("服务状态为运行中", svc_net_is_running() == 1, NULL);
     g_port = svc_net_port();
@@ -401,6 +440,54 @@ int main(int argc, char **argv)
             eof = (n == 0);
         }
         check("★ TEARDOWN 之后服务器主动关闭连接", eof, NULL);
+    }
+    close(fd);
+    printf("\n");
+
+    /* ═══ ⑥-2 UDP 会话: on_play 必须传出正确的 RTP 目的地(M1-9 新增) ═══ */
+    /*
+     * 这一节验的是 M1-9 接线的**前置条件**: 上层要往客户端发 RTP,
+     * 就必须从 on_play 拿到 "客户端 IP + 客户端 RTP 端口"。
+     *
+     * ⚠️ 用 **UDP** 而不是 TCP 交错, 而且 client_port 用一个**不常见的值**
+     *    (50000-50001) —— 这样如果实现里把端口写错(比如误用 RTSP 端口、
+     *    或误用 RTCP 端口), 断言立刻能发现。用 5000 这种默认值反而容易
+     *    "碰巧对上"而掩盖错误。
+     */
+    printf("⑥-2 UDP 会话: on_play 传出的 RTP 目的地\n");
+    {
+        int before = g_play_calls;
+
+        fd = cli_connect();
+        rl = mk_req(req, sizeof(req), "SETUP", 35, "/live/streamid=0",
+                    "Transport: RTP/AVP;unicast;client_port=50000-50001\r\n");
+        send(fd, req, rl, 0);
+        got = cli_recv(fd, resp, sizeof(resp), 2000, 150);
+        check("UDP SETUP 拿到 200", cli_count_200(resp) == 1, NULL);
+        check("回显 client_port=50000-50001",
+              strstr(resp, "client_port=50000-50001") != NULL, NULL);
+
+        rl = mk_req(req, sizeof(req), "PLAY", 36, "/live",
+                    "Session: 1000\r\nRange: npt=0.000-\r\n");
+        send(fd, req, rl, 0);
+        got = cli_recv(fd, resp, sizeof(resp), 2000, 150);
+        check("UDP PLAY 拿到 200", cli_count_200(resp) == 1, NULL);
+
+        check("★ on_play 被调用了", g_play_calls == before + 1, NULL);
+        check("★ 传出的目的地不是 NULL", g_play_dst_null == 0, NULL);
+        check("★ 目的地 IP 是客户端 IP(127.0.0.1)",
+              g_play_dst.sin_addr.s_addr == htonl(INADDR_LOOPBACK), NULL);
+        check("★ 目的地端口 = SETUP 协商的 client_port(50000)",
+              ntohs(g_play_dst.sin_port) == 50000, NULL);
+        check("★ 用同一个值反查端口也能对上(证明字节序没错)",
+              ntohs(g_play_dst.sin_port) != 50001, NULL);
+
+        /* 收尾: TEARDOWN → 应触发 on_teardown */
+        rl = mk_req(req, sizeof(req), "TEARDOWN", 37, "/live", "Session: 1000\r\n");
+        send(fd, req, rl, 0);
+        got = cli_recv(fd, resp, sizeof(resp), 2000, 150);
+        check("UDP TEARDOWN 拿到 200", cli_count_200(resp) == 1, NULL);
+        check("★ on_teardown 被调用了", g_teardown_calls >= 1, NULL);
     }
     close(fd);
     printf("\n");

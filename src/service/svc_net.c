@@ -23,6 +23,7 @@
 #include "infra_poll.h"
 #include "proto_rtsp.h"
 
+#include <arpa/inet.h>      /* inet_ntoa —— 日志里打客户端 IP */
 #include <errno.h>
 #include <pthread.h>
 #include <stdio.h>
@@ -56,6 +57,24 @@ typedef struct {
     uint8_t  rtp_channel;               /* SETUP 协商结果(TCP 交错用) */
     uint8_t  rtcp_channel;
 
+    /*
+     * ── M1-9 新增: RTP 目的地 ──
+     *
+     * 为什么要存这三样: 上层(发送线程)要 `sendto()` 到客户端, 就必须知道
+     *   **客户端 IP**(从 accept 取) + **客户端 RTP 端口**(从 SETUP 的
+     *   `client_port=a-b` 取)。
+     * 原来这两样都没存 —— accept 传的是 NULL、setup_session 只记了通道号,
+     * 于是 RTP 发送根本无从下手。这是 M1-9 接线时补上的缺口。
+     *
+     * @note 客户端的 **RTSP 源端口 != RTP 接收端口**!
+     *       RTSP 走 554(或任意临时端口), 而 RTP 是客户端在 SETUP 里
+     *       **另开的一个 UDP 端口**(典型 5000-5001)。两者必须分开存,
+     *       混用会导致"往 RTSP 端口发 RTP"这种查起来很痛的问题。
+     */
+    struct sockaddr_in peer_addr;       /* 对端 IP(RTSP 连接的来源) */
+    uint16_t client_rtp_port;           /* SETUP 协商到的 RTP 端口 */
+    uint16_t client_rtcp_port;          /* SETUP 协商到的 RTCP 端口(= RTP+1) */
+
     time_t   last_active;               /* 最后一次收到数据的时刻 */
 } svc_net_client_t;
 
@@ -88,7 +107,8 @@ static struct {
     size_t              sdp_len;
 
     int                 idle_timeout_sec;
-    void              (*on_play)(int, void *);
+    /* 与 svc_net_cfg_t 里的两个回调保持一致(签名改一处必须改两处, 否则是 UB) */
+    void              (*on_play)(int, const struct sockaddr_in *, void *);
     void              (*on_teardown)(int, void *);
     void               *user;
 
@@ -258,12 +278,33 @@ static int handle_parse_failure(svc_net_client_t *c,
 }
 
 /**
- * 处理 SETUP: 记录会话与传输通道。
+ * 取一个客户端的 **RTP 目的地**(IP = 对端 IP, 端口 = SETUP 协商到的 RTP 端口)。
+ *
+ * @param c  客户端槽位
+ * @param out 输出: 目的地
+ *
+ * @note 抽成 helper 是因为有两个地方要用:
+ *       ① PLAY 时通过 `on_play` 把它交给上层
+ *       ② 将来若要支持"运行时查询"(如 RTCP), 也能复用
+ *       两处各写一遍容易漏掉 `sin_family` 之类的字段。
+ */
+static void client_rtp_dst(const svc_net_client_t *c, struct sockaddr_in *out)
+{
+    memset(out, 0, sizeof(*out));
+    out->sin_family      = AF_INET;
+    out->sin_addr.s_addr = c->peer_addr.sin_addr.s_addr;   /* 只取 IP, 不要 RTSP 端口 */
+    out->sin_port        = htons(c->client_rtp_port);
+}
+
+/**
+ * 处理 SETUP: 记录会话、传输通道与 **RTP 目的地**。
  *
  * @note 会话号 = 槽位下标 + 基准值: 同一连接每次 SETUP 都得到确定的号,
  *       而槽位下标天然唯一 → 不会和别的连接撞上。
  * @note 交错通道号只在客户端要 TCP 时才有意义; UDP 时填默认值,
  *       这样上层(发 RTP)不必再判断传输方式。
+ * @note ⚠️ **这里必须存 `client_port`** —— 它就是客户端准备收 RTP 的
+ *       UDP 端口, 少了它 RTP 根本发不出去(见 `svc_net_client_t` 的说明)。
  */
 static void setup_session(svc_net_client_t *c, const proto_rtsp_request_t *req)
 {
@@ -273,6 +314,13 @@ static void setup_session(svc_net_client_t *c, const proto_rtsp_request_t *req)
     c->session_assigned = 1;
     c->rtp_channel      = tcp ? req->interleaved_rtp  : SVC_NET_RTP_CHANNEL;
     c->rtcp_channel     = tcp ? req->interleaved_rtcp : SVC_NET_RTCP_CHANNEL;
+    c->client_rtp_port  = req->client_rtp_port;
+    c->client_rtcp_port = req->client_rtcp_port;
+
+    LOG_INFO("客户端%d: SETUP 完成(session=%u, %s, RTP 端口 %u)",
+             c->index, c->session_id,
+             tcp ? "TCP 交错" : "UDP",
+             (unsigned)c->client_rtp_port);
 }
 
 /**
@@ -298,9 +346,17 @@ static int handle_play_pause(svc_net_client_t *c, const proto_rtsp_request_t *re
     if (send_all(c->fd, resp, (size_t)n) != 0)
         return -1;
 
-    /* 先把响应发出去, 再通知上层 —— 否则上层的回调若阻塞, 客户端会先等到超时 */
-    if (playing && g.on_play != NULL)
-        g.on_play(c->index, g.user);
+    /*
+     * 先把响应发出去, 再通知上层 —— 否则上层的回调若阻塞, 客户端会先等到超时。
+     * 然后把 **RTP 目的地**一起交给上层(见 svc_net.h 里 on_play 的说明:
+     * 按值传出去, 上层不必再查表, 也就没有"查表期间客户端被清掉"的竞态)。
+     */
+    if (playing && g.on_play != NULL) {
+        struct sockaddr_in dst;
+
+        client_rtp_dst(c, &dst);
+        g.on_play(c->index, &dst, g.user);
+    }
     return 0;
 }
 
@@ -519,9 +575,15 @@ static void reap_idle(void)
 static void on_accept(void)
 {
     int cfd, idx;
-    ev_data_t d;
+    struct sockaddr_in peer;
+    socklen_t          peer_len = sizeof(peer);
 
-    cfd = accept(g.listen_fd, NULL, NULL);
+    /*
+     * ⚠️ 这里**必须把对端地址接出来** —— M1-9 的 RTP 发送要知道往哪个 IP 发。
+     * 原来传的是 NULL(地址直接丢掉), 于是上层拿不到客户端 IP。
+     */
+    memset(&peer, 0, sizeof(peer));
+    cfd = accept(g.listen_fd, (struct sockaddr *)&peer, &peer_len);
     if (cfd < 0) {
         if (errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK)
             LOG_WARN("accept 失败: %s", strerror(errno));
@@ -541,8 +603,16 @@ static void on_accept(void)
         return;
     }
 
-    d.kind  = EV_CLIENT;
-    d.index = idx;
+    /* 对端 IP 存进槽位 —— RTP 目的地的一半(另一半是 SETUP 协商的端口) */
+    g.clients[idx].peer_addr = peer;
+    LOG_INFO("新连接: fd=%d 来自 %s", cfd, inet_ntoa(peer.sin_addr));
+
+    /*
+     * @note 这里原来有一段 `d.kind = EV_CLIENT; d.index = idx;` 但 **d 从未被使用**
+     *       —— `dispatch_event()` 是靠 `client_find(ev->fd)` 反查槽位的,
+     *       不依赖这个 ev_data_t。属于死代码, 编译器会报
+     *       `variable 'd' set but not used`, 2026-09-15 清掉。
+     */
     if (infra_poller_add(g.poller, cfd, INFRA_POLL_IN) != 0) {
         LOG_ERROR("epoll 注册失败, 拒绝这个连接");
         infra_close(&g.clients[idx].fd);

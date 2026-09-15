@@ -71,6 +71,7 @@
 #ifndef __SVC_NET_H__
 #define __SVC_NET_H__
 
+#include <netinet/in.h>     /* struct sockaddr_in —— on_play 要传出 RTP 目的地 */
 #include <stddef.h>
 #include <stdint.h>
 
@@ -112,9 +113,26 @@ typedef struct {
 
     /**
      * 会话开始时被调用(PLAY 之后)。M1-9 用它把客户端挂到 RTP 发送路径上。
+     *
+     * @param client_index 客户端槽位下标(唯一标识一个客户端)
+     * @param rtp_dst      **该客户端的 RTP 目的地**(IP = 对端 IP, 端口 = SETUP 里
+     *                     协商到的 `client_port` 的 RTP 那一个)。这里**保证非 NULL**。
+     * @param user         `svc_net_cfg_t.user` 原样回传
+     *
+     * @note ⚠️ **为什么把目的地当参数传, 而不是让上层去查表**(2026-09-15):
+     *       上层(发送线程)需要"往哪发"才能建 sender。有两个做法:
+     *         ① 回调只给 index, 上层再调 `svc_net_get_rtp_dst(index)` 去查
+     *         ② **回调直接把目的地按值给出来**(本做法)
+     *       选 ② 的理由:目的地信息在 **PLAY 那一刻就已经完备**, 直接传出去
+     *       **没有任何竞态**; 而 ① 会让上层"拿着 index 去查表", 这期间
+     *       客户端可能已被空闲超时清掉 —— 那就是一个真实的竞态窗口。
+     *       代价是回调签名改动(测试的假回调要同步改), 但换来的是"不可能用错"。
+     *
      * @note 在事件循环线程里被调用, **不要在里面做阻塞操作**。
+     *       建 sender / 起线程这类事应当只做"记录", 真正的发送在别的线程。
      */
-    void      (*on_play)(int client_index, void *user);
+    void      (*on_play)(int client_index, const struct sockaddr_in *rtp_dst,
+                         void *user);
     /** 会话结束时被调用(TEARDOWN / 断开 / 超时)。 */
     void      (*on_teardown)(int client_index, void *user);
     void       *user;           /**< 原样传给上面两个回调 */

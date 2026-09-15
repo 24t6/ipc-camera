@@ -19,6 +19,95 @@
 #include "proto_nalu.h"
 #include "proto_rtp.h"
 
+/* ── 时间戳换算测试(M1-9 新增, 解 B012) ─────────────────────── */
+
+static int g_ts_fails;
+
+static void ts_check(const char *name, int cond, const char *detail)
+{
+    if (cond) {
+        printf("   [通过] %s%s%s\n", name, detail ? "  " : "", detail ? detail : "");
+    } else {
+        g_ts_fails++;
+        printf("   [失败] %s%s%s <<<\n", name, detail ? "  " : "", detail ? detail : "");
+    }
+}
+
+/**
+ * 验证「用编码器 PTS 推进时间戳」这条新路径。
+ *
+ * @note 这是**纯逻辑**测试, 不需要 socket —— 时间戳换算和网络无关。
+ *       实测依据: 本板 PTS 时基是 **1 MHz**(相邻帧间隔 33333),
+ *       而 RTP 时钟是 90kHz, 所以每帧时间戳增量应当 ≈ 3000
+ *       (33333 × 90000 / 1000000 = 2999.97)。
+ *
+ * @note ⚠️ 这里**故意不用 3000 做等值断言**, 而是断言落在 2990~3010:
+ *       PTS 间隔实测有 ±10 的抖动(33323~33343), 换算后就是 2999±1。
+ *       用等值会引入假失败 —— 断言的目的是抓"量级错"(比如忘了换算,
+ *       那会是 33333, 差 11 倍), 不是抓个别帧的抖动。
+ */
+static void test_pts_timestamp(void)
+{
+    proto_rtp_session_t s;
+    uint32_t            t0, t1, t2, t3;
+    const uint64_t      step = 33333;   /* 实测的标称 PTS 间隔(1MHz 单位) */
+
+    printf("\n----- 时间戳换算(编码器 PTS → RTP 90kHz)-----\n");
+
+    proto_rtp_session_init(&s, 0, 0x1234, 30);
+
+    /* ① 首帧: 只记基准, 时间戳不动 */
+    t0 = s.timestamp;
+    proto_rtp_session_frame_pts(&s, 1000000u);
+    ts_check("首帧只记基准 PTS, 不动时间戳", s.timestamp == t0, NULL);
+
+    /* ② 第二帧: 增量应 ≈ 3000(33333 × 90000 / 1000000) */
+    proto_rtp_session_frame_pts(&s, 1000000u + step);
+    t1 = s.timestamp - t0;
+    printf("      实测增量 = %u(期望 ≈ 3000)\n", t1);
+    ts_check("★ 一帧增量 ≈ 3000(1MHz→90kHz 换算正确)", t1 >= 2990 && t1 <= 3010,
+             NULL);
+    ts_check("★ 不是 33333(证明**做了换算**, 没有直接拿 PTS 当时间戳)",
+             t1 < 5000, NULL);
+
+    /* ③ 再来一帧: 增量应一致(帧间隔稳定 → 时间戳等距) */
+    proto_rtp_session_frame_pts(&s, 1000000u + step * 2);
+    t2 = s.timestamp - t0 - t1;
+    ts_check("★ 第二帧增量同样 ≈ 3000(等距)", t2 >= 2990 && t2 <= 3010, NULL);
+    ts_check("★ 时间戳严格递增", s.timestamp > t0 + t1, NULL);
+
+    /* ④ PTS 倒退(异常) → 时间戳**不动**, 保持单调 */
+    t3 = s.timestamp;
+    proto_rtp_session_frame_pts(&s, 1000000u + step);      /* 倒退 */
+    ts_check("★ PTS 倒退时不动时间戳(保持单调)", s.timestamp == t3, NULL);
+
+    /* ⑤ PTS 持平(同一帧被调两次) → 也不动 */
+    proto_rtp_session_frame_pts(&s, 1000000u + step * 2);
+    ts_check("★ PTS 持平时不动时间戳", s.timestamp == t3, NULL);
+
+    /* ⑥ 对 30fps 的一段连续帧: 总增量应 ≈ 帧数 × 3000 */
+    {
+        proto_rtp_session_t s2;
+        uint32_t            base;
+        int                 i;
+
+        proto_rtp_session_init(&s2, 0, 0x5678, 30);
+        proto_rtp_session_frame_pts(&s2, 5000000u);
+        base = s2.timestamp;
+        for (i = 1; i <= 30; i++)
+            proto_rtp_session_frame_pts(&s2, 5000000u + step * (uint64_t)i);
+
+        /* 30 帧间隔 × 3000 = 90000 ≈ 正好 1 秒的 RTP 时钟 */
+        {
+            uint32_t total = s2.timestamp - base;
+
+            printf("      30 帧总增量 = %u(期望 ≈ 90000, 即 1 秒)\n", total);
+            ts_check("★ 30 帧 ≈ 90000 = 恰好 1 秒的 90kHz 时钟",
+                     total >= 89700 && total <= 90300, NULL);
+        }
+    }
+}
+
 /* ── 测试统计 ─────────────────────────────────────────────────── */
 typedef struct {
     int nalus_total;
@@ -312,7 +401,18 @@ int main(int argc, char **argv)
                      ? ">>> PASS: 全部 NALU 打包→重组 逐字节一致 <<<"
                      : ">>> FAIL: 存在不一致 <<<");
 
+    /*
+     * 时间戳换算测试 —— 纯逻辑, 放在逐字节回归之后(它不依赖 socket/文件)。
+     * 为什么值得单独测: 老路径(next_frame)按 90000/fps 硬加, 新路径
+     * 用编码器 PTS 换算。**换算算错(比如忘了除 100)在逐字节回归里
+     * 完全看不出来** —— 分片照样对, 只是时间戳快 11 倍, 客户端会加速播放。
+     */
+    test_pts_timestamp();
+
+    printf("\n----- 时间戳部分: %s(%d 项失败)-----\n",
+           g_ts_fails == 0 ? "全部通过" : "有失败", g_ts_fails);
+
     free(buf);
     close(g_sockfd);
-    return (g_stats.verify_fail == 0) ? 0 : 1;
+    return (g_stats.verify_fail == 0 && g_ts_fails == 0) ? 0 : 1;
 }

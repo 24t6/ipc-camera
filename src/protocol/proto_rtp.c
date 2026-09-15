@@ -185,6 +185,43 @@ void proto_rtp_session_next_frame(proto_rtp_session_t *s)
     s->timestamp += s->ts_step;
 }
 
+void proto_rtp_session_frame_pts(proto_rtp_session_t *s, uint64_t pts)
+{
+    uint64_t delta;
+
+    if (s == NULL)
+        return;
+
+    /*
+     * 第一次调用: 只记下基准 PTS, **不动时间戳**。
+     * 为什么不在首帧就把它换算成时间戳: RTP 时间戳的起点应当是随机的
+     * (RFC 3550), 而且首帧的绝对 PTS 可能是个很大的数(实测 ~39 亿),
+     * 直接换算会把起点钉死在某个可预测的值上。从第二帧起用**差值**推进。
+     */
+    if (s->last_pts == 0) {
+        s->last_pts = pts;
+        return;
+    }
+
+    /* PTS 倒退或持平: 异常(或同一帧被调两次) → 不动时间戳, 保持单调 */
+    if (pts <= s->last_pts)
+        return;
+
+    delta = pts - s->last_pts;
+    s->last_pts = pts;
+
+    /*
+     * 1MHz → 90kHz: × 90000 / 1000000 = / 100。
+     *
+     * ⚠️ 先乘后除会溢出吗: delta 是"两帧之差"(实测 33333), 乘 90000
+     *    约 3×10^9, 在 uint64_t 里绰绰有余。即便 delta 大到 10^10
+     *    (约 2.8 小时的两帧间隔, 不现实)也不会溢出。
+     *    所以这里用 `delta * PROTO_RTP_CLOCK_RATE / PROTO_RTP_PTS_HZ`
+     *    保留精度, 比先除后乘准确。
+     */
+    s->timestamp += (uint32_t)(delta * PROTO_RTP_CLOCK_RATE / PROTO_RTP_PTS_HZ);
+}
+
 int proto_rtp_send_nalu(int sockfd, const struct sockaddr *dst, socklen_t dstlen,
                   proto_rtp_session_t *s, const proto_nalu_t *n, int is_last)
 {
