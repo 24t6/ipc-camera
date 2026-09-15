@@ -101,7 +101,7 @@ infra_sender_t *infra_sender_tcp_interleaved(int fd, uint8_t rtp_channel);
 2. 将来加 TCP interleaved 只影响 `infra_netio.c`
 3. 单测时可以注入一个"计数 sender",统计发了多少字节而不用真发网络
 
-> **⚠️ `destroy` 为什么收 `infra_sender_t **` 而不是 `void *ctx`(2026-02-12 修订)**
+> **⚠️ `destroy` 为什么收 `infra_sender_t **` 而不是 `void *ctx`(2026-09-14 修订)**
 >
 > 初版签名是 `void (*destroy)(void *ctx)`,即要求调用方传 `s->ctx`。
 > 但调用方手上拿的是 `s`,**极易写成 `s->destroy(s)`** —— 本项目在 M1-6 单测里
