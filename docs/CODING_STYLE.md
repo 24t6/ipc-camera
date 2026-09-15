@@ -368,6 +368,8 @@ int proto_rtp_send_nalu(/* ... */)          /* 函数: 括号另起一行 */
 [ ] -Wall -Wextra 零告警?
 [ ] 字符串/中文编码正确吗?(UTF-8)
 [ ] 跑过 `python tools/check_style.py` 吗?(函数 ≤ 50 代码行 / 局部变量 ≤ 10 / 缩进 ≤ 5 层)
+[ ] 跑过 `python tools/check_encoding.py` 吗?(UTF-8 / LF)
+[ ] 核心模块过了 ASan + UBSan 吗?(PC 侧能做的一定要做)
 [ ] 抽 helper 之后, 原来的**语义**还在吗?(尤其是回调返回值、错误码、提前返回)
 ```
 
@@ -375,6 +377,9 @@ int proto_rtp_send_nalu(/* ... */)          /* 函数: 括号另起一行 */
 > (原意是"回调要求提前终止"),**编译器不会报错,类型也完全对**。
 > 只有重跑 `rtp_test`(809/809 + 835/835 逐字节一致)才证明没改坏。
 > **重构必须重跑测试 —— 这是唯一能发现"语义静默丢失"的办法。**
+
+> 💡 工作区级(`D:\linux_hi`)还有一条:`python tools/gen_doc_index.py --check`
+> —— 加了文档/改了标题之后要重生成 `docs/文档索引.md`。见 `AGENTS.md` §7.3。
 
 ---
 
