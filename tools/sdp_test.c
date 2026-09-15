@@ -175,8 +175,67 @@ int main(int argc, char **argv)
         none.sps_len = none.pps_len = none.vps_len = 0;
         int rc = proto_sdp_build(&none, sdp, sizeof(sdp));
         fails += check("参数集为空时仍能生成(降级为无 sprop)", rc > 0);
-        if (rc > 0 && g_is_h265)
-            fails += check("  且未输出空的 sprop 字段", strstr(sdp, "sprop-vps=") == NULL);
+
+        /*
+         * ⚠️ 这一组断言是 2026-09-15 **补上的**, 因为漏测导致一个真 bug 溜过去:
+         *
+         *   原来的断言**只查 H.265 的 `sprop-vps=`**(下面那个 `if (g_is_h265)`),
+         *   而 H.264 分支当时**无条件**写
+         *       "sprop-parameter-sets=" + SPS + "," + PPS
+         *   参数集为空时产出的是残缺值 `sprop-parameter-sets=,` ——
+         *   实测让 ffmpeg/VLC **直接放弃这条流**:
+         *       [rtsp] Missing PPS in sprop-parameter-sets, ignoring
+         *   (板子侧只看到 4 个 RTSP 请求, 客户端连 PLAY 都不发。)
+         *
+         *   教训: **只测了一个协议分支就等于没测另一个**。
+         *        两个分支不对称(H.265 有 has_vps 守卫、H.264 没有)本身
+         *        就是"该回头看一眼"的信号。
+         */
+        if (rc > 0) {
+            /* 通用: 任何编码都不该出现"空值"形态的 sprop 字段 */
+            fails += check("  没有任何残缺的 sprop 空值(如 'sprop-...=,' 或 '=;')",
+                           strstr(sdp, "sprop-parameter-sets=,") == NULL &&
+                           strstr(sdp, "sprop-parameter-sets=;") == NULL &&
+                           strstr(sdp, "sprop-vps=;") == NULL);
+            if (g_is_h265)
+                fails += check("  H.265 未输出空的 sprop 字段",
+                               strstr(sdp, "sprop-vps=") == NULL &&
+                               strstr(sdp, "sprop-sps=") == NULL);
+            else
+                fails += check("  H.264 未输出空的 sprop-parameter-sets",
+                               strstr(sdp, "sprop-parameter-sets=") == NULL);
+            /*
+             * `packetization-mode=1` 是 **H.264(RFC 6184)** 的参数, 是"允许 FU-A 分片"
+             * 的开关 —— 参数集被省略时它**必须留下**, 不能跟着一起被省掉。
+             *
+             * ⚠️ 但 **H.265 根本没有这个参数**: RFC 7798 用的是
+             *    `sprop-vps/sps/pps` 与 `sprop-max-don-diff`, **不存在 packetization-mode**。
+             *    所以 H.265 分支不输出它**才是对的**。
+             *
+             *    这条断言原先写成了"两种编码都必须有", 于是 H.265 那一路**永远红**。
+             *    实测确认: 错的是**断言**, 不是代码 —— 又一次"先怀疑测法"
+             *    (同 B026 教训 3;B027 的 `-h265` 无效实验是同一个毛病的另一面)。
+             */
+            if (g_is_h265)
+                fails += check("  H.265 不输出 packetization-mode(RFC 7798 无此参数)",
+                               strstr(sdp, "packetization-mode") == NULL);
+            else
+                fails += check("  但 packetization-mode=1 仍然保留(分片开关)",
+                               strstr(sdp, "packetization-mode=1") != NULL);
+        }
+
+        /*
+         * 再补一个"只给一半参数集"的边界: 半成品会影响客户端解析,
+         * 应当与"都没有"一样被省略(而不是写出只有 SPS 的残缺字段)。
+         */
+        none = g_cfg;
+        none.vps_len = 0;
+        none.pps_len = 0;               /* 只留 SPS */
+        if (none.sps_len > 0) {
+            rc = proto_sdp_build(&none, sdp, sizeof(sdp));
+            fails += check("只有 SPS 没有 PPS 时也省略整个字段", rc > 0 &&
+                           strstr(sdp, "sprop-parameter-sets=") == NULL);
+        }
     }
     printf("\n");
 

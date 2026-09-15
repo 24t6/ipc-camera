@@ -131,10 +131,32 @@ static int build_common(const proto_sdp_cfg_t *cfg, char *out, size_t cap,
  *   a=fmtp:96 packetization-mode=1;sprop-parameter-sets=<b64(SPS)>,<b64(PPS)>
  *
  * 注意 SPS 与 PPS 是**逗号**分隔, 且属于同一个 sprop-parameter-sets 字段。
+ *
+ * @note ⚠️ **参数集为空时必须把整个 `sprop-parameter-sets` 字段省掉**
+ *       (2026-09-15 修的一个真 bug, 值得完整记下):
+ *
+ *   第一版这里**无条件**写 `sprop-parameter-sets=` + SPS + `,` + PPS。
+ *   当 SPS/PPS 都为空(`len == 0`, 本项目的默认做法)时, 产出的是:
+ *
+ *       a=fmtp:96 packetization-mode=1;sprop-parameter-sets=,
+ *                                                        ↑ 残缺! 空 SPS + 逗号 + 空 PPS
+ *
+ *   后果(实测, 不是推测): **ffmpeg/VLC 直接放弃这条流** ——
+ *       [rtsp] Missing PPS in sprop-parameter-sets, ignoring
+ *   然后它连 PLAY 都不发(板子侧只看到 4 个 RTSP 请求), 画面永远出不来。
+ *
+ *   **教训**: 参数集"可以先不给"(让客户端等码流里的), 但
+ *   **不能给一个残缺的值** —— 后者比完全不给更糟。
+ *   "可选字段"的正确做法是**整段省略**, 不是"写个空值"。
+ *   (H.265 分支当时就有 `has_vps` 守卫, H.264 分支漏了 —— 两个分支不对称
+ *    本身就是信号: 写第二个分支时该回头看一眼第一个。)
  */
 static int build_h264(const proto_sdp_cfg_t *cfg, char *out, size_t cap,
                       size_t *used, const char *codec_name)
 {
+    int has_sps = (cfg->sps_len > 0);
+    int has_pps = (cfg->pps_len > 0);
+
     if (build_common(cfg, out, cap, used) != 0)
         return -1;
     if (append(out, cap, used, "\r\na=rtpmap:") != 0)
@@ -149,14 +171,30 @@ static int build_h264(const proto_sdp_cfg_t *cfg, char *out, size_t cap,
         return -1;
     if (append_pt(out, cap, used, cfg->payload_type) != 0)
         return -1;
-    if (append(out, cap, used, " packetization-mode=1;sprop-parameter-sets=") != 0)
+    if (append(out, cap, used, " packetization-mode=1") != 0)
         return -1;
-    if (append_param(out, cap, used, "", cfg->sps, cfg->sps_len) != 0)
-        return -1;
-    if (append(out, cap, used, ",") != 0)
-        return -1;
-    if (append_param(out, cap, used, "", cfg->pps, cfg->pps_len) != 0)
-        return -1;
+
+    /*
+     * ★ 只有**真的拿到了**参数集才写这个字段。
+     *   两个都没有 → 整段省略(客户端会等码流里的 SPS/PPS,
+     *   而我们的发送端保证从 IDR 起, IDR 自带参数集)。
+     *
+     *   ⚠️ 只有一个的情况也**一并省略**: 缺一个参数集的半成品
+     *   会让客户端解析失败 —— 比完全不给更糟。
+     *   @note 这里**不记日志**: 本文件属于 protocol 层, 而日志在 infra 层,
+     *         分层规矩是"只能从上往下依赖"(见 ARCHITECTURE.md)。
+     *         要观测这种情况, 应由 service 层在调用前检查参数集完整性。
+     */
+    if (has_sps && has_pps) {
+        if (append(out, cap, used, ";sprop-parameter-sets=") != 0)
+            return -1;
+        if (append_param(out, cap, used, "", cfg->sps, cfg->sps_len) != 0)
+            return -1;
+        if (append(out, cap, used, ",") != 0)
+            return -1;
+        if (append_param(out, cap, used, "", cfg->pps, cfg->pps_len) != 0)
+            return -1;
+    }
     return append(out, cap, used, "\r\na=control:streamid=0\r\n");
 }
 
