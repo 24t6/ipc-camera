@@ -1,6 +1,12 @@
 /**
- * @file osd_render.c
+ * @file bsp_osd_render.c
  * @brief OSD 时间水印的纯渲染逻辑(字模 + 位图生成)
+ *
+ * 【模块职责】时间格式化 + 13 个点阵字形 → ARGB1555 位图
+ * 【依赖方向】**不依赖任何项目内模块**, 只用 libc(<string.h> / <time.h>)
+ *             —— 所以能在 PC 上原生单测(tools/bsp_osd_render_test.c)
+ * 【线程模型】无状态全局、纯函数; 调用方自带缓冲, 可在多线程中并发使用
+ * 【资源边界】无动态分配、不碰硬件; 数据只在 .rodata(字模)与调用方缓冲里
  *
  * ## 字模为什么写成源码里的 ASCII 图, 而不是复用参考项目的汉字库
  *
@@ -21,7 +27,7 @@
  * 取第 `row` 行第 `col` 列 = `art[row * 8 + col] == '#'`。
  * 有效笔画画在 **第 2~13 行**, 左右各留 1 列, 这样数字之间自然有空隙。
  */
-#include "osd_render.h"
+#include "bsp_osd_render.h"
 
 #include <string.h>
 
@@ -187,11 +193,11 @@ static void osd_draw_glyph(uint16_t *buf, int stride_px, char ch,
     int row;
     int col;
 
-    for (row = 0; row < OSD_GLYPH_H; row++) {
-        for (col = 0; col < OSD_GLYPH_W; col++) {
-            if (osd_render_glyph_bit(ch, row, col)) {
+    for (row = 0; row < BSP_OSD_RENDER_GLYPH_H; row++) {
+        for (col = 0; col < BSP_OSD_RENDER_GLYPH_W; col++) {
+            if (bsp_osd_render_glyph_bit(ch, row, col)) {
                 osd_fill_block(buf, stride_px, x0 + col * scale, row * scale,
-                               scale, OSD_PIXEL_FG);
+                               scale, BSP_OSD_RENDER_PIXEL_FG);
             }
         }
     }
@@ -199,7 +205,7 @@ static void osd_draw_glyph(uint16_t *buf, int stride_px, char ch,
 
 /* ---------- 对外接口 ---------- */
 
-int osd_render_format_time(const struct tm *tmv, char *out, size_t cap)
+int bsp_osd_render_format_time(const struct tm *tmv, char *out, size_t cap)
 {
     size_t n;
 
@@ -213,7 +219,7 @@ int osd_render_format_time(const struct tm *tmv, char *out, size_t cap)
     return (int)n;
 }
 
-int osd_render_measure(const char *text, int scale, osd_render_size_t *out)
+int bsp_osd_render_measure(const char *text, int scale, bsp_osd_render_size_t *out)
 {
     size_t n;
 
@@ -221,24 +227,24 @@ int osd_render_measure(const char *text, int scale, osd_render_size_t *out)
         return -1;
     }
     n = strlen(text);
-    if (n == 0 || n >= (size_t)OSD_RENDER_MAX_CHARS) {
+    if (n == 0 || n >= (size_t)BSP_OSD_RENDER_MAX_CHARS) {
         return -1;
     }
     out->chars  = (int)n;
     out->scale  = scale;
-    out->width  = (int)n * OSD_GLYPH_W * scale;
-    out->height = OSD_GLYPH_H * scale;
+    out->width  = (int)n * BSP_OSD_RENDER_GLYPH_W * scale;
+    out->height = BSP_OSD_RENDER_GLYPH_H * scale;
     return 0;
 }
 
-int osd_render_text(const char *text, int scale, uint16_t *buf,
-                    size_t buf_pixels, osd_render_size_t *out)
+int bsp_osd_render_text(const char *text, int scale, uint16_t *buf,
+                    size_t buf_pixels, bsp_osd_render_size_t *out)
 {
-    osd_render_size_t sz;
+    bsp_osd_render_size_t sz;
     size_t            need;
     int               i;
 
-    if (buf == NULL || osd_render_measure(text, scale, &sz) != 0) {
+    if (buf == NULL || bsp_osd_render_measure(text, scale, &sz) != 0) {
         return -1;
     }
     need = (size_t)sz.width * (size_t)sz.height;
@@ -249,7 +255,7 @@ int osd_render_text(const char *text, int scale, uint16_t *buf,
      * 这样"没画到的地方一定是透明的", 不会留下上一帧的残影。 */
     memset(buf, 0, need * sizeof(uint16_t));
     for (i = 0; i < sz.chars; i++) {
-        osd_draw_glyph(buf, sz.width, text[i], i * OSD_GLYPH_W * scale, scale);
+        osd_draw_glyph(buf, sz.width, text[i], i * BSP_OSD_RENDER_GLYPH_W * scale, scale);
     }
     if (out != NULL) {
         *out = sz;
@@ -257,10 +263,10 @@ int osd_render_text(const char *text, int scale, uint16_t *buf,
     return 0;
 }
 
-int osd_render_glyph_bit(char ch, int row, int col)
+int bsp_osd_render_glyph_bit(char ch, int row, int col)
 {
-    if (row < 0 || row >= OSD_GLYPH_H || col < 0 || col >= OSD_GLYPH_W) {
+    if (row < 0 || row >= BSP_OSD_RENDER_GLYPH_H || col < 0 || col >= BSP_OSD_RENDER_GLYPH_W) {
         return 0;
     }
-    return (osd_lookup_art(ch)[row * OSD_GLYPH_W + col] == '#') ? 1 : 0;
+    return (osd_lookup_art(ch)[row * BSP_OSD_RENDER_GLYPH_W + col] == '#') ? 1 : 0;
 }

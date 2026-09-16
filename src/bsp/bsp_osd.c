@@ -2,6 +2,14 @@
  * @file bsp_osd.c
  * @brief OSD 时间水印的板级实现(海思 REGION / OVERLAY → VENC 通道)
  *
+ * 【模块职责】建 OVERLAY 区域 → 挂到当前 VENC 通道 → 把位图喂进去
+ * 【依赖方向】依赖 bsp_mpp(取通道号与画面尺寸)、bsp_osd_render(生成位图)、
+ *             infra_log; **不依赖 service / protocol**
+ * 【线程模型】非线程安全。只允许**一个**线程调用
+ *             (按架构由 svc_osd 的 1 Hz 线程独占)
+ * 【资源边界】无动态分配。文件级静态像素缓冲 304×32×2 = 19,456 字节(.bss);
+ *             另持有 1 个 REGION 句柄(程序退出时 deinit 释放)
+ *
  * 详细的分层位置、复用出处与颜色约定见 `bsp_osd.h`。
  * 这里只强调一件事:**本文件是全项目唯一碰 `HI_MPI_RGN_*` 的地方**。
  */
@@ -20,9 +28,15 @@
 /** 区域句柄。依据厂商 `sample_comm_region.c`:`#define OverlayMinHandle 0` */
 #define BSP_OSD_RGN_HANDLE 0
 
-/** 水印像素缓冲(ARGB1555, 每像素 2 字节)。
- *  304 × 32 × 2 = 19,456 字节 —— **必须放 .bss, 不能放栈**
- *  (本项目规矩:栈数组不超过 4 KB)。 */
+/*
+ * 水印像素缓冲(ARGB1555, 每像素 2 字节)
+ *   容量依据 : 区域 304×32 像素 × 2 字节 = 19,456 字节
+ *              (区域尺寸由 bsp_osd.h 按"19 字符 × 8 列 × 2 倍"算出)
+ *   内存区域 : 文件级静态(.bss) —— **不放栈**
+ *              (项目规矩: 栈数组不超过 4 KB, 这个有 19 KB)
+ *   唯一所有者: 本模块
+ *   释放时机 : 程序生命周期内常驻, 无需释放
+ */
 static uint16_t g_pixels[BSP_OSD_REGION_W * BSP_OSD_REGION_H];
 
 static struct {
@@ -129,7 +143,7 @@ static int osd_attach(int venc_chn, int x, int y)
  * @param[in] px 紧密排列的 ARGB1555 像素(每行 `BSP_OSD_REGION_W` 个, 无行间填充)
  * @return 0 成功; -1 失败
  * @note `BITMAP_S` **没有 stride 字段** —— 所以缓冲必须是紧密排列的,
- *       `osd_render_text()` 输出的正好是。
+ *       `bsp_osd_render_text()` 输出的正好是。
  */
 static int osd_push_bitmap(uint16_t *px)
 {
@@ -189,12 +203,12 @@ int bsp_osd_init(void)
  * @note 区域尺寸在 `Create` 时就定死了、改不了 —— 文本长度不符**必须明确拒绝**,
  *       否则会画出一个错位的水印, 而且没人知道。
  */
-static int osd_render_into_buffer(const char *text)
+static int bsp_osd_render_into_buffer(const char *text)
 {
-    osd_render_size_t sz;
+    bsp_osd_render_size_t sz;
     size_t            pixels = (size_t)BSP_OSD_REGION_W * BSP_OSD_REGION_H;
 
-    if (osd_render_text(text, BSP_OSD_SCALE, g_pixels, pixels, &sz) != 0) {
+    if (bsp_osd_render_text(text, BSP_OSD_SCALE, g_pixels, pixels, &sz) != 0) {
         LOG_ERROR("水印渲染失败");
         return -1;
     }
@@ -210,7 +224,7 @@ int bsp_osd_show(const char *text)
     if (!g.attached || text == NULL) {
         return -1;
     }
-    if (osd_render_into_buffer(text) != 0 || osd_push_bitmap(g_pixels) != 0) {
+    if (bsp_osd_render_into_buffer(text) != 0 || osd_push_bitmap(g_pixels) != 0) {
         g.errors++;
         return -1;
     }

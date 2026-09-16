@@ -2,12 +2,19 @@
  * @file svc_osd.c
  * @brief OSD 时间水印服务(1 Hz 线程)
  *
+ * 【模块职责】定时驱动: 取当前时间 → 渲染 → 提交给 REGION
+ * 【依赖方向】依赖 bsp_osd(提交位图)、bsp_osd_render(格式化+渲染)、infra_log;
+ *             **不依赖 svc_media / svc_sender / svc_net**
+ * 【线程模型】自己起 **1 个**线程(osd_thread); 该线程独占 bsp_osd_*(非线程安全)
+ * 【资源边界】无动态分配。只有一个小状态结构(线程句柄 + 统计);
+ *             像素缓冲的所有权在 bsp_osd 那边
+ *
  * 设计理由、启动顺序的讲究见 `svc_osd.h`。
  *
  * 三段分工(每一段都能单独验证):
- *      `osd_render.c`  时间 + 字模 → ARGB1555 位图   (**PC 单测**)
- *      `bsp_osd.c`     位图 → REGION → VENC 通道     (板上验)
- *      `svc_osd.c`     **本文件**: 定时驱动上面两段
+ *      `bsp_osd_render.c`  时间 + 字模 → ARGB1555 位图   (**PC 单测**)
+ *      `bsp_osd.c`         位图 → REGION → VENC 通道     (板上验)
+ *      `svc_osd.c`         **本文件**: 定时驱动上面两段
  */
 #include "svc_osd.h"
 
@@ -15,8 +22,8 @@
 #include <time.h>
 
 #include "bsp_osd.h"
+#include "bsp_osd_render.h"
 #include "infra_log.h"
-#include "osd_render.h"
 
 static struct {
     int             running;
@@ -37,14 +44,14 @@ static int osd_update_once(void)
 {
     struct tm tmv;
     time_t    now;
-    char      text[OSD_RENDER_MAX_CHARS];
+    char      text[BSP_OSD_RENDER_MAX_CHARS];
 
     now = time(NULL);
     if (localtime_r(&now, &tmv) == NULL) {
         LOG_ERROR("localtime_r 失败");
         return -1;
     }
-    if (osd_render_format_time(&tmv, text, sizeof(text)) <= 0) {
+    if (bsp_osd_render_format_time(&tmv, text, sizeof(text)) <= 0) {
         LOG_ERROR("时间格式化失败");
         return -1;
     }

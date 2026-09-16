@@ -6,8 +6,8 @@
  * ─────────────────────────────────────────────────────────────────
  *  它在分层里的位置(M2 拆成三块, 各自能独立验证)
  * ─────────────────────────────────────────────────────────────────
- *      `osd_render.c`   纯函数: 时间 + 点阵字模 → ARGB1555 位图
- *                       **不碰硬件 → PC 上原生单测**(见 `tools/osd_render_test.c`)
+ *      `bsp_osd_render.c`   纯函数: 时间 + 点阵字模 → ARGB1555 位图
+ *                       **不碰硬件 → PC 上原生单测**(见 `tools/bsp_osd_render_test.c`)
  *      `bsp_osd.c`      **本文件**: 只有它碰 `HI_MPI_RGN_*`
  *                       → **只能板上验**
  *      `svc_osd.c`      1 Hz 线程, 每秒调一次 `bsp_osd_show()`
@@ -26,7 +26,7 @@
  *  (厂商 sample 就是"先挂载、再喂位图")。
  *
  * ─────────────────────────────────────────────────────────────────
- *  颜色约定(与 `osd_render.h` 一致)
+ *  颜色约定(与 `bsp_osd_render.h` 一致)
  * ─────────────────────────────────────────────────────────────────
  *  `PIXEL_FORMAT_ARGB_1555`; 文字 = `0xFFFF`(alpha 位 1),
  *  背景 = `0x0000`(alpha 位 0)。再配 `u32BgAlpha = 0` → **背景全透明**,
@@ -40,7 +40,7 @@
 
 #include <stdint.h>
 
-#include "osd_render.h"
+#include "bsp_osd_render.h"
 
 /** 水印字符数: `YYYY-MM-DD HH:MM:SS` 恰好 19 个 */
 #define BSP_OSD_TIME_CHARS 19
@@ -54,8 +54,8 @@
  * @note 海思要求 OVERLAY 的宽高为**偶数**(对齐 2);
  *       `8 × 2 = 16`、`16 × 2 = 32` 天然满足。
  */
-#define BSP_OSD_REGION_W (BSP_OSD_TIME_CHARS * OSD_GLYPH_W * BSP_OSD_SCALE)
-#define BSP_OSD_REGION_H (OSD_GLYPH_H * BSP_OSD_SCALE)
+#define BSP_OSD_REGION_W (BSP_OSD_TIME_CHARS * BSP_OSD_RENDER_GLYPH_W * BSP_OSD_SCALE)
+#define BSP_OSD_REGION_H (BSP_OSD_RENDER_GLYPH_H * BSP_OSD_SCALE)
 
 /** 区域离画面边缘的留白(像素) */
 #define BSP_OSD_MARGIN 16
