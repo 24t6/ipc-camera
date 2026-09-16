@@ -149,7 +149,7 @@ typedef struct {
 } svc_media_stats_t;
 
 /**
- * 启动取流服务。
+ * @brief 启动取流服务。
  *
  * @param queue  发送队列(**由调用方创建并拥有**; 本模块只 push, 不销毁它)
  * @param is_h265 1 = 按 H.265 解析; 0 = H.264。**必须和 bsp_mpp 编的那一路一致**
@@ -161,21 +161,21 @@ typedef struct {
 int svc_media_start(void *queue, int is_h265);
 
 /**
- * 停止取流服务: 通知线程退出 → join → `bsp_mpp_deinit()`。
+ * @brief 停止取流服务: 通知线程退出 → join → `bsp_mpp_deinit()`。
  *
  * @note **阻塞**, 会等线程真正退出(避免 use-after-free)。
  * @note 未启动时调用是安全的(no-op)。
  */
 void svc_media_stop(void);
 
-/** 服务是否在运行。@return 1 = 在运行 */
+/** @brief 服务是否在运行。@return 1 = 在运行 */
 int svc_media_is_running(void);
 
-/** 取统计快照。 */
+/** @brief 取统计快照。 */
 void svc_media_get_stats(svc_media_stats_t *out);
 
 /**
- * 从队列槽位里取出帧头指针。
+ * @brief 从队列槽位里取出帧头指针。
  *
  * @param slot 从队列 pop 出来的槽位(开头就是帧头)
  * @return 帧头指针; 槽位内容不是我们写的帧时返回 NULL(魔数不符)
@@ -185,7 +185,7 @@ void svc_media_get_stats(svc_media_stats_t *out);
  */
 const svc_media_frame_hdr_t *svc_media_slot_hdr(const void *slot);
 
-/** 取槽位里的码流数据指针(紧跟帧头)。 */
+/** @brief 取槽位里的码流数据指针(紧跟帧头)。 */
 const uint8_t *svc_media_slot_data(const void *slot);
 
 #endif /* __SVC_MEDIA_H__ */

@@ -102,7 +102,7 @@ typedef struct {
 } proto_rtp_session_t;
 
 /**
- * 初始化发送会话。
+ * @brief 初始化发送会话。
  * @param is_h265    1=H.265, 0=H.264
  * @param ssrc_seed  生成 SSRC 的种子(通常传时间或 pid)
  * @param fps        帧率, 用于计算时间戳步长
@@ -111,7 +111,7 @@ void proto_rtp_session_init(proto_rtp_session_t *s, int is_h265,
                       uint32_t ssrc_seed, int fps);
 
 /**
- * 帧边界: 递增时间戳(**按假设帧率**, 旧路径)。
+ * @brief 帧边界: 递增时间戳(**按假设帧率**, 旧路径)。
  *
  * @deprecated 优先用 `proto_rtp_session_frame_pts()`。
  *   本函数按 `90000/fps` 硬加, 它**不知道编码器实际什么时候出帧** ——
@@ -121,7 +121,7 @@ void proto_rtp_session_init(proto_rtp_session_t *s, int is_h265,
 void proto_rtp_session_next_frame(proto_rtp_session_t *s);
 
 /**
- * 帧边界: 用**编码器给的时间戳**推进(**新路径**, 解 B012)。
+ * @brief 帧边界: 用**编码器给的时间戳**推进(**新路径**, 解 B012)。
  *
  * @param s   会话状态
  * @param pts 本帧的编码器时间戳(`bsp_mpp_frame_t.pts`, 单位见
@@ -147,7 +147,7 @@ void proto_rtp_session_next_frame(proto_rtp_session_t *s);
 void proto_rtp_session_frame_pts(proto_rtp_session_t *s, uint64_t pts);
 
 /**
- * 发送一个 NALU(自动决定单包还是 FU-A 分片)。
+ * @brief 发送一个 NALU(自动决定单包还是 FU-A 分片)。
  *
  * @param sockfd    用于发送的 UDP socket
  * @param dst       目标地址

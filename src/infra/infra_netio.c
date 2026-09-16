@@ -1,6 +1,11 @@
 /**
  * @file    infra_netio.c
  * @brief   发送抽象 + socket 助手实现 —— 见 infra_netio.h
+ *
+ * 【模块职责】发送抽象 infra_sender_t(把"怎么发"与"发什么"隔开) + socket 小工具
+ * 【依赖方向】只依赖 libc 与 infra_log
+ * 【线程模型】sender 对象由调用方独占; 底层 socket fd 可跨线程使用(内核保证)
+ * 【资源边界】sender 对象在创建时分配一次, 由调用方 destroy; 无运行期分配
  */
 #include "infra_netio.h"
 
@@ -28,6 +33,14 @@ typedef struct {
     uint64_t             errors;
 } udp_ctx_t;
 
+/**
+ * @brief UDP 发送实现(infra_sender_t 的 vtable 之一)
+ *
+ * @param ctx udp_ctx_t(内含目标地址与 socket fd)
+ * @param buf 待发数据
+ * @param len 字节数
+ * @return 0 成功; 负值失败
+ */
 static int udp_send(void *ctx, const void *buf, size_t len)
 {
     udp_ctx_t *c = (udp_ctx_t *)ctx;
@@ -47,6 +60,11 @@ static int udp_send(void *ctx, const void *buf, size_t len)
     return (int)n;
 }
 
+/**
+ * @brief 销毁 UDP sender 并释放上下文
+ *
+ * @param ps 指向 sender 指针的指针(销毁后置 NULL)
+ */
 static void udp_destroy(infra_sender_t **ps)
 {
     infra_sender_t *s;
@@ -103,6 +121,15 @@ typedef struct {
 /* 单帧上限: RTP 头(12) + FU 头(3) + 载荷上限(1400) + 交错头(4), 留足余量 */
 #define TCP_FRAME_CAP 2048
 
+/**
+ * @brief TCP 交错(interleaved)发送实现 —— 把 RTP 包塞进 RTSP 那条 TCP 连接
+ *
+ * @param ctx tcp_ctx_t
+ * @param buf 待发数据
+ * @param len 字节数
+ * @return 0 成功; 负值失败
+ * @note 这是 ADR-1 留的**预留实现**(先做 UDP); 详见 ARCHITECTURE.md。
+ */
 static int tcp_send(void *ctx, const void *buf, size_t len)
 {
     tcp_ctx_t *c = (tcp_ctx_t *)ctx;
@@ -140,6 +167,11 @@ static int tcp_send(void *ctx, const void *buf, size_t len)
     return (int)len;
 }
 
+/**
+ * @brief 销毁 TCP sender 并释放上下文(含创建期分配的成帧缓冲)
+ *
+ * @param ps 指向 sender 指针的指针
+ */
 static void tcp_destroy(infra_sender_t **ps)
 {
     infra_sender_t *s;

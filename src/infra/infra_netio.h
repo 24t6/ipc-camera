@@ -70,7 +70,7 @@ struct infra_sender {
 };
 
 /**
- * 创建一个 UDP sender(包到包一次 sendto)。
+ * @brief 创建一个 UDP sender(包到包一次 sendto)。
  *
  * @param dst    目标地址(会**按值拷贝**进 ctx, 调用方不必保持有效)
  * @param sockfd 已创建的 UDP socket
@@ -81,7 +81,7 @@ struct infra_sender {
 infra_sender_t *infra_sender_udp(const struct sockaddr_in *dst, int sockfd);
 
 /**
- * 创建一个 RTP-over-TCP 交错 sender(RFC 2326 §10.12)。
+ * @brief 创建一个 RTP-over-TCP 交错 sender(RFC 2326 §10.12)。
  *
  * @param fd          已连接的 TCP socket(通常是 RTSP 那条连接)
  * @param rtp_channel 交错通道号(SETUP 时协商, 通常 RTP=0 / RTCP=1)
@@ -95,7 +95,7 @@ infra_sender_t *infra_sender_udp(const struct sockaddr_in *dst, int sockfd);
 infra_sender_t *infra_sender_tcp_interleaved(int fd, uint8_t rtp_channel);
 
 /**
- * 发送统计 —— 用于"发了多少、失败多少"的日志与单测。
+ * @brief 发送统计 —— 用于"发了多少、失败多少"的日志与单测。
  *
  * @param s            sender
  * @param out_bytes    输出: 累计发送字节数(可为 NULL)
@@ -110,7 +110,7 @@ void infra_sender_stats(const infra_sender_t *s, uint64_t *out_bytes,
 /* ─────────────────── socket 助手 ─────────────────── */
 
 /**
- * 创建并绑定一个 TCP 监听 socket。
+ * @brief 创建并绑定一个 TCP 监听 socket。
  *
  * @param ip       绑定地址(如 "0.0.0.0")
  * @param port     端口(如 554)
@@ -122,13 +122,13 @@ void infra_sender_stats(const infra_sender_t *s, uint64_t *out_bytes,
  */
 int infra_tcp_listen(const char *ip, uint16_t port, int backlog);
 
-/** 创建并绑定一个 UDP socket(端口传 0 表示由内核选)。@return fd; 失败 -1 */
+/** @brief 创建并绑定一个 UDP socket(端口传 0 表示由内核选)。@return fd; 失败 -1 */
 int infra_udp_bind(const char *ip, uint16_t port);
 
-/** 把 socket 设为非阻塞。@return 0 成功, -1 失败 */
+/** @brief 把 socket 设为非阻塞。@return 0 成功, -1 失败 */
 int infra_set_nonblocking(int fd);
 
-/** 关闭 socket 并置 -1(避免野句柄重复关闭)。 */
+/** @brief 关闭 socket 并置 -1(避免野句柄重复关闭)。 */
 void infra_close(int *fd);
 
 #endif /* __INFRA_NETIO_H__ */

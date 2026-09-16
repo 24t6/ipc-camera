@@ -25,7 +25,7 @@
 #include <stdint.h>
 
 /**
- * 把无符号整数写成十进制文本。
+ * @brief 把无符号整数写成十进制文本。
  *
  * @param v    要转换的值
  * @param out  输出缓冲
@@ -35,7 +35,7 @@
 int proto_str_u32(uint32_t v, char *out, size_t cap);
 
 /**
- * 解析十进制无符号整数(遇非数字即停, 不报错)。
+ * @brief 解析十进制无符号整数(遇非数字即停, 不报错)。
  *
  * @param p    文本起点
  * @param out  解析结果
@@ -46,7 +46,7 @@ int proto_str_u32(uint32_t v, char *out, size_t cap);
 size_t proto_str_parse_u32(const char *p, uint32_t *out);
 
 /**
- * 把一段文本追加到缓冲末尾(就地追加, 自带容量检查)。
+ * @brief 把一段文本追加到缓冲末尾(就地追加, 自带容量检查)。
  *
  * @param out   目标缓冲
  * @param cap   容量(含结尾 '\0')
@@ -57,26 +57,26 @@ size_t proto_str_parse_u32(const char *p, uint32_t *out);
 int proto_str_append(char *out, size_t cap, size_t *used, const char *text);
 
 /**
- * 把无符号整数转文本后追加(等价于 append(u32_to_str(v)))。
+ * @brief 把无符号整数转文本后追加(等价于 append(u32_to_str(v)))。
  * @return 0 = 成功; -1 = 容量不够
  */
 int proto_str_append_u32(char *out, size_t cap, size_t *used, uint32_t v);
 
 /**
- * ASCII 转小写。
+ * @brief ASCII 转小写。
  * @note 刻意不用 `<ctype.h>` 的 `tolower`: 它受 locale 影响,
  *       用它比较 HTTP/RTSP 头名在不同语言环境下行为可能不一致。
  */
 char proto_str_lower(char c);
 
 /**
- * 大小写无关比较(最多 n 字节)。
+ * @brief 大小写无关比较(最多 n 字节)。
  * @return 1 = 前 n 字节相同(或提前遇到相同结尾); 0 = 不同
  */
 int proto_str_eq_ci_n(const char *a, const char *b, size_t n);
 
 /**
- * 大小写无关比较(以 '\0' 结尾的整串)。
+ * @brief 大小写无关比较(以 '\0' 结尾的整串)。
  * @return 1 = 相同; 0 = 不同
  */
 int proto_str_eq_ci(const char *a, const char *b);

@@ -44,7 +44,7 @@ typedef struct {
 } svc_osd_stats_t;
 
 /**
- * 启动 OSD 服务。
+ * @brief 启动 OSD 服务。
  *
  * @return 0 成功; 负值失败(此时不会有水印, 但推流照常)
  *
@@ -55,17 +55,17 @@ typedef struct {
 int svc_osd_start(void);
 
 /**
- * 停止 OSD 服务: 通知线程退出 → join → `bsp_osd_deinit()`。
+ * @brief 停止 OSD 服务: 通知线程退出 → join → `bsp_osd_deinit()`。
  *
  * @note **必须在 `svc_media_stop()` 之前调** —— 否则 VENC 通道已经被拆掉。
  * @note 未启动时调用是安全的(no-op)。
  */
 void svc_osd_stop(void);
 
-/** 服务是否在运行。@return 1 = 在运行 */
+/** @brief 服务是否在运行。@return 1 = 在运行 */
 int svc_osd_is_running(void);
 
-/** 取统计快照。 */
+/** @brief 取统计快照。 */
 void svc_osd_get_stats(svc_osd_stats_t *out);
 
 #endif /* __SVC_OSD_H__ */

@@ -47,16 +47,16 @@ typedef struct {
 typedef struct infra_poller infra_poller_t;
 
 /**
- * 创建轮询器(内部 epoll_create1(EPOLL_CLOEXEC))。
+ * @brief 创建轮询器(内部 epoll_create1(EPOLL_CLOEXEC))。
  * @return 句柄; 失败返回 NULL
  */
 infra_poller_t *infra_poller_create(void);
 
-/** 销毁轮询器。**不关闭**已注册的 fd —— 所有权始终归调用方。 */
+/** @brief 销毁轮询器。**不关闭**已注册的 fd —— 所有权始终归调用方。 */
 void infra_poller_destroy(infra_poller_t *p);
 
 /**
- * 注册(或修改)一个 fd 关心的事件。
+ * @brief 注册(或修改)一个 fd 关心的事件。
  *
  * @param events INFRA_POLL_IN / INFRA_POLL_OUT 的组合
  * @return 0 成功; -1 失败
@@ -65,11 +65,11 @@ void infra_poller_destroy(infra_poller_t *p);
  */
 int infra_poller_add(infra_poller_t *p, int fd, uint32_t events);
 
-/** 取消注册。@return 0 成功; -1 失败(如本来就没注册) */
+/** @brief 取消注册。@return 0 成功; -1 失败(如本来就没注册) */
 int infra_poller_del(infra_poller_t *p, int fd);
 
 /**
- * 等待事件。
+ * @brief 等待事件。
  *
  * @param timeout_ms 超时毫秒; 0 = 立即返回; <0 = 一直等
  * @return 就绪事件个数(>=0); -1 = 出错

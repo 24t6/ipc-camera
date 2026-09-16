@@ -1,6 +1,11 @@
 /**
  * @file    infra_poll.c
  * @brief   事件轮询实现 —— epoll(见 infra_poll.h 的取舍说明)
+ *
+ * 【模块职责】epoll 的薄封装(注册 / 等待 / 移除), 让上层不必直接写 epoll_ctl
+ * 【依赖方向】只依赖 Linux epoll 与 libc
+ * 【线程模型】**一个 poller 只允许一个线程 wait**; 注册/移除也建议在同一线程做
+ * 【资源边界】epoll fd 一个; poller 结构在创建时分配, destroy 时释放
  */
 #include "infra_poll.h"
 
@@ -14,7 +19,7 @@ struct infra_poller {
     int epfd;
 };
 
-/** 我们的掩码 → epoll 掩码 */
+/** @brief 我们的掩码 → epoll 掩码 */
 static uint32_t to_epoll(uint32_t events)
 {
     uint32_t e = 0;
@@ -26,7 +31,7 @@ static uint32_t to_epoll(uint32_t events)
     return e;
 }
 
-/** epoll 掩码 → 我们的掩码 */
+/** @brief epoll 掩码 → 我们的掩码 */
 static uint32_t from_epoll(uint32_t e)
 {
     uint32_t r = 0;

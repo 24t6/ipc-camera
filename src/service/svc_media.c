@@ -2,6 +2,11 @@
  * @file    svc_media.c
  * @brief   取流服务实现 —— MPP 取帧 → 拼成连续缓冲 → 入队
  *
+ * 【模块职责】取流线程: MPP 取帧 → 逐 pack 拼进连续槽位 → 写帧头 → 入队 → 立刻释放
+ * 【依赖方向】依赖 bsp_mpp、infra_queue、proto_nalu、infra_log
+ * 【线程模型】自己起 **1 个**线程(stream_thread, 线程名 `ipc_media`); MPP 由它独占
+ * 【资源边界】槽位缓冲在 start 时一次分配(start 后视为静态), stop 时释放; 运行期零分配
+ *
  * 结构:
  *      ① 模块状态
  *      ② 槽位读写小工具
@@ -24,6 +29,7 @@
 #include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/prctl.h>      /* prctl(PR_SET_NAME) —— 给线程起名, ps/top 能看出来 */
 #include <time.h>
 
 /** 槽位容量 = 帧头 + 最大帧字节数。架构预算里单帧 256 KB */
@@ -65,7 +71,7 @@ static struct {
     int             thread_valid;
     volatile int    stop_requested;
 
-    /** 启动时等首帧实际等了多久(毫秒); 只用于日志 */
+    /** @brief 启动时等首帧实际等了多久(毫秒); 只用于日志 */
     long            warmup_ms;
 
     /* 槽位缓冲: start 时一次分配 */
@@ -95,7 +101,7 @@ const uint8_t *svc_media_slot_data(const void *slot)
 /* ─────────── ③ 取流线程 ─────────── */
 
 /**
- * 把一帧的所有 pack 拼进槽位缓冲, 并**一次性写好帧头**。
+ * @brief 把一帧的所有 pack 拼进槽位缓冲, 并**一次性写好帧头**。
  *
  * @param frame 取到的帧(指向 MPP 内部缓冲)
  * @param index 帧序号(写进帧头)
@@ -145,7 +151,7 @@ static size_t pack_into_slot(const bsp_mpp_frame_t *frame, uint32_t index)
 }
 
 /**
- * NALU 计数回调 —— 只数个数, 不做别的。
+ * @brief NALU 计数回调 —— 只数个数, 不做别的。
  * @return 0 = 继续遍历
  */
 static int count_nalu_cb(const proto_nalu_t *n, void *user)
@@ -159,7 +165,7 @@ static int count_nalu_cb(const proto_nalu_t *n, void *user)
 }
 
 /**
- * 处理一帧: 校验 → 拼进槽位 → 入队。
+ * @brief 处理一帧: 校验 → 拼进槽位 → 入队。
  * @return 0 正常(含"丢弃"的情况); -1 表示应当退出线程
  */
 static int handle_one_frame(const bsp_mpp_frame_t *frame)
@@ -214,10 +220,12 @@ static int handle_one_frame(const bsp_mpp_frame_t *frame)
     return 0;
 }
 
-/** 取流线程主体 */
+/** @brief 取流线程主体 */
 static void *stream_thread(void *arg)
 {
     (void)arg;
+    /* §7.1: 线程名让 `ps` / `top` 一眼看出这是谁, 不用靠 pid 猜 */
+    (void)prctl(PR_SET_NAME, "ipc_media", 0, 0, 0);
     LOG_INFO("取流线程启动(H.26%d, 槽位数据容量 %zu 字节)",
              g.is_h265 ? 5 : 4, g.slot_data_cap);
 
@@ -258,7 +266,7 @@ static void *stream_thread(void *arg)
 /* ─────────── ④ 生命周期 ─────────── */
 
 /**
- * 校验队列并算出一帧最多能放多少码流字节。
+ * @brief 校验队列并算出一帧最多能放多少码流字节。
  *
  * @return 0 成功(已设好 `g.slot_data_cap`); 负值失败
  *
@@ -284,7 +292,7 @@ static int setup_from_queue(void)
 }
 
 /**
- * 等第一帧出现(启动握手)。
+ * @brief 等第一帧出现(启动握手)。
  *
  * @return 0 = 等到了; -1 = 超时仍没有
  *

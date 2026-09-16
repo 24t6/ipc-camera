@@ -2,6 +2,11 @@
  * @file    proto_rtsp.c
  * @brief   RTSP 请求解析 + 响应构造实现
  *
+ * 【模块职责】RTSP 请求解析与响应构造(CSeq / Session / Transport / Content-Length)
+ * 【依赖方向】只依赖 proto_str 与 libc
+ * 【线程模型】纯函数; 解析结果写到调用方提供的结构体里
+ * 【资源边界】无动态分配; 不保存任何跨调用的状态
+ *
  * 结构(刻意保持每块都短):
  *      ① 解析:请求行 + 头行逐行扫
  *      ② 响应构造:每类响应一个函数
@@ -28,7 +33,7 @@
 
 /* ─────────────── ① 解析:行扫描 ─────────────── */
 
-/** 取出一行到 line 缓冲; 返回下一行起点, 到末尾返回 NULL */
+/** @brief 取出一行到 line 缓冲; 返回下一行起点, 到末尾返回 NULL */
 static const char *next_line(const char *p, const char *end,
                              char *line, size_t cap)
 {
@@ -50,7 +55,7 @@ static const char *next_line(const char *p, const char *end,
 
 /* ─────────────── ② 解析:请求行与头行 ─────────────── */
 
-/** 把方法名文本映射成枚举 */
+/** @brief 把方法名文本映射成枚举 */
 static proto_rtsp_method_t method_from_name(const char *name)
 {
     if (eq_ci(name, "OPTIONS"))       return PROTO_RTSP_METHOD_OPTIONS;
@@ -63,7 +68,7 @@ static proto_rtsp_method_t method_from_name(const char *name)
     return PROTO_RTSP_METHOD_UNKNOWN;
 }
 
-/** 解析 "a-b" 这种端口/通道对, 写进 lo/hi。返回是否解析到了 hi。 */
+/** @brief 解析 "a-b" 这种端口/通道对, 写进 lo/hi。返回是否解析到了 hi。 */
 static int parse_pair(const char *p, uint32_t *lo, uint32_t *hi)
 {
     size_t n = parse_u32(p, lo);
@@ -79,7 +84,7 @@ static int parse_pair(const char *p, uint32_t *lo, uint32_t *hi)
 }
 
 /**
- * 在一行头值里找 `key=`, 找到了就把后面的 "a-b" 解析出来。
+ * @brief 在一行头值里找 `key=`, 找到了就把后面的 "a-b" 解析出来。
  *
  * @param v        头值(如 "RTP/AVP;unicast;client_port=5000-5001")
  * @param key      要找的参数名(含 '=', 如 "client_port=")
@@ -103,7 +108,7 @@ static int find_param_pair(const char *v, const char *key,
     return 0;
 }
 
-/** 把解析出来的 lo/hi 存进请求结构(按传输方式决定存哪一组字段) */
+/** @brief 把解析出来的 lo/hi 存进请求结构(按传输方式决定存哪一组字段) */
 static void store_transport_pair(proto_rtsp_request_t *req,
                                  uint32_t lo, uint32_t hi)
 {
@@ -117,7 +122,7 @@ static void store_transport_pair(proto_rtsp_request_t *req,
 }
 
 /**
- * 解析 Transport 头。
+ * @brief 解析 Transport 头。
  *
  * 两种写法(见第 3 课 / ADR-1):
  *   UDP : RTP/AVP;unicast;client_port=5000-5001
@@ -149,7 +154,7 @@ static void parse_transport(proto_rtsp_request_t *req, const char *v)
 }
 
 /**
- * 把字段名和值搬进 dst(带长度检查)。
+ * @brief 把字段名和值搬进 dst(带长度检查)。
  * @return 0 成功; -2 = 放不下(报文畸形或恶意超长)
  */
 static int copy_field(char *dst, size_t cap, const char *src, size_t len)
@@ -162,7 +167,7 @@ static int copy_field(char *dst, size_t cap, const char *src, size_t len)
 }
 
 /**
- * 解析请求行: `METHOD SP URL SP VERSION`。
+ * @brief 解析请求行: `METHOD SP URL SP VERSION`。
  * @return 0 成功; -2 = 畸形
  *
  * @note 拆出来的理由: 原来这段嵌在"逐行扫描"的循环里(while + if(first) + 三个
@@ -197,7 +202,7 @@ static int parse_request_line(proto_rtsp_request_t *req, const char *line)
 }
 
 /**
- * 解析一行头: `Name: value`。
+ * @brief 解析一行头: `Name: value`。
  *
  * @note 本项目只关心 CSeq / Session / Transport 三个, **其它头一律忽略** ——
  *       协议允许扩展头, 忽略比报错健壮(客户端会发一堆 User-Agent/Accept)。
@@ -233,7 +238,7 @@ static void parse_header_line(proto_rtsp_request_t *req, const char *line)
 }
 
 /**
- * 逐行扫描, 填 req。@return 0 成功; 其余为错误码(见 proto_rtsp.h)
+ * @brief 逐行扫描, 填 req。@return 0 成功; 其余为错误码(见 proto_rtsp.h)
  *
  * @note 拆出来的理由: 让 parse_request 只剩"清空 → 扫描 → 校验"三步。
  *       原来三者挤在一个函数里, 到 58 行。
@@ -266,7 +271,7 @@ static int scan_lines(const char *buf, size_t len, proto_rtsp_request_t *req)
 }
 
 /**
- * 扫描完之后的一致性校验与默认值补齐。
+ * @brief 扫描完之后的一致性校验与默认值补齐。
  * @return 0 通过; -3 = 缺 CSeq; -4 = 方法不认识(请求行本身合法)
  *
  * @note -3 和 -4 为什么要分开: 见下面 -4 处的注释。
@@ -331,7 +336,7 @@ const char *proto_rtsp_method_name(proto_rtsp_method_t m)
 /* ─────────────── ③ 响应构造 ─────────────── */
 
 /**
- * 写状态行 + 必备的 CSeq 头(**不写结尾空行**)。
+ * @brief 写状态行 + 必备的 CSeq 头(**不写结尾空行**)。
  *
  * @note **每个响应都必须回 CSeq**, 且值要和请求一致 ——
  *       否则客户端无法把响应和请求对应起来, 会一直等或直接断开。
@@ -360,6 +365,12 @@ typedef enum {
     RES_TYPE_SDP,               /* application/sdp */
 } resp_body_type_t;
 
+/**
+ * @brief 取响应体类型对应的 Content-Type 文本
+ *
+ * @param t 响应体类型
+ * @return 静态字符串(**不需要释放**)
+ */
 static const char *content_type_text(resp_body_type_t t)
 {
     switch (t) {
@@ -369,7 +380,7 @@ static const char *content_type_text(resp_body_type_t t)
 }
 
 /**
- * ★★ 所有响应的**唯一出口** —— 由它保证"每个响应都带 Content-Length"。
+ * @brief ★★ 所有响应的**唯一出口** —— 由它保证"每个响应都带 Content-Length"。
  *
  * @param extra       额外的头(可以为 NULL), 必须以 "\r\n" 结尾
  * @param body_type   消息体的 MIME 类型(无体就传 RES_TYPE_NONE)
@@ -451,7 +462,7 @@ int proto_rtsp_build_describe(const proto_rtsp_request_t *req,
 }
 
 /**
- * 写 SETUP 响应的 Transport 头 —— **把协商结果原样回给客户端**。
+ * @brief 写 SETUP 响应的 Transport 头 —— **把协商结果原样回给客户端**。
  *
  * 这是 SETUP 响应最关键的部分: 客户端要据此知道"服务器同意用什么方式收流"。
  *

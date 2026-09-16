@@ -1,6 +1,11 @@
 /**
  * @file    rtp.c
  * @brief   RTP 打包实现 —— 单 NALU 模式 + FU-A 分片模式
+ *
+ * 【模块职责】把 NALU 打成 RTP 包: 单包 / FU-A 分片 / H.265 FU 分片
+ * 【依赖方向】只依赖 proto_nalu 与 libc
+ * 【线程模型】每个会话(proto_rtp_session_t)由调用方独占; 函数本身可重入
+ * 【资源边界】发送缓冲在**栈上**(1415 字节, 远小于 4KB 规矩); 运行期零分配
  */
 #include "proto_rtp.h"
 
@@ -22,7 +27,7 @@
  */
 
 /**
- * 写 RTP 固定头(12 字节)。
+ * @brief 写 RTP 固定头(12 字节)。
  *
  *   0                   1                   2                   3
  *   0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
@@ -71,6 +76,13 @@ static int send_single(int fd, const struct sockaddr *dst, socklen_t dstlen,
 
 /* ─────────────────────── H.264 FU-A 分片 ─────────────────────── */
 
+/**
+ * @brief 用 H.264 的 FU-A 把一个大 NALU 分片发出去
+ *
+ * @return >=0 已发送的 RTP 包个数; <0 失败
+ * @note 原 NALU 头被拆开复用(F/NRI 进 FU indicator, Type 进 FU header),
+ *       所以每片只多 2 字节 —— 见 docs/面试问答.md Q15。
+ */
 static int send_fua_h264(int fd, const struct sockaddr *dst, socklen_t dstlen,
                          proto_rtp_session_t *s, const proto_nalu_t *n, int marker)
 {
@@ -114,6 +126,12 @@ static int send_fua_h264(int fd, const struct sockaddr *dst, socklen_t dstlen,
 
 /* ─────────────────────── H.265 FU 分片 ─────────────────────── */
 
+/**
+ * @brief 用 H.265 的 FU 把一个大 NALU 分片发出去
+ *
+ * @return >=0 已发送的 RTP 包个数; <0 失败
+ * @note 与 H.264 的差别: 剥 2 字节头、补 3 字节分片头、FU 类型值 = 49。
+ */
 static int send_fu_h265(int fd, const struct sockaddr *dst, socklen_t dstlen,
                         proto_rtp_session_t *s, const proto_nalu_t *n, int marker)
 {

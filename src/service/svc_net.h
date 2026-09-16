@@ -152,7 +152,7 @@ typedef struct {
 } svc_net_stats_t;
 
 /**
- * 启动 RTSP 服务端(创建监听 socket + epoll + 事件循环线程)。
+ * @brief 启动 RTSP 服务端(创建监听 socket + epoll + 事件循环线程)。
  *
  * @param cfg 配置; **不能为 NULL**, 且 sdp/sdp_len 必须自洽
  * @return 0 = 成功; 负值 = 失败:
@@ -165,7 +165,7 @@ typedef struct {
 int svc_net_start(const svc_net_cfg_t *cfg);
 
 /**
- * 停止服务端: 关闭所有客户端 → 停止事件循环 → 释放全部资源。
+ * @brief 停止服务端: 关闭所有客户端 → 停止事件循环 → 释放全部资源。
  *
  * @note 阻塞: 会等事件循环线程真正退出(最多等到当前 tick 结束)。
  * @note 未启动时调用是安全的(no-op)。
@@ -173,16 +173,16 @@ int svc_net_start(const svc_net_cfg_t *cfg);
  */
 void svc_net_stop(void);
 
-/** 服务是否在运行。@return 1 = 在运行 */
+/** @brief 服务是否在运行。@return 1 = 在运行 */
 int svc_net_is_running(void);
 
-/** 取实际监听的端口(端口传 0 时由内核分配, 用这个查询真实端口)。 */
+/** @brief 取实际监听的端口(端口传 0 时由内核分配, 用这个查询真实端口)。 */
 uint16_t svc_net_port(void);
 
-/** 取统计快照。 */
+/** @brief 取统计快照。 */
 void svc_net_get_stats(svc_net_stats_t *out);
 
-/** 有多少个槽位正在使用(用于验收断言"槽位没泄漏")。 */
+/** @brief 有多少个槽位正在使用(用于验收断言"槽位没泄漏")。 */
 int svc_net_client_count(void);
 
 #endif /* __SVC_NET_H__ */

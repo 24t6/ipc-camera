@@ -19,6 +19,7 @@
 #include "svc_osd.h"
 
 #include <pthread.h>
+#include <sys/prctl.h>      /* prctl(PR_SET_NAME) —— 给线程起名, ps/top 能看出来 */
 #include <time.h>
 
 #include "bsp_osd.h"
@@ -74,6 +75,8 @@ static void *osd_thread(void *arg)
     struct timespec period;
 
     (void)arg;
+    /* §7.1: 线程名让 `ps` / `top` 一眼看出这是谁, 不用靠 pid 猜 */
+    (void)prctl(PR_SET_NAME, "ipc_osd", 0, 0, 0);
     period.tv_sec  = SVC_OSD_PERIOD_SEC;
     period.tv_nsec = 0;
 

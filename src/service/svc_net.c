@@ -2,6 +2,12 @@
  * @file    svc_net.c
  * @brief   RTSP 服务端实现 —— 事件循环 + 客户端会话管理 (M1-8)
  *
+ * 【模块职责】RTSP 服务端: epoll 事件循环 + 客户端会话与报文 framing
+ * 【依赖方向】依赖 infra_poll、infra_netio、proto_rtsp、infra_log
+ * 【线程模型】自己起 **1 个**线程(loop_thread, 线程名 `ipc_net`);
+ *             两个回调**在本线程执行, 绝不许阻塞**
+ * 【资源边界】客户端槽位固定 8 个(连接时占用、空闲超时/断开时回收); 无运行期堆分配
+ *
  * 结构(刻意按"一层一件事"切):
  *      ① 客户端槽位: 分配 / 释放
  *      ② 收字节 + framing(找完整请求)
@@ -29,6 +35,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/prctl.h>      /* prctl(PR_SET_NAME) —— 给线程起名, ps/top 能看出来 */
 #include <sys/socket.h>
 #include <time.h>
 #include <unistd.h>
@@ -117,7 +124,7 @@ static struct {
 
 /* ═══════════════ 小工具 ═══════════════ */
 
-/** 找槽位下标; 找不到返回 -1 */
+/** @brief 找槽位下标; 找不到返回 -1 */
 static int client_find(int fd)
 {
     int i;
@@ -130,7 +137,7 @@ static int client_find(int fd)
 }
 
 /**
- * 找一个空槽位并初始化。找不到返回 -1(客户端满了)。
+ * @brief 找一个空槽位并初始化。找不到返回 -1(客户端满了)。
  * @note 分配时清零 → "分配即初始状态", 不留上一次的残留。
  */
 static int client_alloc(int fd)
@@ -152,7 +159,7 @@ static int client_alloc(int fd)
 }
 
 /**
- * 释放槽位: 从 epoll 摘掉 → 关 fd → 标空闲 → 通知上层。
+ * @brief 释放槽位: 从 epoll 摘掉 → 关 fd → 标空闲 → 通知上层。
  *
  * @note 关 fd 之前必须先 epoll_ctl(DEL): 否则 fd 号被下一个连接复用时,
  *       epoll 里还留着旧的注册项, 会把新连接的事件张冠李戴。
@@ -180,7 +187,7 @@ static void client_free(int idx)
     g.stats.conns_closed++;
 }
 
-/** 数当前用掉的槽位数 */
+/** @brief 数当前用掉的槽位数 */
 static int client_count(void)
 {
     int i, n = 0;
@@ -193,7 +200,7 @@ static int client_count(void)
 }
 
 /**
- * 把 len 字节完整发出去。
+ * @brief 把 len 字节完整发出去。
  *
  * @return 0 成功; -1 失败(**调用方必须关掉这个连接**)
  *
@@ -231,7 +238,7 @@ static int send_all(int fd, const char *buf, size_t len)
 /* ═══════════════ ③ 请求处理 ═══════════════ */
 
 /**
- * 拼一个错误响应并发出去。
+ * @brief 拼一个错误响应并发出去。
  *
  * @return 0 已回应(连接保留); -1 发送失败(应当断开)
  * @note 抽出来的理由: 原来 400/405/454 三个分支各自重复"构造 + 判断 + 发送"三段,
@@ -251,7 +258,7 @@ static int reply_error(svc_net_client_t *c, const proto_rtsp_request_t *req,
 }
 
 /**
- * 处理解析失败的请求。
+ * @brief 处理解析失败的请求。
  *
  * @return 0 已处理完(连接保留); -1 已回应但发送失败, 必须断开
  *
@@ -278,7 +285,7 @@ static int handle_parse_failure(svc_net_client_t *c,
 }
 
 /**
- * 取一个客户端的 **RTP 目的地**(IP = 对端 IP, 端口 = SETUP 协商到的 RTP 端口)。
+ * @brief 取一个客户端的 **RTP 目的地**(IP = 对端 IP, 端口 = SETUP 协商到的 RTP 端口)。
  *
  * @param c  客户端槽位
  * @param out 输出: 目的地
@@ -297,7 +304,7 @@ static void client_rtp_dst(const svc_net_client_t *c, struct sockaddr_in *out)
 }
 
 /**
- * 处理 SETUP: 记录会话、传输通道与 **RTP 目的地**。
+ * @brief 处理 SETUP: 记录会话、传输通道与 **RTP 目的地**。
  *
  * @note 会话号 = 槽位下标 + 基准值: 同一连接每次 SETUP 都得到确定的号,
  *       而槽位下标天然唯一 → 不会和别的连接撞上。
@@ -324,7 +331,7 @@ static void setup_session(svc_net_client_t *c, const proto_rtsp_request_t *req)
 }
 
 /**
- * 处理 PLAY / PAUSE(两者只差 playing 标志和要不要通知上层)。
+ * @brief 处理 PLAY / PAUSE(两者只差 playing 标志和要不要通知上层)。
  *
  * @return 同 handle_request
  */
@@ -361,7 +368,7 @@ static int handle_play_pause(svc_net_client_t *c, const proto_rtsp_request_t *re
 }
 
 /**
- * 按方法分派, 把响应文本拼进 out。
+ * @brief 按方法分派, 把响应文本拼进 out。
  *
  * @return >0 = 响应字节数; 0 = 这个请求不需要普通响应(见 out_kind);
  *         -1 = 构造失败或断连
@@ -413,7 +420,7 @@ static int build_response(svc_net_client_t *c, const proto_rtsp_request_t *req,
 }
 
 /**
- * 处理一个**完整的** RTSP 请求并回应。
+ * @brief 处理一个**完整的** RTSP 请求并回应。
  *
  * @param req_buf 请求文本(已被截断到边界处, 保证以 '\0' 结尾)
  * @param req_len 请求字节数
@@ -454,7 +461,7 @@ static int handle_request(svc_net_client_t *c, const char *req_buf, size_t req_l
 
 /* ═══════════════ ② 收字节 + framing ═══════════════ */
 
-/** 处理累积缓冲里**所有**已经完整的请求。@return 0 继续; -1 断开; 1 回完 TEARDOWN */
+/** @brief 处理累积缓冲里**所有**已经完整的请求。@return 0 继续; -1 断开; 1 回完 TEARDOWN */
 static int drain_requests(svc_net_client_t *c)
 {
     for (;;) {
@@ -490,7 +497,7 @@ static int drain_requests(svc_net_client_t *c)
 }
 
 /**
- * 读一个客户端的数据并处理。@return 0 继续; -1 关闭连接; 1 客户端说了 TEARDOWN
+ * @brief 读一个客户端的数据并处理。@return 0 继续; -1 关闭连接; 1 客户端说了 TEARDOWN
  *
  * @note ⚠️ 必须先读完再解析。原因(纪律③): epoll 是水平触发,
  *       只要内核缓冲里还有没读走的字节, 下一次 epoll_wait 会**继续报告同一个 fd**。
@@ -541,7 +548,7 @@ static int read_client(svc_net_client_t *c)
 
 /* ═══════════════ ④ 事件循环 ═══════════════ */
 
-/** 清理所有空闲超时的客户端(纪律④) */
+/** @brief 清理所有空闲超时的客户端(纪律④) */
 static void reap_idle(void)
 {
     int i;
@@ -564,7 +571,7 @@ static void reap_idle(void)
 }
 
 /**
- * 接受一个新连接。
+ * @brief 接受一个新连接。
  *
  * ⚠️ **耦合点**: 监听 socket 目前注册的是**电平触发**(LT), 所以这里
  * 每次事件只 `accept()` 一个就够了 —— 没接完的连接, 下次 epoll_wait 还会报。
@@ -624,7 +631,7 @@ static void on_accept(void)
 }
 
 /**
- * 分派一个就绪事件。
+ * @brief 分派一个就绪事件。
  *
  * @note 抽出来的理由有二: 让 loop_thread 只剩"等 → 内务 → 分派"三步;
  *       以及把"fd → 槽位"的查找集中在一处(fd 号会被内核复用,
@@ -652,11 +659,13 @@ static void dispatch_event(const infra_poll_event_t *ev)
         client_free(idx);
 }
 
-/** 事件循环主体 */
+/** @brief 事件循环主体 */
 static void *loop_thread(void *arg)
 {
     infra_poll_event_t events[INFRA_POLL_MAX_EVENTS];
     (void)arg;
+    /* §7.1: 线程名让 `ps` / `top` 一眼看出这是谁, 不用靠 pid 猜 */
+    (void)prctl(PR_SET_NAME, "ipc_net", 0, 0, 0);
 
     LOG_INFO("RTSP 事件循环启动, 监听端口 %u", (unsigned)g.port);
 
@@ -687,7 +696,7 @@ static void *loop_thread(void *arg)
 /* ═══════════════ ⑤ 生命周期 ═══════════════ */
 
 /**
- * 释放启动阶段申请过的一切(无论启动成功与否都可用)。
+ * @brief 释放启动阶段申请过的一切(无论启动成功与否都可用)。
  *
  * @note ⚠️ **清理顺序必须是申请顺序的反序** —— 这是统一清理函数唯一要守的纪律。
  *       这里的申请顺序是: ①槽位表/读缓冲 → ②SDP 副本 → ③监听 fd → ④epoll。
@@ -722,7 +731,7 @@ static void release_all(void)
 }
 
 /**
- * 第 1 步: 分配槽位表 + 拷贝 SDP。
+ * @brief 第 1 步: 分配槽位表 + 拷贝 SDP。
  * @return 0 成功; -3 内存不足(失败时不会留下半成品)
  */
 static int start_alloc(const svc_net_cfg_t *cfg)
@@ -757,7 +766,7 @@ static int start_alloc(const svc_net_cfg_t *cfg)
 }
 
 /**
- * 第 2 步: 建监听 socket(非阻塞)并问出真实端口。
+ * @brief 第 2 步: 建监听 socket(非阻塞)并问出真实端口。
  * @return 0 成功; -2 建不起来(端口被占用?); -3 epoll 建不起来
  *
  * @note 端口传 0 时由内核分配 —— 必须用 getsockname 问回真实值,

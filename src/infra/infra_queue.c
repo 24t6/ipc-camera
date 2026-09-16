@@ -2,6 +2,11 @@
  * @file    infra_queue.c
  * @brief   线程安全环形队列实现 —— 见 infra_queue.h
  *
+ * 【模块职责】线程安全的有界环形队列(取流线程 → 发送线程 的缓冲)
+ * 【依赖方向】只依赖 pthread 与 libc
+ * 【线程模型】单生产者单消费者安全; 内部用 mutex + 条件变量, 临界区不含拷贝
+ * 【资源边界】槽位缓冲在创建时**一次分配**(slots × slot_bytes); 运行期零分配; 队满**丢最旧**
+ *
  * 实现要点:
  *   · **环形缓冲**: head/tail 两个索引对 capacity 取模, 不搬移数据
  *   · **一把互斥锁**保护所有字段; **一个条件变量**让 pop 能"睡到有数据"
@@ -36,13 +41,13 @@ struct infra_queue {
     uint64_t  rejected;
 };
 
-/** 取第 idx 个槽位的地址 */
+/** @brief 取第 idx 个槽位的地址 */
 static uint8_t *slot_at(infra_queue_t *q, size_t idx)
 {
     return q->slots + (idx % q->capacity) * q->slot_size;
 }
 
-/** 把毫秒超时换算成绝对时间(pthread_cond_timedwait 要的是绝对时刻) */
+/** @brief 把毫秒超时换算成绝对时间(pthread_cond_timedwait 要的是绝对时刻) */
 static void ms_to_abstime(int timeout_ms, struct timespec *ts)
 {
     struct timeval tv;
@@ -158,7 +163,7 @@ int infra_queue_push(infra_queue_t *q, const void *data, size_t len)
 }
 
 /**
- * 队列空时按 timeout_ms 等一次。
+ * @brief 队列空时按 timeout_ms 等一次。
  *
  * @return 0 = 可以再检查一次队列了; 1 = 确定超时(调用方应当放弃)
  *

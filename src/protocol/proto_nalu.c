@@ -1,6 +1,11 @@
 /**
  * @file    nalu.c
  * @brief   Annex-B 码流解析实现
+ *
+ * 【模块职责】把 Annex-B 码流切成一个个 NALU, 并识别参数集 / IDR
+ * 【依赖方向】只依赖 libc —— **不碰 socket、不碰硬件**(所以能在 PC 上原生单测)
+ * 【线程模型】纯函数, 无全局可变状态, 可在多线程中并发调用
+ * 【资源边界】无动态分配; 解析结果写到调用方给的数组里
  */
 #include "proto_nalu.h"
 
@@ -46,6 +51,13 @@ static void classify_h264(proto_nalu_t *n)
 }
 
 /* H.265: 判断类型并归一化 */
+
+/**
+ * @brief 按 H.265 的 **6 位**类型值判定 NALU 种类
+ *
+ * @param[in,out] n 已填好类型值的 NALU(本函数补上 kind)
+ * @note H.265 的类型是 6 位(H.264 是 5 位), 所以两者的判定表**不能共用**。
+ */
 static void classify_h265(proto_nalu_t *n)
 {
     uint8_t type = (n->data[0] >> 1) & 0x3F;   /* 高 6 bit */
@@ -73,7 +85,7 @@ static void classify_h265(proto_nalu_t *n)
 }
 
 /**
- * 算出一个 NALU 的右边界。
+ * @brief 算出一个 NALU 的右边界。
  *
  * @param nalu_start NALU 第一个字节(已在起始码之后)
  * @param end        整段缓冲的末尾
@@ -103,7 +115,7 @@ static const uint8_t *nalu_right_edge(const uint8_t *nalu_start,
 #define EMIT_STOP     2     /* 回调要求提前终止 */
 
 /**
- * 给一个 NALU 分类并回调。
+ * @brief 给一个 NALU 分类并回调。
  *
  * @return EMIT_SKIPPED / EMIT_DELIVERED / EMIT_STOP
  *
@@ -180,6 +192,13 @@ typedef struct {
     int found;
 } idr_ctx_t;
 
+/**
+ * @brief 遍历回调: 只要见到 IDR 就置位并立即停止
+ *
+ * @param n 当前 NALU
+ * @param user 指向"命中标志"(int)的指针
+ * @return 1 = 命中, 要求遍历提前结束; 0 = 继续
+ */
 static int idr_probe(const proto_nalu_t *n, void *user)
 {
     idr_ctx_t *ctx = (idr_ctx_t *)user;

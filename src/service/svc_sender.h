@@ -98,7 +98,7 @@ typedef struct {
 } svc_sender_stats_t;
 
 /**
- * 启动发送服务。
+ * @brief 启动发送服务。
  *
  * @param queue 帧队列(**由调用方创建并拥有**; 本模块只 pop)
  * @param is_h265 1 = 按 H.265 打包; 0 = H.264。**必须和编码器那一路一致**
@@ -111,16 +111,16 @@ typedef struct {
 int svc_sender_start(void *queue, int is_h265);
 
 /**
- * 停止发送服务: 通知线程退出 → join → 释放资源。
+ * @brief 停止发送服务: 通知线程退出 → join → 释放资源。
  * @note **阻塞**, 会等线程真正退出。未启动时调用安全(no-op)。
  */
 void svc_sender_stop(void);
 
-/** 是否在运行。@return 1 = 在运行 */
+/** @brief 是否在运行。@return 1 = 在运行 */
 int svc_sender_is_running(void);
 
 /**
- * 通知"有个客户端开始播放了"。
+ * @brief 通知"有个客户端开始播放了"。
  *
  * @param client_index 客户端槽位下标(`svc_net` 的 `on_play` 里的那个)
  * @param rtp_dst      该客户端的 RTP 目的地(**非 NULL**, 由 svc_net 给出)
@@ -133,7 +133,7 @@ int svc_sender_is_running(void);
 int svc_sender_add_client(int client_index, const struct sockaddr_in *rtp_dst);
 
 /**
- * 通知"某个客户端停止播放/断开了"。
+ * @brief 通知"某个客户端停止播放/断开了"。
  *
  * @param client_index 客户端槽位下标
  *
@@ -142,10 +142,10 @@ int svc_sender_add_client(int client_index, const struct sockaddr_in *rtp_dst);
  */
 void svc_sender_remove_client(int client_index);
 
-/** 取统计快照。 */
+/** @brief 取统计快照。 */
 void svc_sender_get_stats(svc_sender_stats_t *out);
 
-/** 当前有多少个客户端在播放(用于验收断言)。 */
+/** @brief 当前有多少个客户端在播放(用于验收断言)。 */
 int svc_sender_client_count(void);
 
 #endif /* __SVC_SENDER_H__ */

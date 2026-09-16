@@ -71,7 +71,7 @@ typedef struct {
 } infra_queue_stats_t;
 
 /**
- * 创建队列。
+ * @brief 创建队列。
  *
  * @param capacity  槽位数(必须 > 0)
  * @param slot_size 每个槽位的字节数(必须 > 0)
@@ -82,11 +82,11 @@ typedef struct {
  */
 infra_queue_t *infra_queue_create(size_t capacity, size_t slot_size);
 
-/** 销毁队列, 释放全部槽位。传 NULL 安全。 */
+/** @brief 销毁队列, 释放全部槽位。传 NULL 安全。 */
 void infra_queue_destroy(infra_queue_t *q);
 
 /**
- * 入队(拷贝 len 字节)。
+ * @brief 入队(拷贝 len 字节)。
  *
  * @param len 数据长度, **必须 <= 创建时的 slot_size**; 否则整条被拒绝
  * @return 0 = 成功入队; -1 = 参数非法或单帧超长(计 rejected);
@@ -98,7 +98,7 @@ void infra_queue_destroy(infra_queue_t *q);
 int infra_queue_push(infra_queue_t *q, const void *data, size_t len);
 
 /**
- * 出队(拷贝到一个缓冲)。
+ * @brief 出队(拷贝到一个缓冲)。
  *
  * @param buf 输出缓冲
  * @param cap buf 的容量(必须 >= 创建时的 slot_size 才安全)
@@ -113,10 +113,10 @@ int infra_queue_push(infra_queue_t *q, const void *data, size_t len);
 int infra_queue_pop(infra_queue_t *q, void *buf, size_t cap,
                     size_t *out_len, int timeout_ms);
 
-/** 取当前深度(加锁读一次, 用于打日志/水位监测)。 */
+/** @brief 取当前深度(加锁读一次, 用于打日志/水位监测)。 */
 size_t infra_queue_depth(infra_queue_t *q);
 
-/** 取统计快照。@note 一次性加锁读全部字段, 保证同一时刻的一致性。 */
+/** @brief 取统计快照。@note 一次性加锁读全部字段, 保证同一时刻的一致性。 */
 void infra_queue_get_stats(infra_queue_t *q, infra_queue_stats_t *out);
 
 #endif /* __INFRA_QUEUE_H__ */

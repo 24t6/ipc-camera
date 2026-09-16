@@ -97,7 +97,7 @@ typedef struct {
 } bsp_mpp_frame_t;
 
 /**
- * 选择要取的那一路编码通道。**必须在 `bsp_mpp_init()` 之前调用。**
+ * @brief 选择要取的那一路编码通道。**必须在 `bsp_mpp_init()` 之前调用。**
  *
  * @param is_h265 非 0 = H.265 1080p(VENC chn0); 0 = H.264 720p(VENC chn1)
  *
@@ -111,7 +111,7 @@ typedef struct {
 void bsp_mpp_select_encoder(int is_h265);
 
 /**
- * 当前选中的 VENC 通道号(给需要"通道号"的模块用, 例如 OSD 挂载)。
+ * @brief 当前选中的 VENC 通道号(给需要"通道号"的模块用, 例如 OSD 挂载)。
  *
  * @return VENC 通道号
  * @note ★ 为什么不直接读内部结构里的 `chn`: `bsp_mpp_init()` 开头有
@@ -122,7 +122,7 @@ void bsp_mpp_select_encoder(int is_h265);
 int bsp_mpp_get_venc_chn(void);
 
 /**
- * 当前选中通道的**编码尺寸**(像素)。
+ * @brief 当前选中通道的**编码尺寸**(像素)。
  *
  * @param[out] width  输出宽度, 可为 NULL
  * @param[out] height 输出高度, 可为 NULL
@@ -132,7 +132,7 @@ int bsp_mpp_get_venc_chn(void);
 void bsp_mpp_get_encoder_size(int *width, int *height);
 
 /**
- * 初始化 MPP 视频通路(系统/VB → VI → VPSS → VENC)。
+ * @brief 初始化 MPP 视频通路(系统/VB → VI → VPSS → VENC)。
  *
  * @return 0 成功; 负值失败
  *
@@ -143,16 +143,16 @@ void bsp_mpp_get_encoder_size(int *width, int *height);
 int bsp_mpp_init(void);
 
 /**
- * 销毁通路。按**申请的反序**释放(与 `svc_net` 的 `release_all` 同一原则)。
+ * @brief 销毁通路。按**申请的反序**释放(与 `svc_net` 的 `release_all` 同一原则)。
  * @note 未初始化时调用是安全的(no-op)。
  */
 void bsp_mpp_deinit(void);
 
-/** 通路是否已就绪。@return 1 = 可以取流 */
+/** @brief 通路是否已就绪。@return 1 = 可以取流 */
 int bsp_mpp_is_ready(void);
 
 /**
- * 取一帧。
+ * @brief 取一帧。
  *
  * @param[out] frame 输出: 帧描述(指向 MPP 内部缓冲)
  * @param timeout_ms 0 = 不等待立即返回; <0 = 阻塞等到有帧; >0 = 最多等这么久
@@ -167,7 +167,7 @@ int bsp_mpp_is_ready(void);
 int bsp_mpp_get_frame(bsp_mpp_frame_t *frame, int timeout_ms);
 
 /**
- * 释放一帧。必须与上一次成功的 `bsp_mpp_get_frame` 配对调用。
+ * @brief 释放一帧。必须与上一次成功的 `bsp_mpp_get_frame` 配对调用。
  * 传 NULL 是安全的(no-op)。
  */
 void bsp_mpp_release_frame(bsp_mpp_frame_t *frame);
@@ -189,7 +189,7 @@ typedef struct {
     uint64_t drained_full;
 } bsp_mpp_stats_t;
 
-/** 取统计快照。 */
+/** @brief 取统计快照。 */
 void bsp_mpp_get_stats(bsp_mpp_stats_t *out);
 
 #endif /* __BSP_MPP_H__ */

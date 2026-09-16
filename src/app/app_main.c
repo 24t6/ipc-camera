@@ -2,6 +2,11 @@
  * @file    app_main.c
  * @brief   应用入口 —— 把四个模块接起来, 让整条链路真正跑起来(M1-9)
  *
+ * 【模块职责】把 queue + svc_net + svc_sender + svc_media + svc_osd 接起来, 并管起停顺序
+ * 【依赖方向】依赖全部 service 层与 infra_queue / proto_sdp / bsp_mpp; 不碰 MPP 细节
+ * 【线程模型】main 线程只做信号处理与定期汇报; 真正干活的是 4 个 service 线程
+ * 【资源边界】队列 8 槽 × 256KB(启动时一次分配, 退出时销毁); 无运行期动态分配
+ *
  * @details
  * ─────────────────────────────────────────────────────────────────
  *  它做的事:一根线, 四个模块
@@ -97,6 +102,13 @@
 
 static volatile int g_stop;
 
+/**
+ * @brief 信号处理: 只置"该停了"的标志
+ *
+ * @param sig 信号号(未使用)
+ * @note ⚠️ **只置标志, 不做任何清理** —— 在信号处理函数里做清理是不安全的。
+ * @note 执行线程: 收到信号的那个线程(通常是 main)。
+ */
 static void on_sigint(int sig)
 {
     (void)sig;
@@ -113,6 +125,11 @@ typedef struct {
     int         verbose;
 } app_opts_t;
 
+/**
+ * @brief 打印命令行用法
+ *
+ * @param prog 程序名(argv[0])
+ */
 static void usage(const char *prog)
 {
     printf("用法: %s [选项]\n"
@@ -126,7 +143,7 @@ static void usage(const char *prog)
 }
 
 /**
- * 解析命令行。
+ * @brief 解析命令行。
  *
  * @return 0 = 继续运行; 1 = 参数错(已打印用法); 2 = 用户要 -h 帮助(正常退出)
  *
@@ -163,7 +180,7 @@ static int parse_args(int argc, char **argv, app_opts_t *o)
 }
 
 /**
- * 打印运行状态(链路的四段各一个数字)。
+ * @brief 打印运行状态(链路的四段各一个数字)。
  *
  * @note 为什么值得定期打: 板子上跑起来之后, 你要能**一眼看出卡在哪一环**。
  *       `丢` 非 0 = 队列在丢帧(下游跟不上); `错误` 非 0 = 网络或编码有问题。
@@ -204,7 +221,7 @@ static void report(int secs)
 /* ─────────────────── svc_net 的两个回调 ─────────────────── */
 
 /**
- * 客户端开始播放(PLAY 之后)。
+ * @brief 客户端开始播放(PLAY 之后)。
  *
  * @note ⚠️ **本函数在 svc_net 的事件循环线程里执行** —— 绝不能阻塞,
  *       否则所有客户端的 RTSP 请求都会被卡住。
@@ -224,7 +241,7 @@ static void on_play(int client_index, const struct sockaddr_in *rtp_dst, void *u
                  (unsigned)ntohs(rtp_dst->sin_port));
 }
 
-/** 客户端停止播放(TEARDOWN / 断开 / 空闲超时) */
+/** @brief 客户端停止播放(TEARDOWN / 断开 / 空闲超时) */
 static void on_teardown(int client_index, void *user)
 {
     (void)user;
@@ -233,7 +250,7 @@ static void on_teardown(int client_index, void *user)
 }
 
 /**
- * 生成 SDP 文本。
+ * @brief 生成 SDP 文本。
  *
  * @return 写入的字符数; <=0 = 失败
  */
@@ -251,7 +268,7 @@ static int build_sdp(const app_opts_t *o, char *out, size_t cap)
 }
 
 /**
- * 按**申请的反序**停掉已启动的东西。
+ * @brief 按**申请的反序**停掉已启动的东西。
  *
  * @param started 位掩码: bit0=svc_media, bit1=svc_sender, bit2=svc_net, bit3=svc_osd
  *
@@ -273,7 +290,7 @@ static void shutdown_chain(int started)
 }
 
 /**
- * 把整条链路建起来并启动。
+ * @brief 把整条链路建起来并启动。
  *
  * @param o       命令行选项
  * @param started 输出: 位掩码(bit0=svc_media, bit1=svc_sender, bit2=svc_net, bit3=svc_osd)
@@ -381,6 +398,14 @@ static infra_queue_t *start_chain(const app_opts_t *o, int *started)
 
 /* ─────────────────── 主流程 ─────────────────── */
 
+/**
+ * @brief 程序入口: 解析参数 → 建链路 → 主循环汇报 → 收尾
+ *
+ * @param argc 参数个数
+ * @param argv 参数数组
+ * @return 0 正常退出; 1 = 参数错或启动失败
+ * @note 主线程只做汇报与信号处理, 真正干活的是 4 个 service 线程。
+ */
 int main(int argc, char **argv)
 {
     app_opts_t     o;

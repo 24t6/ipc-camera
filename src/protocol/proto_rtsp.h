@@ -87,7 +87,7 @@ typedef struct {
 } proto_rtsp_request_t;
 
 /**
- * 解析一段 RTSP 请求。
+ * @brief 解析一段 RTSP 请求。
  *
  * @param buf   收到的字节(不一定以 '\0' 结尾, 所以必须给 len)
  * @param len   buf 长度
@@ -105,20 +105,20 @@ typedef struct {
  */
 int proto_rtsp_parse_request(const char *buf, size_t len, proto_rtsp_request_t *req);
 
-/** 方法名(用于日志)。未知返回 "UNKNOWN"。 */
+/** @brief 方法名(用于日志)。未知返回 "UNKNOWN"。 */
 const char *proto_rtsp_method_name(proto_rtsp_method_t m);
 
 /* ─────────────────── 响应构造 ─────────────────── */
 
 /**
- * OPTIONS 响应 —— 告诉客户端我们支持哪些命令。
+ * @brief OPTIONS 响应 —— 告诉客户端我们支持哪些命令。
  * @return 写入字符数; 负值 = 缓冲不够
  * @note 必须在 Public 头里列出 **PAUSE**(我们实现了), 否则部分客户端不显示暂停按钮。
  */
 int proto_rtsp_build_options(const proto_rtsp_request_t *req, char *out, size_t cap);
 
 /**
- * DESCRIBE 响应 —— 把 SDP 作为消息体返回。
+ * @brief DESCRIBE 响应 —— 把 SDP 作为消息体返回。
  *
  * @param sdp       已经生成好的 SDP 文本(通常来自 proto_sdp_build)
  * @param sdp_len   SDP 字节数
@@ -129,7 +129,7 @@ int proto_rtsp_build_describe(const proto_rtsp_request_t *req,
                               char *out, size_t cap);
 
 /**
- * SETUP 响应 —— 分配会话号, 并把协商结果回给客户端。
+ * @brief SETUP 响应 —— 分配会话号, 并把协商结果回给客户端。
  *
  * @param session_id      服务器分配的随机会话号
  * @param server_rtp_port 服务器本地收 RTCP 用的端口(回显给客户端便于诊断)
@@ -138,18 +138,18 @@ int proto_rtsp_build_setup(const proto_rtsp_request_t *req, uint32_t session_id,
                            uint16_t server_rtp_port, char *out, size_t cap);
 
 /**
- * PLAY / PAUSE 响应 —— 只是确认, 但要带上 Session。
+ * @brief PLAY / PAUSE 响应 —— 只是确认, 但要带上 Session。
  * @note PLAY 之后数据才真正开始发; 但"开始发"这个动作在 svc_net 里, 不在这里。
  */
 int proto_rtsp_build_play_pause(const proto_rtsp_request_t *req, uint32_t session_id,
                                 char *out, size_t cap);
 
-/** TEARDOWN 响应 —— 会话就此结束。 */
+/** @brief TEARDOWN 响应 —— 会话就此结束。 */
 int proto_rtsp_build_teardown(const proto_rtsp_request_t *req, uint32_t session_id,
                               char *out, size_t cap);
 
 /**
- * 通用错误响应(如 400 Bad Request / 454 Session Not Found)。
+ * @brief 通用错误响应(如 400 Bad Request / 454 Session Not Found)。
  * @param code  三位状态码, 如 400 / 454 / 500
  * @param reason 原因短语, 如 "Bad Request"
  */

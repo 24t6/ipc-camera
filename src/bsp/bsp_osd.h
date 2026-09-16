@@ -73,7 +73,7 @@ typedef struct {
 } bsp_osd_stats_t;
 
 /**
- * 初始化 OSD:建区域 → 挂到当前选中的 VENC 通道 → 摆到右上角。
+ * @brief 初始化 OSD:建区域 → 挂到当前选中的 VENC 通道 → 摆到右上角。
  *
  * @return 0 成功; 负值失败
  *
@@ -86,7 +86,7 @@ typedef struct {
 int bsp_osd_init(void);
 
 /**
- * 渲染一段文本并提交为一帧水印。
+ * @brief 渲染一段文本并提交为一帧水印。
  *
  * @param[in] text 文本, **必须恰好 `BSP_OSD_TIME_CHARS` 个字符**
  *                  (区域尺寸在 `Create` 时就定死了, 长度不符会被拒绝并计数)
@@ -99,16 +99,16 @@ int bsp_osd_init(void);
 int bsp_osd_show(const char *text);
 
 /**
- * 销毁 OSD:从通道摘下 → 销毁区域。
+ * @brief 销毁 OSD:从通道摘下 → 销毁区域。
  * @note 未初始化时调用是安全的(no-op)。
  * @note 按**申请的反序**释放, 与 `bsp_mpp_deinit()` 同一原则。
  */
 void bsp_osd_deinit(void);
 
-/** OSD 是否已就绪。@return 1 = 已在叠加 */
+/** @brief OSD 是否已就绪。@return 1 = 已在叠加 */
 int bsp_osd_started(void);
 
-/** 取统计快照。 */
+/** @brief 取统计快照。 */
 void bsp_osd_get_stats(bsp_osd_stats_t *out);
 
 #endif /* __BSP_OSD_H__ */

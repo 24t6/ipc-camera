@@ -2,6 +2,11 @@
  * @file    bsp_mpp.c
  * @brief   MPP 板级支持实现 —— VI/VPSS/VENC 通路 + 取流
  *
+ * 【模块职责】MPP 通路(VB → VI → VPSS → VENC)的初始化、取流、销毁
+ * 【依赖方向】依赖厂商 MPP(libmpi 与 sample common)与 infra_log; 不依赖 service / protocol
+ * 【线程模型】**非线程安全**: 只允许 svc_media 的取流线程调用(MPP 通路由它独占)
+ * 【资源边界】VENC 码流缓冲由 MPP 持有(取到后必须立刻 ReleaseStream); 无自有堆分配
+ *
  * 结构:
  *      ① 模块状态与帧缓冲
  *      ② 取流
@@ -143,7 +148,7 @@ static struct {
 } g;
 
 /**
- * 选择要取的那一路编码通道。**必须在 `bsp_mpp_init()` 之前调用。**
+ * @brief 选择要取的那一路编码通道。**必须在 `bsp_mpp_init()` 之前调用。**
  *
  * @param is_h265 非 0 = 选 H.265 1080p(VENC chn0); 0 = H.264 720p(VENC chn1)
  *
@@ -185,7 +190,7 @@ void bsp_mpp_get_encoder_size(int *width, int *height)
 /* ─────────── ② 取流 ─────────── */
 
 /**
- * 轮询等待"有帧可取"。
+ * @brief 轮询等待"有帧可取"。
  *
  * @param timeout_ms 0 = 不等待; <0 = 最多等 2 秒(看门狗上限,不是无限等); >0 = 毫秒
  * @return 1 = 有 pack 了; 0 = 等到超时还是没有
@@ -242,7 +247,7 @@ static int wait_for_packs(int timeout_ms)
 }
 
 /**
- * 记录"码流缓冲已满, 但我们仍然要把它取走"这件事。
+ * @brief 记录"码流缓冲已满, 但我们仍然要把它取走"这件事。
  *
  * @note 只在**第一次**发生时打一条告警(卡住时每帧都满, 打日志会把串口刷爆),
  *       次数累计在 `stats.drained_full` 里, 由上层在结束时打印。
@@ -258,7 +263,7 @@ static void note_buffer_full(void)
 
 
 /**
- * 把 MPP 的 pack 数组搬进我们的帧描述(只搬指针, 不拷数据)。
+ * @brief 把 MPP 的 pack 数组搬进我们的帧描述(只搬指针, 不拷数据)。
  *
  * @note ⚠️ **绝不能**假设各 pack 内存连续 —— 见下面的详细说明。
  */
@@ -374,7 +379,7 @@ int bsp_mpp_is_ready(void)
 /* ─────────── ③ 初始化 ─────────── */
 
 /**
- * 第 1 步: 系统初始化 + VB(视频缓冲池)。
+ * @brief 第 1 步: 系统初始化 + VB(视频缓冲池)。
  *
  * @note 照抄 `sample_venc.c` 的 `SAMPLE_VENC_SYS_Init()`(厂商实际在用的写法):
  *       块大小用 `COMMON_GetPicBufferSize()` 算(不自己拼),
@@ -427,7 +432,7 @@ static int init_sys_and_vb(void)
 }
 
 /**
- * 填 VI 配置结构。
+ * @brief 填 VI 配置结构。
  *
  * @note ⚠️ `MipiDev` / `s32BusId` / `ViDev` 必须**一起**设对 ——
  *       摄像头在 sensor1/MIPI1/i2c-1。"摄像头在 sensor1"这一条信息
@@ -467,7 +472,7 @@ static void fill_vi_config(void)
     cfg->astViInfo[0].stChnInfo.enCompressMode = COMPRESS_MODE_SEG;
 }
 
-/** 第 2 步: VI(视频输入)。摄像头 → 采集。 */
+/** @brief 第 2 步: VI(视频输入)。摄像头 → 采集。 */
 static int init_vi(void)
 {
     SAMPLE_VI_CONFIG_S *cfg = &g.vi_cfg;
@@ -501,7 +506,7 @@ static int init_vi(void)
 }
 
 /**
- * 第 3 步: VPSS。
+ * @brief 第 3 步: VPSS。
  *
  * @note **顺序要点**:`SAMPLE_COMM_VPSS_Start` 成功后**才** `VI_Bind_VPSS`。
  *       Bind 内部只是 `HI_MPI_SYS_Bind`,目标 grp 不存在时不报错、只是不生效。
@@ -562,7 +567,7 @@ static int init_vpss(void)
 }
 
 /**
- * 第 4 步: VENC —— **只启动被选中的那一路**。
+ * @brief 第 4 步: VENC —— **只启动被选中的那一路**。
  *
  * @note ⚠️ 这里**故意不**"两路都开"。两路都开就必然有一路没人取流,
  *       它会塞满自己的码流缓冲 → 该路编码器停 → 它的输入图像队列占满

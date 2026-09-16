@@ -80,7 +80,7 @@ typedef struct {
 } proto_sdp_cfg_t;
 
 /**
- * 生成 SDP 文本。
+ * @brief 生成 SDP 文本。
  *
  * @param cfg   输入参数(见上)
  * @param out   输出缓冲(调用方提供, 建议 PROTO_SDP_BUF_SIZE)
@@ -94,7 +94,7 @@ typedef struct {
 int proto_sdp_build(const proto_sdp_cfg_t *cfg, char *out, size_t cap);
 
 /**
- * Base64 编码(单独暴露, 便于单测「3 字节 → 4 字符」这条规则)。
+ * @brief Base64 编码(单独暴露, 便于单测「3 字节 → 4 字符」这条规则)。
  *
  * @param in       输入字节
  * @param in_len   输入长度

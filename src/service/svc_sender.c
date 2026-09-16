@@ -2,6 +2,11 @@
  * @file    svc_sender.c
  * @brief   RTP 发送服务实现 —— 见 svc_sender.h
  *
+ * 【模块职责】发送线程: 出队 → 切 NALU → 打 RTP 包 → 发给每个正在看的客户端
+ * 【依赖方向】依赖 infra_queue、proto_nalu、proto_rtp、infra_netio、svc_media(槽位布局的唯一出处)
+ * 【线程模型】自己起 **1 个**线程(sender_thread, 线程名 `ipc_send`); 每客户端一份独立 RTP 会话
+ * 【资源边界】槽位缓冲在 start 时一次分配; 客户端槽位固定 8 个(引用计数保护移除竞态)
+ *
  * 结构:
  *      ① 模块状态与客户端槽位
  *      ② 并发策略(本文件最需要看懂的一节)
@@ -24,6 +29,7 @@
 #include <stdio.h>      /* fprintf —— 临时诊断用(SVC_SENDER_DEBUG) */
 #include <stdlib.h>
 #include <string.h>
+#include <sys/prctl.h>      /* prctl(PR_SET_NAME) —— 给线程起名, ps/top 能看出来 */
 #include <time.h>
 #include <unistd.h>
 
@@ -108,7 +114,7 @@ static struct {
  *  收益: sendto 绝不在临界区里; 且**不持有悬空指针**。
  */
 
-/** 释放一个槽位(调用方必须已持锁, 且确认 in_use == 0) */
+/** @brief 释放一个槽位(调用方必须已持锁, 且确认 in_use == 0) */
 static void client_slot_free_locked(sender_client_t *c)
 {
     if (c->sender != NULL)
@@ -119,7 +125,7 @@ static void client_slot_free_locked(sender_client_t *c)
     g.stats.clients_left++;
 }
 
-/** 放下引用; 若该槽位正等着被释放且引用已归零, 就地释放 */
+/** @brief 放下引用; 若该槽位正等着被释放且引用已归零, 就地释放 */
 static void client_release_locked(sender_client_t *c)
 {
     if (c->in_use > 0)
@@ -136,6 +142,13 @@ typedef struct {
     int has_idr;
 } frame_info_t;
 
+/**
+ * @brief 遍历回调: 把一个 NALU 打包发给**所有**正在看的客户端
+ *
+ * @param n 当前 NALU
+ * @param user 本次发送的上下文
+ * @return 0 = 继续遍历; 非 0 = 要求提前结束
+ */
 static int scan_nalu_cb(const proto_nalu_t *n, void *user)
 {
     frame_info_t *fi = (frame_info_t *)user;
@@ -189,7 +202,7 @@ typedef struct {
     int                  total;         /* 本帧 NALU 总数 */
 } fanout_ctx_t;
 
-/** 真正发一个 NALU(带 is_last 判断) */
+/** @brief 真正发一个 NALU(带 is_last 判断) */
 static void emit(fanout_ctx_t *fc, const proto_nalu_t *n, int is_last)
 {
     int npkt;
@@ -209,7 +222,7 @@ static void emit(fanout_ctx_t *fc, const proto_nalu_t *n, int is_last)
 }
 
 /**
- * 遍历回调 —— 用"滞后一个 NALU"的办法解决 `is_last`。
+ * @brief 遍历回调 —— 用"滞后一个 NALU"的办法解决 `is_last`。
  *
  * @note 为什么需要这个技巧: `is_last`(RTP marker 位)要求知道
  *       **当前 NALU 是不是本帧最后一个**, 但遍历时并不知道后面还有没有。
@@ -233,7 +246,7 @@ static int fanout_nalu_cb(const proto_nalu_t *n, void *user)
 }
 
 /**
- * 把一帧发给一个客户端。
+ * @brief 把一帧发给一个客户端。
  *
  * @return 0 成功; -1 发送出错; 1 = 本帧被跳过(还在等 IDR)
  */
@@ -279,7 +292,7 @@ static int send_frame_to_one(sender_client_t *cli, const uint8_t *data,
 /* ═══════════════ ④ 发送线程 ═══════════════ */
 
 /**
- * 把一帧分发给**当前所有正在播放的客户端**。
+ * @brief 把一帧分发给**当前所有正在播放的客户端**。
  *
  * @note 按"② 并发策略"说的三步走: 快照 → 锁外发送 → 放引用。
  */
@@ -317,7 +330,7 @@ static void fanout_frame(const uint8_t *data, size_t len, uint64_t pts)
 }
 
 /**
- * 记一帧的「帧龄」= `CLOCK_MONOTONIC(现在) − u64PTS(采集时刻)`。
+ * @brief 记一帧的「帧龄」= `CLOCK_MONOTONIC(现在) − u64PTS(采集时刻)`。
  *
  * @param pts 该帧的编码器时间戳(1 MHz 单调时钟, 由 MPP 给)
  *
@@ -357,7 +370,7 @@ static void note_latency(uint64_t pts)
 }
 
 /**
- * 解析发送槽位里的一帧, 并分发给所有客户端。
+ * @brief 解析发送槽位里的一帧, 并分发给所有客户端。
  *
  * @param len 槽位里的有效字节数(由 `infra_queue_pop` 给出)
  * @return 0 = 已分发; -1 = 槽位内容非法(已告警, 调用方继续下一轮)
@@ -406,9 +419,18 @@ static int dispatch_one_slot(size_t len)
     return 0;
 }
 
+/**
+ * @brief 发送线程主循环: 出队一帧 → 切 NALU → 分别发给每个客户端
+ *
+ * @param arg 未使用
+ * @return 永远返回 NULL
+ * @note 执行线程: 本模块自己起的线程(线程名 `ipc_send`)。
+ */
 static void *sender_thread(void *arg)
 {
     (void)arg;
+    /* §7.1: 线程名让 `ps` / `top` 一眼看出这是谁, 不用靠 pid 猜 */
+    (void)prctl(PR_SET_NAME, "ipc_send", 0, 0, 0);
     LOG_INFO("发送线程启动(H.26%d, 客户端上限 %d)",
              g.is_h265 ? 5 : 4, SVC_SENDER_MAX_CLIENTS);
 

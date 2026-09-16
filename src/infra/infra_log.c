@@ -2,6 +2,11 @@
  * @file    infra_log.c
  * @brief   分级日志实现 —— 见 infra_log.h
  *
+ * 【模块职责】分级日志(DEBUG/INFO/WARN/ERROR)输出到 stdout
+ * 【依赖方向】只依赖 libc —— **不依赖任何项目内模块**
+ * 【线程模型】每条日志一次输出, 无共享可变状态(级别只在启动时设一次)
+ * 【资源边界】无动态分配; 格式化缓冲在栈上且有长度上限
+ *
  * 实现要点:
  *   · 先在本线程栈上的 buf 里拼完整行, 再**一次性 write()**
  *     —— 这样多线程同时打日志时, 输出不会互相插进半行
@@ -27,6 +32,11 @@ void infra_log_set_level(infra_log_level_t level)
     g_level = level;
 }
 
+/**
+ * @brief 取当前日志级别
+ *
+ * @return 当前的 infra_log_level_t
+ */
 infra_log_level_t infra_log_get_level(void)
 {
     return g_level;

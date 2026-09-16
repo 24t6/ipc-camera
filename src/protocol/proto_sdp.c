@@ -2,6 +2,11 @@
  * @file    proto_sdp.c
  * @brief   SDP 生成实现 —— 两套模板(H.264 / H.265)+ Base64
  *
+ * 【模块职责】生成 SDP 媒体说明书(含 sprop 参数集的 Base64 编码)
+ * 【依赖方向】只依赖 proto_str 与 libc
+ * 【线程模型】纯函数, 可在多线程中并发调用
+ * 【资源边界】无动态分配; 输出写到调用方给的缓冲(容量不足时明确失败, 不截断)
+ *
  * 实现刻意保持短小:职责只有「把参数拼成文本」。
  * 具体分三个部分:
  *      ① Base64 编码(把二进制的 SPS/PPS 变成 SDP 能携带的文本)
@@ -20,7 +25,7 @@
 static const char B64_TAB[] =
     "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
-/** 编码一个 3 字节组; count 不足 3 时补 '='。返回写入的字符数(固定 4)。 */
+/** @brief 编码一个 3 字节组; count 不足 3 时补 '='。返回写入的字符数(固定 4)。 */
 static size_t b64_group(const uint8_t *g, size_t count, char *out)
 {
     uint32_t v = ((uint32_t)g[0] << 16);
@@ -75,7 +80,7 @@ int proto_sdp_base64(const uint8_t *in, size_t in_len, char *out, size_t cap)
 #define append(out, cap, used, text)        proto_str_append((out), (cap), (used), (text))
 #define append_u32(out, cap, used, v)       proto_str_append_u32((out), (cap), (used), (v))
 
-/** 追加 "前缀 + Base64(参数集)"; 参数集为空时整行跳过。 */
+/** @brief 追加 "前缀 + Base64(参数集)"; 参数集为空时整行跳过。 */
 static int append_param(char *out, size_t cap, size_t *used,
                         const char *prefix, const uint8_t *data, size_t len)
 {
@@ -97,7 +102,7 @@ static int append_param(char *out, size_t cap, size_t *used,
 /* ─────────────────── ③ 两套 SDP 模板 ─────────────────── */
 
 /**
- * 把载荷类型数字追加到输出(动态 PT 只可能是 96~127)。
+ * @brief 把载荷类型数字追加到输出(动态 PT 只可能是 96~127)。
  * @note 直接复用 proto_str_append_u32, 不再手写十进制转换。
  */
 static int append_pt(char *out, size_t cap, size_t *used, uint8_t pt)
@@ -105,7 +110,7 @@ static int append_pt(char *out, size_t cap, size_t *used, uint8_t pt)
     return append_u32(out, cap, used, (uint32_t)pt);
 }
 
-/** 写入两个协议共有的头几行(v= o= s= c= t= m=)。 */
+/** @brief 写入两个协议共有的头几行(v= o= s= c= t= m=)。 */
 static int build_common(const proto_sdp_cfg_t *cfg, char *out, size_t cap,
                         size_t *used)
 {
@@ -125,7 +130,7 @@ static int build_common(const proto_sdp_cfg_t *cfg, char *out, size_t cap,
 }
 
 /**
- * H.264 模板(RFC 6184 §8.1)。
+ * @brief H.264 模板(RFC 6184 §8.1)。
  *
  *   a=rtpmap:96 H264/90000
  *   a=fmtp:96 packetization-mode=1;sprop-parameter-sets=<b64(SPS)>,<b64(PPS)>
@@ -199,7 +204,7 @@ static int build_h264(const proto_sdp_cfg_t *cfg, char *out, size_t cap,
 }
 
 /**
- * H.265 模板(RFC 7798 §7.2.1)。
+ * @brief H.265 模板(RFC 7798 §7.2.1)。
  *
  *   a=rtpmap:97 H265/90000
  *   a=fmtp:97 sprop-vps=<b64(VPS)>;sprop-sps=<b64(SPS)>;sprop-pps=<b64(PPS)>

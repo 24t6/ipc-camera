@@ -80,7 +80,7 @@ typedef struct {
 typedef int (*proto_nalu_cb_t)(const proto_nalu_t *nalu, void *user);
 
 /**
- * 把一段 Annex-B 缓冲拆成 NALU 逐个回调。
+ * @brief 把一段 Annex-B 缓冲拆成 NALU 逐个回调。
  *
  * @param buf      码流起始
  * @param len      码流长度
@@ -93,13 +93,13 @@ int proto_nalu_foreach(const uint8_t *buf, size_t len, int is_h265,
                  proto_nalu_cb_t cb, void *user);
 
 /**
- * 判断一段 Annex-B 缓冲里是否含关键帧(IDR)。
+ * @brief 判断一段 Annex-B 缓冲里是否含关键帧(IDR)。
  * 用于「新客户端何时可以开始看」的决策 —— 必须从 IDR 起才不出花屏。
  */
 int proto_nalu_has_idr(const uint8_t *buf, size_t len, int is_h265);
 
 /**
- * 根据类型值给出可读名称, 便于打日志。
+ * @brief 根据类型值给出可读名称, 便于打日志。
  */
 const char *proto_nalu_kind_name(proto_nalu_kind_t kind);
 

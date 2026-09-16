@@ -24,15 +24,15 @@ typedef enum {
     INFRA_LOG_ERROR = 3,
 } infra_log_level_t;
 
-/** 低于该级别的日志不输出; 默认 INFRA_LOG_INFO */
+/** @brief 低于该级别的日志不输出; 默认 INFRA_LOG_INFO */
 void infra_log_set_level(infra_log_level_t level);
 infra_log_level_t infra_log_get_level(void);
 
-/** 级别名(用于输出), 未知返回 "?" */
+/** @brief 级别名(用于输出), 未知返回 "?" */
 const char *infra_log_level_name(infra_log_level_t level);
 
 /**
- * 输出一条日志(一般不用直接调, 用下面的宏)。
+ * @brief 输出一条日志(一般不用直接调, 用下面的宏)。
  *
  * @param level  级别
  * @param file   文件名(由宏用 __FILE__ 传入)
