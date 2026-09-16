@@ -100,9 +100,13 @@
 
 /**
  * 默认环形容量上限(MB)。
- * 2 GB ≈ 30G 卡的 7%, 也够存约 1 小时的 4 Mbps 码流 —— 既能录很久, 又留足空间。
+ *
+ * @note ⚠️ 这个值**必须大于一段的大小**, 否则每录满一段就把上一段删掉,
+ *       环形覆盖变成"只留一段"。
+ *       实测码流约 4 Mbps ⇒ 30 分钟一段 ≈ **900 MB**;
+ *       8 GB ≈ 9 段 ≈ 4.5 小时, 占 30G 卡的 27%, 留足余量。
  */
-#define APP_REC_LIMIT_MB 2048
+#define APP_REC_LIMIT_MB 8192
 
 /** 录制队列(与发送队列**互相独立**, 见 svc_media.h 的说明) */
 static infra_queue_t *g_record_queue;
@@ -137,7 +141,7 @@ typedef struct {
     int         no_osd;      /**< 1 = 不叠时间水印(默认叠) */
     int         no_record;   /**< 1 = 不录 MP4(默认录到 /mnt/sdcard) */
     int         rec_mb;      /**< 环形容量上限(MB);0 = 不限 */
-    int         rec_seg;     /**< 每段帧数;0 = 用默认(1800 ≈ 60 秒) */
+    int         rec_seg;     /**< 每段**秒数**;0 = 用默认(1800 秒 = 30 分钟) */
     int         verbose;
 } app_opts_t;
 
@@ -155,7 +159,7 @@ static void usage(const char *prog)
            "  -no-osd     不叠时间水印(默认在右上角叠)\n"
            "  -no-record  不录 MP4(默认录到 " APP_REC_DIR ")\n"
            "  -r <MB>     录制环形容量上限(默认 %d MB;0=不限)\n"
-           "  -s <帧数>   每段多少帧后切新文件(默认 1800 ≈ 60 秒)\n"
+           "  -s <秒数>   每段多少秒后切新文件(默认 1800 = 30 分钟)\n"
            "  -v          打开 DEBUG 日志\n"
            "  -h          显示本帮助\n",
            prog, APP_DEFAULT_PORT, APP_REC_LIMIT_MB);
@@ -331,7 +335,7 @@ static void shutdown_chain(int started)
 /**
  * @brief 起录制服务:建录制队列 → 配 mp4v2 → 起线程
  *
- * @param[in]  o       命令行选项(容量上限 / 每段帧数)
+ * @param[in]  o       命令行选项(容量上限 / 每段秒数)
  * @param[out] started 位掩码,成功则置上 bit4
  * @return 0 成功; 负值失败
  *
@@ -356,7 +360,7 @@ static int start_record(const app_opts_t *o, int *started)
     rec.height         = h;
     rec.limit_bytes    = (o->rec_mb > 0) ? (uint64_t)o->rec_mb * 1024 * 1024 : 0;
     rec.limit_files    = 0;
-    rec.segment_frames = o->rec_seg;
+    rec.segment_frames = o->rec_seg * SVC_RECORD_FPS;   /* 命令行给的是秒 */
 
     if (svc_record_start(&rec, g_record_queue) != 0) {
         infra_queue_destroy(g_record_queue);
@@ -364,9 +368,10 @@ static int start_record(const app_opts_t *o, int *started)
         return -2;
     }
     *started |= 16;
-    printf("录制      : %s · %dx%d · 每段 %d 帧 · 上限 %d MB\n",
+    printf("录制      : %s · %dx%d · 每段 %d 秒 · 上限 %d MB\n",
            APP_REC_DIR, w, h,
-           (o->rec_seg > 0) ? o->rec_seg : 1800, o->rec_mb);
+           (o->rec_seg > 0) ? o->rec_seg : SVC_RECORD_DEFAULT_SEGMENT_SEC,
+           o->rec_mb);
     return 0;
 }
 

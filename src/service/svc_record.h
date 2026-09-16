@@ -52,8 +52,23 @@
 /** 单个 NALU 的上限。720p 实测最大约 55KB, 留足余量;超过的 NALU 会被计数丢弃 */
 #define SVC_RECORD_MAX_NALU (256 * 1024)
 
-/** 默认每段帧数:1800 帧 ≈ 60 秒 @30fps(M3-5:缩短单段以降低强杀损失) */
-#define SVC_RECORD_DEFAULT_SEGMENT_FRAMES 1800
+/** 编码帧率。分段长度对外用**秒**表达, 换算成帧数要乘它 */
+#define SVC_RECORD_FPS 30
+
+/** 默认分段长度:**30 分钟**(1800 秒 = 54000 帧) */
+#define SVC_RECORD_DEFAULT_SEGMENT_SEC 1800
+
+/**
+ * 默认每段帧数 = 默认秒数 × 帧率。
+ *
+ * @note 为什么是 30 分钟:这是**监控录像的行业惯例**(NVR/DVR 普遍按 30 或 60
+ *       分钟切文件)—— 段太长不便于检索和删除, 段太短则文件数爆炸。
+ * @note ⚠️ 代价:**段越长, 异常掉电丢得越多**。mp4v2 的索引(moov)只在
+ *       `MP4Close` 时落盘, 所以 `kill -9` / 断电最多丢"正在写的那一段",
+ *       也就是**最多 30 分钟**。想要更小的掉电损失就把 `-s` 调小。
+ */
+#define SVC_RECORD_DEFAULT_SEGMENT_FRAMES \
+    (SVC_RECORD_DEFAULT_SEGMENT_SEC * SVC_RECORD_FPS)
 
 /** mp4v2 的时间基与"每帧时长"。90000 / 3000 = 30fps, 与码流一致 */
 #define SVC_RECORD_TIMESCALE  90000
@@ -66,7 +81,7 @@ typedef struct {
     int         height;          /**< 编码高 */
     uint64_t    limit_bytes;     /**< 环形容量上限(字节);0 = 不限 */
     int         limit_files;     /**< 环形文件数上限;0 = 不限 */
-    int         segment_frames;  /**< 每段多少帧后切新文件;<=0 = 用默认(1800) */
+    int         segment_frames;  /**< 每段多少帧后切新文件;<=0 = 用默认(54000 ≈ 30 分钟) */
 } svc_record_cfg_t;
 
 /** 录制统计(用于日志与验收断言) */

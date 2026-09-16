@@ -59,6 +59,7 @@ static struct {
     int              have_sps;
     int              have_pps;
     int              frames_in_seg;
+    int              want_close;                  /* 1 = 已达段长, 等下一个 IDR 再切 */
     char             cur_name[SVC_RECORD_POLICY_NAME_MAX];
 
     svc_record_stats_t stats;
@@ -247,6 +248,7 @@ static int open_segment(void)
     g.have_sps      = 0;
     g.have_pps      = 0;
     g.frames_in_seg = 0;
+    g.want_close    = 0;
     LOG_INFO("录制: 开始新分段 %s(%dx%d)", g.cur_name, g.width, g.height);
     return 0;
 }
@@ -262,8 +264,9 @@ static void close_segment(void)
         return;
     }
     MP4Close(g.mp4, 0);
-    g.mp4   = NULL;
-    g.track = MP4_INVALID_TRACK_ID;
+    g.mp4        = NULL;
+    g.track      = MP4_INVALID_TRACK_ID;
+    g.want_close = 0;
     g.stats.segments++;
     LOG_INFO("录制: 分段收尾 %s(%d 帧, %llu 字节, 共 %llu 段)",
              g.cur_name, g.frames_in_seg,
@@ -396,11 +399,27 @@ static int on_nalu_cb(const proto_nalu_t *n, void *user)
  * @brief 处理一个队列槽位(一帧)
  *
  * @param[in] len 槽位里的有效字节数
+ *
+ * @note ★ **分段边界对齐到 IDR** —— 这是修 B033 的关键, 两条规则:
+ *       ① 新分段**必须从关键帧(IDR)开始**: MP4 建轨要 SPS/PPS, 而它们是
+ *          跟着 IDR 一起发的; 从 P 帧起写, 播放器解不出来(花屏/播不了)。
+ *       ② 收满 `segment_frames` 后**不立刻关**, 而是继续把这帧写进**当前段**
+ *          (它是合法的后续帧), 等**下一个关键帧**才关旧段、并**用它开新段**。
+ *          于是边界正好落在 IDR 上, **一帧都不丢**。
+ *
+ *       ❌ 修之前是"满了立刻关, 新段干等下一个 IDR":等的那些帧被计数但
+ *          **没落盘**, 实测每段丢 29 帧(≈1 秒); 而 `frames_in_seg` 统计的是
+ *          "处理过"的帧, 于是日志说 900 帧、文件里只有 871 帧(见 B033)。
+ *
+ * @note 代价:段长从"恰好 segment_frames 帧"变成
+ *       **segment_frames ~ segment_frames + GOP-1 帧**(30fps/GOP=30 时约
+ *       30.0~31.0 秒)。"每段不短于设定值"是更强的语义, 这是有意的取舍。
  */
 static void handle_slot(size_t len)
 {
     const svc_media_frame_hdr_t *h;
     const uint8_t               *data;
+    int                          is_key;
     int                          n;
 
     (void)len;
@@ -409,19 +428,30 @@ static void handle_slot(size_t len)
         g.stats.slot_errors++;
         return;
     }
-    if (g.mp4 == NULL && open_segment() != 0) {
-        return;
+    data   = svc_media_slot_data(g_slot);
+    is_key = proto_nalu_has_idr(data, h->len, 0 /* 只支持 H.264 */);
+
+    if (g.mp4 != NULL && g.want_close && is_key) {
+        close_segment();                /* ★ 边界落在这个 IDR 上 */
     }
-    data = svc_media_slot_data(g_slot);
+    if (g.mp4 == NULL) {
+        if (!is_key) {
+            return;                     /* 等关键帧(只在刚启动那一下会发生) */
+        }
+        if (open_segment() != 0) {
+            return;
+        }
+    }
     n = proto_nalu_foreach(data, h->len, 0 /* 只支持 H.264 */, on_nalu_cb, NULL);
     if (n <= 0) {
         g.stats.write_errors++;
         return;
     }
+    /* ★ 只统计**真正落盘**的帧 —— 让日志里的帧数等于文件里的帧数(B033 的教训) */
     g.frames_in_seg++;
     g.stats.frames_written++;
     if (g.segment_frames > 0 && g.frames_in_seg >= g.segment_frames) {
-        close_segment();
+        g.want_close = 1;               /* 不立刻关:等下一个 IDR 再切 */
     }
 }
 
@@ -439,7 +469,8 @@ static void *record_thread(void *arg)
     (void)arg;
     /* §7.1: 线程名让 `ps` / `top` 一眼看出这是谁 */
     (void)prctl(PR_SET_NAME, "ipc_rec", 0, 0, 0);
-    LOG_INFO("录制线程启动(目录 %s, 每段 %d 帧)", g.dir, g.segment_frames);
+    LOG_INFO("录制线程启动(目录 %s, 每段 %d 帧 ≈ %d 秒)",
+             g.dir, g.segment_frames, g.segment_frames / SVC_RECORD_FPS);
 
     while (!g.stop_requested) {
         size_t len = 0;
