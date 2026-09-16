@@ -111,6 +111,27 @@ typedef struct {
 void bsp_mpp_select_encoder(int is_h265);
 
 /**
+ * 当前选中的 VENC 通道号(给需要"通道号"的模块用, 例如 OSD 挂载)。
+ *
+ * @return VENC 通道号
+ * @note ★ 为什么不直接读内部结构里的 `chn`: `bsp_mpp_init()` 开头有
+ *       `memset(&g, 0, sizeof(g))`, 会把结构里的一切清零 ——
+ *       所以"选路意向"存在文件级静态 `g_want_h265`, **它才是唯一真相**。
+ *       本接口在 `init` 前后都返回正确的通道号。
+ */
+int bsp_mpp_get_venc_chn(void);
+
+/**
+ * 当前选中通道的**编码尺寸**(像素)。
+ *
+ * @param[out] width  输出宽度, 可为 NULL
+ * @param[out] height 输出高度, 可为 NULL
+ * @note OSD 的区域坐标是**图像坐标**, 摆放位置(如右上角)要用到它。
+ *       尺寸与选路一一对应: chn0 = 1920×1080, chn1 = 1280×720。
+ */
+void bsp_mpp_get_encoder_size(int *width, int *height);
+
+/**
  * 初始化 MPP 视频通路(系统/VB → VI → VPSS → VENC)。
  *
  * @return 0 成功; 负值失败

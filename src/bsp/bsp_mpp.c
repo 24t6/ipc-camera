@@ -163,6 +163,25 @@ void bsp_mpp_select_encoder(int is_h265)
 }
 
 
+int bsp_mpp_get_venc_chn(void)
+{
+    return g_want_h265 ? BSP_VENC_CHN_H265 : BSP_VENC_CHN_H264;
+}
+
+void bsp_mpp_get_encoder_size(int *width, int *height)
+{
+    /* 这三个数与 init_vpss() 里给 VPSS 通道设的尺寸、以及传给
+     * SAMPLE_COMM_VENC_Start 的 PIC_1080P / PIC_720P 是**同一组事实**,
+     * 改这里必须同时改那里。 */
+    if (width != NULL) {
+        *width = g_want_h265 ? 1920 : 1280;
+    }
+    if (height != NULL) {
+        *height = g_want_h265 ? 1080 : 720;
+    }
+}
+
+
 /* ─────────── ② 取流 ─────────── */
 
 /**

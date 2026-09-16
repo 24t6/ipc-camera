@@ -10,7 +10,8 @@
  *      ① svc_media   取流线程: MPP 取帧 → 拼槽位 → 入队
  *      ② svc_sender  发送线程: 出队 → 分片成 RTP → 发给所有在看的人
  *      ③ svc_net     RTSP 服务端: 处理 OPTIONS/DESCRIBE/SETUP/PLAY…
- *      ④ 本文件      接线: 队列 + 两个回调(on_play / on_teardown)
+ *      ④ svc_osd     1 Hz 线程: 时间 → 点阵渲染 → 叠加到 VENC 通道(M2 水印)
+ *      ⑤ 本文件      接线: 队列 + 两个回调(on_play / on_teardown)
  *
  *  接线图(箭头 = 数据流; 虚线 = 回调):
  *
@@ -29,10 +30,13 @@
  * ─────────────────────────────────────────────────────────────────
  *  ⭐ 启动顺序为什么是这样(有讲究)
  * ─────────────────────────────────────────────────────────────────
- *      ① 建队列          —— 后面两个都要用它
+ *      ① 建队列          —— 后面几个都要用它
  *      ② 起 svc_net      —— 先把"控制面"立起来(此时还没码流, 但能应答 OPTIONS)
  *      ③ 起 svc_sender   —— 消费端先就位
- *      ④ **最后**起 svc_media —— 生产者最后开
+ *      ④ 起 svc_media    —— 生产者最后开(它会 bsp_mpp_init(), 约 5~10 秒)
+ *      ⑤ 起 svc_osd      —— **必须在 svc_media 之后**: 水印挂在 VENC 通道上,
+ *                          而那个通道是 bsp_mpp_init() 建的。
+ *                          失败**不影响推流**(水印只是锦上添花)。
  *
  *  为什么生产者最后: `svc_media` 一起来就开始往队列里推帧。如果队列还没有
  *  消费者(或队列还没建), 那些帧要么没地方去、要么立刻被"丢最旧"丢掉。
@@ -55,6 +59,7 @@
  *      ./ipc_app                 # 监听 0.0.0.0:554
  *      ./ipc_app -p 8554         # 换端口(免 root)
  *      ./ipc_app -h265           # 取 H.265 那一路(默认 H.264)
+ *      ./ipc_app -no-osd         # 不叠时间水印(默认在右上角叠)
  *      ./ipc_app -v              # 打开 DEBUG 日志
  *
  *  然后客户端拉流:
@@ -75,6 +80,7 @@
 #include "proto_sdp.h"
 #include "svc_media.h"
 #include "svc_net.h"
+#include "svc_osd.h"
 #include "svc_sender.h"
 
 /** 队列槽位容量 = 帧头 + 单帧最大字节(与 svc_media 的预算一致) */
@@ -103,6 +109,7 @@ typedef struct {
     uint16_t    port;
     const char *bind_ip;
     int         is_h265;
+    int         no_osd;      /**< 1 = 不叠时间水印(默认叠) */
     int         verbose;
 } app_opts_t;
 
@@ -112,6 +119,7 @@ static void usage(const char *prog)
            "  -p <端口>   RTSP 端口(默认 %d)\n"
            "  -b <地址>   监听地址(默认 0.0.0.0)\n"
            "  -h265       取 H.265 那一路(默认 H.264)\n"
+           "  -no-osd     不叠时间水印(默认在右上角叠)\n"
            "  -v          打开 DEBUG 日志\n"
            "  -h          显示本帮助\n",
            prog, APP_DEFAULT_PORT);
@@ -133,6 +141,7 @@ static int parse_args(int argc, char **argv, app_opts_t *o)
     o->port    = APP_DEFAULT_PORT;
     o->bind_ip = "0.0.0.0";
     o->is_h265 = 0;
+    o->no_osd  = 0;
     o->verbose = 0;
 
     while ((opt = getopt(argc, argv, "p:b:hv")) != -1) {
@@ -147,6 +156,8 @@ static int parse_args(int argc, char **argv, app_opts_t *o)
     for (i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-h265") == 0)
             o->is_h265 = 1;
+        else if (strcmp(argv[i], "-no-osd") == 0)
+            o->no_osd = 1;
     }
     return 0;
 }
@@ -162,14 +173,17 @@ static void report(int secs)
     svc_media_stats_t  ms;
     svc_sender_stats_t ss;
     svc_net_stats_t    ns;
+    svc_osd_stats_t    os;
 
     svc_media_get_stats(&ms);
     svc_sender_get_stats(&ss);
     svc_net_get_stats(&ns);
+    svc_osd_get_stats(&os);
 
     printf("[%4ds] 取流 %llu 帧 | 发送 %llu 帧/%llu 包 | 客户端 %d 在发(%llu 等IDR)"
            " | RTSP %llu 连接/%llu 请求 | 丢 %llu | 错误 %llu"
-           " | ★帧龄 现/最小/最大 %.0f/%.0f/%.0f ms 漂移 %.0f ms\n",
+           " | ★帧龄 现/最小/最大 %.0f/%.0f/%.0f ms 漂移 %.0f ms"
+           " | OSD %llu 次/错 %llu\n",
            secs,
            (unsigned long long)ms.frames,
            (unsigned long long)ss.frames_sent,
@@ -181,8 +195,9 @@ static void report(int secs)
            (unsigned long long)(ms.queue_dropped + ms.oversize),
            (unsigned long long)(ms.get_errors + ss.send_errors),
            ss.age_last_us / 1000.0, ss.age_min_us / 1000.0, ss.age_max_us / 1000.0,
-           (ss.age_last_us - ss.age_first_us) / 1000.0);
-    fflush(stdout);
+           (ss.age_last_us - ss.age_first_us) / 1000.0,
+           (unsigned long long)os.ticks,
+           (unsigned long long)os.show_errors);
     fflush(stdout);
 }
 
@@ -238,13 +253,17 @@ static int build_sdp(const app_opts_t *o, char *out, size_t cap)
 /**
  * 按**申请的反序**停掉已启动的东西。
  *
- * @param started 位掩码: bit0=svc_media, bit1=svc_sender, bit2=svc_net
+ * @param started 位掩码: bit0=svc_media, bit1=svc_sender, bit2=svc_net, bit3=svc_osd
  *
  * @note 抽出来是为了让每一处失败都能"从当前状态干净回退",
  *       而不必在每个失败分支里重复写一遍清理 —— 那种重复**漏一个就是资源泄漏**。
+ * @note ⚠️ **svc_osd 必须最先停**:它挂在 VENC 通道上, 而 `svc_media_stop()`
+ *       会 `bsp_mpp_deinit()` 把整条 MPP 通路拆掉 —— 那时再想 Detach 就晚了。
  */
 static void shutdown_chain(int started)
 {
+    if (started & 8)
+        svc_osd_stop();
     if (started & 1)
         svc_media_stop();
     if (started & 2)
@@ -257,7 +276,7 @@ static void shutdown_chain(int started)
  * 把整条链路建起来并启动。
  *
  * @param o       命令行选项
- * @param started 输出: 位掩码(bit0=svc_media, bit1=svc_sender, bit2=svc_net)
+ * @param started 输出: 位掩码(bit0=svc_media, bit1=svc_sender, bit2=svc_net, bit3=svc_osd)
  * @return 队列句柄(**调用方负责销毁**); NULL = 启动失败(已打印原因)
  *
  * @note 启动顺序为什么是这样(有讲究):
@@ -341,6 +360,19 @@ static infra_queue_t *start_chain(const app_opts_t *o, int *started)
     }
     *started |= 1;
 
+    /* ⑤ OSD 时间水印(可选)。⚠️ **失败不影响推流** —— 水印只是锦上添花,
+     *    不该因为它起不来就没画面。所以这里只告警、不 return。 */
+    if (!o->no_osd) {
+        if (svc_osd_start() != 0) {
+            printf("⚠️  OSD 水印启动失败(画面照常, 只是没有时间)\n");
+        } else {
+            *started |= 8;
+            printf("OSD 水印  : 已叠加到右上角\n");
+        }
+    } else {
+        printf("OSD 水印  : 已按 -no-osd 关闭\n");
+    }
+
     printf("✅ 全链路已启动。用 VLC / ffplay 拉流:\n");
     printf("     ffplay -rtsp_transport udp rtsp://<板子IP>:%u/live\n\n",
            (unsigned)svc_net_port());
@@ -369,9 +401,10 @@ int main(int argc, char **argv)
     setvbuf(stdout, NULL, _IOLBF, 0);   /* 行缓冲: 被 kill 时也能看到日志 */
     infra_log_set_level(o.verbose ? INFRA_LOG_DEBUG : INFRA_LOG_INFO);
 
-    printf("===== IPC 网络监控 —— M1-9 取流 + RTSP 推流 =====\n");
+    printf("===== IPC 网络监控 —— M1 取流+RTSP 推流 / M2 OSD 时间水印 =====\n");
     printf("编码      : %s\n", o.is_h265 ? "H.265 (VENC chn0)" : "H.264 (VENC chn1)");
     printf("RTSP 监听 : %s:%u\n", o.bind_ip, (unsigned)o.port);
+    printf("OSD 水印  : %s\n", o.no_osd ? "关闭" : "右上角时间(每秒更新)");
     printf("拉流地址  : rtsp://<板子IP>:%u/live\n\n", (unsigned)o.port);
 
     signal(SIGINT, on_sigint);
