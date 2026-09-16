@@ -440,7 +440,7 @@ int main(int argc, char **argv)
     /* ── 启动取流(内部会做 MPP 初始化, 约 5~10 秒)── */
     printf("\n【1】svc_media_start() —— 含 MPP 初始化, 请稍等…\n");
     t0 = now_ms();
-    rc = svc_media_start(q, is_h265);       /* 必须和 bsp_mpp 编的那一路一致 */
+    rc = svc_media_start(q, NULL, is_h265);  /* 第 2 参 = 录制队列;本工具不录制 */
     if (rc != 0) {
         printf("❌ svc_media_start 失败 rc=%d\n", rc);
         infra_queue_destroy(q);

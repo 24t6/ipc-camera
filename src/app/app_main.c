@@ -86,6 +86,7 @@
 #include "svc_media.h"
 #include "svc_net.h"
 #include "svc_osd.h"
+#include "svc_record.h"
 #include "svc_sender.h"
 
 /** 队列槽位容量 = 帧头 + 单帧最大字节(与 svc_media 的预算一致) */
@@ -93,6 +94,18 @@
 
 /** 队列槽位数 8 = 约 0.27 秒的缓冲(见 ARCHITECTURE.md 预算表) */
 #define APP_QUEUE_SLOTS 8
+
+/** 录制目录。开机由 rcS 自动把 TF 卡挂到这里(见 work/setup_board_sdcard_mount.py) */
+#define APP_REC_DIR "/mnt/sdcard"
+
+/**
+ * 默认环形容量上限(MB)。
+ * 2 GB ≈ 30G 卡的 7%, 也够存约 1 小时的 4 Mbps 码流 —— 既能录很久, 又留足空间。
+ */
+#define APP_REC_LIMIT_MB 2048
+
+/** 录制队列(与发送队列**互相独立**, 见 svc_media.h 的说明) */
+static infra_queue_t *g_record_queue;
 
 /** 默认 RTSP 端口。554 才是标准端口, 但 <1024 需要 root —— 板子上本来就是 root */
 #define APP_DEFAULT_PORT 554
@@ -122,6 +135,9 @@ typedef struct {
     const char *bind_ip;
     int         is_h265;
     int         no_osd;      /**< 1 = 不叠时间水印(默认叠) */
+    int         no_record;   /**< 1 = 不录 MP4(默认录到 /mnt/sdcard) */
+    int         rec_mb;      /**< 环形容量上限(MB);0 = 不限 */
+    int         rec_seg;     /**< 每段帧数;0 = 用默认(1800 ≈ 60 秒) */
     int         verbose;
 } app_opts_t;
 
@@ -137,9 +153,12 @@ static void usage(const char *prog)
            "  -b <地址>   监听地址(默认 0.0.0.0)\n"
            "  -h265       取 H.265 那一路(默认 H.264)\n"
            "  -no-osd     不叠时间水印(默认在右上角叠)\n"
+           "  -no-record  不录 MP4(默认录到 " APP_REC_DIR ")\n"
+           "  -r <MB>     录制环形容量上限(默认 %d MB;0=不限)\n"
+           "  -s <帧数>   每段多少帧后切新文件(默认 1800 ≈ 60 秒)\n"
            "  -v          打开 DEBUG 日志\n"
            "  -h          显示本帮助\n",
-           prog, APP_DEFAULT_PORT);
+           prog, APP_DEFAULT_PORT, APP_REC_LIMIT_MB);
 }
 
 /**
@@ -155,16 +174,21 @@ static int parse_args(int argc, char **argv, app_opts_t *o)
     int i;
     int opt;
 
-    o->port    = APP_DEFAULT_PORT;
-    o->bind_ip = "0.0.0.0";
-    o->is_h265 = 0;
-    o->no_osd  = 0;
-    o->verbose = 0;
+    o->port      = APP_DEFAULT_PORT;
+    o->bind_ip   = "0.0.0.0";
+    o->is_h265   = 0;
+    o->no_osd    = 0;
+    o->no_record = 0;
+    o->rec_mb    = APP_REC_LIMIT_MB;
+    o->rec_seg   = 0;
+    o->verbose   = 0;
 
-    while ((opt = getopt(argc, argv, "p:b:hv")) != -1) {
+    while ((opt = getopt(argc, argv, "p:b:r:s:hv")) != -1) {
         switch (opt) {
         case 'p': o->port    = (uint16_t)atoi(optarg); break;
         case 'b': o->bind_ip = optarg;                 break;
+        case 'r': o->rec_mb  = atoi(optarg);           break;
+        case 's': o->rec_seg = atoi(optarg);           break;
         case 'v': o->verbose = 1;                      break;
         case 'h': return 2;
         default:  return 1;
@@ -175,6 +199,8 @@ static int parse_args(int argc, char **argv, app_opts_t *o)
             o->is_h265 = 1;
         else if (strcmp(argv[i], "-no-osd") == 0)
             o->no_osd = 1;
+        else if (strcmp(argv[i], "-no-record") == 0)
+            o->no_record = 1;
     }
     return 0;
 }
@@ -191,16 +217,19 @@ static void report(int secs)
     svc_sender_stats_t ss;
     svc_net_stats_t    ns;
     svc_osd_stats_t    os;
+    svc_record_stats_t rs;
 
     svc_media_get_stats(&ms);
     svc_sender_get_stats(&ss);
     svc_net_get_stats(&ns);
     svc_osd_get_stats(&os);
+    svc_record_get_stats(&rs);
 
     printf("[%4ds] 取流 %llu 帧 | 发送 %llu 帧/%llu 包 | 客户端 %d 在发(%llu 等IDR)"
            " | RTSP %llu 连接/%llu 请求 | 丢 %llu | 错误 %llu"
            " | ★帧龄 现/最小/最大 %.0f/%.0f/%.0f ms 漂移 %.0f ms"
-           " | OSD %llu 次/错 %llu\n",
+           " | OSD %llu 次/错 %llu"
+           " | 录制 %llu 段/%llu 帧 删 %llu 丢 %llu 错 %llu\n",
            secs,
            (unsigned long long)ms.frames,
            (unsigned long long)ss.frames_sent,
@@ -214,7 +243,12 @@ static void report(int secs)
            ss.age_last_us / 1000.0, ss.age_min_us / 1000.0, ss.age_max_us / 1000.0,
            (ss.age_last_us - ss.age_first_us) / 1000.0,
            (unsigned long long)os.ticks,
-           (unsigned long long)os.show_errors);
+           (unsigned long long)os.show_errors,
+           (unsigned long long)rs.segments,
+           (unsigned long long)rs.frames_written,
+           (unsigned long long)rs.deleted,
+           (unsigned long long)ms.record_dropped,
+           (unsigned long long)rs.write_errors);
     fflush(stdout);
 }
 
@@ -270,12 +304,15 @@ static int build_sdp(const app_opts_t *o, char *out, size_t cap)
 /**
  * @brief 按**申请的反序**停掉已启动的东西。
  *
- * @param started 位掩码: bit0=svc_media, bit1=svc_sender, bit2=svc_net, bit3=svc_osd
+ * @param started 位掩码: bit0=svc_media, bit1=svc_sender, bit2=svc_net,
+ *                bit3=svc_osd, bit4=svc_record
  *
  * @note 抽出来是为了让每一处失败都能"从当前状态干净回退",
  *       而不必在每个失败分支里重复写一遍清理 —— 那种重复**漏一个就是资源泄漏**。
  * @note ⚠️ **svc_osd 必须最先停**:它挂在 VENC 通道上, 而 `svc_media_stop()`
  *       会 `bsp_mpp_deinit()` 把整条 MPP 通路拆掉 —— 那时再想 Detach 就晚了。
+ * @note ★ **svc_record 排在 svc_media 之后**:先停生产者(不再有新帧),
+ *       录制线程才能安静地把队里剩的写完、再 `MP4Close` 把 moov 落盘。
  */
 static void shutdown_chain(int started)
 {
@@ -283,10 +320,54 @@ static void shutdown_chain(int started)
         svc_osd_stop();
     if (started & 1)
         svc_media_stop();
+    if (started & 16)
+        svc_record_stop();
     if (started & 2)
         svc_sender_stop();
     if (started & 4)
         svc_net_stop();
+}
+
+/**
+ * @brief 起录制服务:建录制队列 → 配 mp4v2 → 起线程
+ *
+ * @param[in]  o       命令行选项(容量上限 / 每段帧数)
+ * @param[out] started 位掩码,成功则置上 bit4
+ * @return 0 成功; 负值失败
+ *
+ * @note 抽出来是为了让 `start_chain()` 别太长(项目硬约束: 代码行 ≤ 50)。
+ * @note 宽高从 `bsp_mpp` 取 —— **不在这里写死分辨率**, 免得将来改通道时漏改一处。
+ */
+static int start_record(const app_opts_t *o, int *started)
+{
+    svc_record_cfg_t rec;
+    int              w = 0;
+    int              h = 0;
+
+    g_record_queue = infra_queue_create(APP_QUEUE_SLOTS, APP_SLOT_BYTES);
+    if (g_record_queue == NULL) {
+        printf("❌ 录制队列创建失败\n");
+        return -1;
+    }
+    bsp_mpp_get_encoder_size(&w, &h);
+    memset(&rec, 0, sizeof(rec));
+    rec.dir            = APP_REC_DIR;
+    rec.width          = w;
+    rec.height         = h;
+    rec.limit_bytes    = (o->rec_mb > 0) ? (uint64_t)o->rec_mb * 1024 * 1024 : 0;
+    rec.limit_files    = 0;
+    rec.segment_frames = o->rec_seg;
+
+    if (svc_record_start(&rec, g_record_queue) != 0) {
+        infra_queue_destroy(g_record_queue);
+        g_record_queue = NULL;
+        return -2;
+    }
+    *started |= 16;
+    printf("录制      : %s · %dx%d · 每段 %d 帧 · 上限 %d MB\n",
+           APP_REC_DIR, w, h,
+           (o->rec_seg > 0) ? o->rec_seg : 1800, o->rec_mb);
+    return 0;
 }
 
 /**
@@ -366,9 +447,25 @@ static infra_queue_t *start_chain(const app_opts_t *o, int *started)
     *started |= 2;
     printf("发送服务  : 已启动\n");
 
+    /*
+     * ③.5 录制服务(M3)。
+     *   位置: 在 svc_media **之前**起 —— 它只是个消费者, 队列空着也无所谓;
+     *         先就位, 等 media 一开始推帧就能立刻写盘(不丢开头几帧)。
+     *   失败**不致命**(与 OSD 同): 录不了不该让推流也起不来, 但要明确告警。
+     */
+    if (o->no_record) {
+        printf("录制      : 已按 -no-record 关闭\n");
+    } else if (o->is_h265) {
+        printf("录制      : ⚠️ 关闭 —— mp4v2 这版只支持 H.264, 而当前取的是 H.265 那一路\n");
+    } else {
+        if (start_record(o, started) != 0) {
+            printf("⚠️  录制启动失败(推流照常, 只是没有录像)\n");
+        }
+    }
+
     /* ④ 最后起取流(生产者) */
     printf("\n正在初始化 MPP 通路(约 5~10 秒, 请稍等)…\n");
-    if (svc_media_start(queue, o->is_h265) != 0) {
+    if (svc_media_start(queue, g_record_queue, o->is_h265) != 0) {
         printf("❌ 取流服务启动失败(MPP 初始化失败? 摄像头没插好?)\n");
         shutdown_chain(*started);
         infra_queue_destroy(queue);
@@ -430,6 +527,7 @@ int main(int argc, char **argv)
     printf("编码      : %s\n", o.is_h265 ? "H.265 (VENC chn0)" : "H.264 (VENC chn1)");
     printf("RTSP 监听 : %s:%u\n", o.bind_ip, (unsigned)o.port);
     printf("OSD 水印  : %s\n", o.no_osd ? "关闭" : "右上角时间(每秒更新)");
+    printf("录制      : %s\n", o.no_record ? "关闭" : APP_REC_DIR " 的 MP4 分段");
     printf("拉流地址  : rtsp://<板子IP>:%u/live\n\n", (unsigned)o.port);
 
     signal(SIGINT, on_sigint);
@@ -451,6 +549,8 @@ int main(int argc, char **argv)
     printf("\n[退出, 正在停止…]\n");
     shutdown_chain(started);
     infra_queue_destroy(queue);
+    if (g_record_queue != NULL)
+        infra_queue_destroy(g_record_queue);
     printf("已退出。\n");
     return 0;
 }

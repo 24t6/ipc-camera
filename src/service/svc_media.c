@@ -65,6 +65,7 @@
 static struct {
     int             running;
     infra_queue_t  *queue;          /* 不拥有: 队列由调用方创建/销毁 */
+    infra_queue_t  *record_queue;   /* 同上;NULL = 不录制(M3 的扇出目标) */
     size_t          slot_data_cap;  /* 槽位里能放多少码流字节 */
     int             is_h265;
     pthread_t       thread;
@@ -168,6 +169,30 @@ static int count_nalu_cb(const proto_nalu_t *n, void *user)
  * @brief 处理一帧: 校验 → 拼进槽位 → 入队。
  * @return 0 正常(含"丢弃"的情况); -1 表示应当退出线程
  */
+/**
+ * @brief 把当前槽位**再 push 一份**给录制队列(M3 的扇出)
+ *
+ * @param[in] total 槽位里的有效字节数(不含帧头)
+ * @return `infra_queue_push` 的返回值(1 = 为腾位置丢了最旧的)
+ *
+ * @note 抽出来是为了让调用处那行**短到不用续行** ——
+ *       `infra_queue_push` 三个参数摊在 `if (... && ...)` 里要续行到 25 空格,
+ *       会被 `check_style.py` 判成"缩进 6 层 > 5"。
+ *       ⚠️ 这个坑今天踩了**四次**(bsp_osd / svc_record_policy / svc_record / 这里),
+ *       统一对策就是"抽 helper", 见 CODING_STYLE.md §9.2。
+ */
+static int push_record_copy(size_t total)
+{
+    return infra_queue_push(g.record_queue, g.slot,
+                            SVC_MEDIA_HDR_SIZE + total);
+}
+
+/**
+ * @brief 处理一帧:拼进槽位 → 校验 → 入队(发送队列 + 录制队列)
+ *
+ * @param[in] frame 刚从 MPP 取到的帧
+ * @return 0 处理完(成功或按策略丢弃)
+ */
 static int handle_one_frame(const bsp_mpp_frame_t *frame)
 {
     size_t total;
@@ -214,6 +239,16 @@ static int handle_one_frame(const bsp_mpp_frame_t *frame)
     }
     if (rc == 1)
         g.stats.queue_dropped++;
+
+    /*
+     * ★ 扇出:同一个槽位**再 push 一份**给录制队列。
+     *   两个队列互相独立 —— 磁盘慢只会撑满录制队列(丢录制的帧),
+     *   发送队列照样满速;反之亦然。这就是"采集/发送/录制三者解耦"。
+     *   没开录制时(NULL)直接跳过, 零开销。
+     */
+    if (g.record_queue != NULL && push_record_copy(total) == 1) {
+        g.stats.record_dropped++;
+    }
 
     g.stats.frames++;
     g.stats.bytes += total;
@@ -321,7 +356,7 @@ static int warmup_wait_first_frame(void)
     return -1;
 }
 
-int svc_media_start(void *queue, int is_h265)
+int svc_media_start(void *queue, void *record_queue, int is_h265)
 {
     if (g.running)
         return 0;
@@ -329,8 +364,9 @@ int svc_media_start(void *queue, int is_h265)
         return -1;
 
     memset(&g, 0, sizeof(g));
-    g.queue   = (infra_queue_t *)queue;
-    g.is_h265 = is_h265 ? 1 : 0;
+    g.queue        = (infra_queue_t *)queue;
+    g.record_queue = (infra_queue_t *)record_queue;   /* NULL = 不录制 */
+    g.is_h265      = is_h265 ? 1 : 0;
 
     if (setup_from_queue() != 0)
         return -2;

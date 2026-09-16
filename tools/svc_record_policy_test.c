@@ -127,9 +127,20 @@ static void test_ring(void)
     lim.limit_bytes = 1;
     n = svc_record_policy_plan_delete(f, 1, &lim, del, 8);
     CHECK(n == 0, "只有一个文件时不该删");
+}
+
+/** 环形覆盖的**其余边界**:按个数上限 / 输出缓冲 / 不限 / 参数非法 */
+static void test_ring_edges(void)
+{
+    svc_record_policy_file_t   f[5];
+    svc_record_policy_limits_t lim;
+    int                        del[8];
+    int                        n;
+
+    fill_shuffled(f);
 
     /* 按**个数**上限 */
-    lim.limit_bytes = 0;
+    memset(&lim, 0, sizeof(lim));
     lim.limit_files = 2;
     n = svc_record_policy_plan_delete(f, 5, &lim, del, 8);
     printf("    个数上限 2 → 要删 %d 个\n", n);
@@ -153,7 +164,8 @@ static void test_ring(void)
     CHECK(svc_record_policy_plan_delete(f, 5, NULL, del, 8) < 0, "NULL lim 应失败");
     CHECK(svc_record_policy_plan_delete(f, 5, &lim, NULL, 8) < 0, "NULL 输出应失败");
     CHECK(svc_record_policy_plan_delete(f, 5, &lim, del, 0) < 0, "del_cap=0 应失败");
-    CHECK(svc_record_policy_plan_delete(f, SVC_RECORD_POLICY_MAX_FILES + 1, &lim, del, 8) < 0,
+    CHECK(svc_record_policy_plan_delete(f, SVC_RECORD_POLICY_MAX_FILES + 1,
+                                        &lim, del, 8) < 0,
           "文件数超上限应失败(不做部分处理)");
     CHECK(svc_record_policy_plan_delete(f, 0, &lim, del, 8) == 0, "0 个文件应返回 0");
 }
@@ -163,6 +175,7 @@ int main(void)
     printf("==== 录制策略(纯函数)PC 单测 ====\n");
     test_name();
     test_ring();
+    test_ring_edges();
 
     printf("\n==== 结果: %d 通过 / %d 失败 ====\n", g_pass, g_fail);
     return (g_fail == 0) ? 0 : 1;

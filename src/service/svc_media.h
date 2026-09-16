@@ -144,21 +144,30 @@ typedef struct {
     uint64_t get_timeouts;  /**< "当时没帧"的次数(**不是错误**) */
     uint64_t get_errors;    /**< 取流出错次数 */
     uint64_t parse_rejects; /**< 因为"整帧里一个 NALU 都没有"而丢掉的帧 */
-    uint64_t queue_dropped; /**< 队列满而丢掉的最旧帧数(来自 infra_queue) */
+    uint64_t queue_dropped; /**< **发送**队列满而丢掉的最旧帧数(来自 infra_queue) */
+    uint64_t record_dropped;/**< **录制**队列满而丢掉的帧数(与发送队列**互相独立**) */
     uint64_t oversize;      /**< 因为超过槽位容量而丢掉的帧数 */
 } svc_media_stats_t;
 
 /**
  * @brief 启动取流服务。
  *
- * @param queue  发送队列(**由调用方创建并拥有**; 本模块只 push, 不销毁它)
- * @param is_h265 1 = 按 H.265 解析; 0 = H.264。**必须和 bsp_mpp 编的那一路一致**
+ * @param queue        发送队列(**由调用方创建并拥有**; 本模块只 push, 不销毁它)
+ * @param record_queue 录制队列, 可为 **NULL**(= 不录制)。
+ *                     非 NULL 时每帧会**再 push 一份**给它 —— 这就是 M3 的"扇出"
+ * @param is_h265      1 = 按 H.265 解析; 0 = H.264。**必须和 bsp_mpp 编的那一路一致**
  * @return 0 成功; 负值失败
  *
  * @note **阻塞**:会先 `bsp_mpp_init()`(约 5~10 秒), 再起线程。
  * @note 重复调用(已启动)返回 0 且不做任何事。
+ *
+ * @note ⚠️ **为什么录制要用"另一个队列"而不是共用发送队列**:
+ *       队列的 pop 是**取走**。一个队列两个消费者, 每一帧只会被其中一方拿到
+ *       —— 发送和录制会**各缺一半帧**, 两边都坏。
+ *       开两个队列才能真正做到"磁盘慢只丢录制的帧、网络慢只丢发送的帧",
+ *       也就是 PROJECT_PLAN 里那句"采集、发送、录制三者解耦"。
  */
-int svc_media_start(void *queue, int is_h265);
+int svc_media_start(void *queue, void *record_queue, int is_h265);
 
 /**
  * @brief 停止取流服务: 通知线程退出 → join → `bsp_mpp_deinit()`。
