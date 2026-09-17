@@ -62,7 +62,7 @@ void MP4Close(MP4FileHandle hFile, uint32_t flags);
 /** @brief 设文件时间基(我们用 90000, 与 RTP 一致) */
 bool MP4SetTimeScale(MP4FileHandle hFile, uint32_t value);
 
-/** @brief 设 ProfileLevel(厂商 sample 用 0x7F = Unconstrained) */
+/** @brief 设 ProfileLevel(参考项目那份实现用 0x7F = Unconstrained, 见 svc_record.h) */
 void MP4SetVideoProfileLevel(MP4FileHandle hFile, uint8_t value);
 
 /**

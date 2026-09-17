@@ -13,10 +13,9 @@
  *             文件级静态:取流槽位 ~256KB + MP4 写缓冲 ~256KB + 目录扫描表 ~5KB
  *
  * ─────────────────────────────────────────────────────────────────
- *  ⭐ 复用说明(AGENTS.md §7.0)
+ *  ⭐ 复用说明(AGENTS.md §7.0) —— ⚠️ 出处已于 2026-09-16 更正
  * ─────────────────────────────────────────────────────────────────
- *  mp4v2 的**调用序列照抄**厂商 sample:
- *      `sample/common/sample_comm_venc.c` 的 `SAMPLE_COMM_VENC_SaveH264ToMP4()`
+ *  mp4v2 的**调用序列照抄** `SAMPLE_COMM_VENC_SaveH264ToMP4()`:
  *      · `MP4Create` → `MP4SetTimeScale(90000)`
  *      · `MP4AddH264VideoTrack(90000, 3000, w, h, sps[1], sps[2], sps[3], 3)`
  *        (最后那个 `3` = **每 NALU 前面有 4 字节长度前缀**, 填的是"长度-1")
@@ -25,7 +24,17 @@
  *      · `MP4WriteSample(..., syncFlag)` —— 关键帧 syncFlag=1
  *      · 每 N 帧 `MP4Close` 再开新文件 = **分段**
  *
- *  ⚠️ **但有一处故意不抄**:sample 是 `malloc(length)` **每帧一次**再 `free`
+ *  ⚠️ **这个函数不是厂商 sample 自带的** —— 出处是**参考项目 IPC-Camera**(公开仓库):
+ *      它的 `common/sample_comm_venc.c`(在厂商 sample 上改出来的那份)里
+ *      `SAMPLE_COMM_VENC_SaveH264ToMP4()` 是**它自己添加的函数**。
+ *      证据: `work/ref_diffs/common__sample_comm_venc.c.diff` 的 `---` 是 SDK 原版、
+ *      `+++` 是参考项目版, 该函数行带 `+`;且 SDK 原版 `sample_comm_venc.c` 里
+ *      `SaveH264` / `SaveH265` **零命中**, 只有 `SAMPLE_COMM_VENC_SaveStream`
+ *      (**只存裸码流**), **全文件没有任何 MP4 调用**。
+ *  ⇒ 也就是说:"**MP4 封装 + 分段**"这件事**厂商 sample 完全没做**,
+ *     是我们(参照该项目)自己实现的 —— 面试问到时如实这么讲。
+ *
+ *  ⚠️ **有一处故意不抄**:那份实现是 `malloc(length)` **每帧一次**再 `free`
  *     —— 违反本项目 §6.1「运行期零动态分配」。这里改用**文件级静态缓冲**。
  *
  *  ⚠️ **只支持 H.264**:mp4v2 这一版没有 `MP4AddH265VideoTrack`。

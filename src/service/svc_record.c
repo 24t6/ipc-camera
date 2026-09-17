@@ -219,7 +219,8 @@ static void enforce_limits(void)
  *
  * @return 0 成功; -1 失败(时间取不到 / 名字放不下 / MP4Create 失败)
  *
- * @note `MP4Create` 之后**立刻** `MP4SetTimeScale(90000)` —— 照抄厂商 sample 的顺序。
+ * @note `MP4Create` 之后**立刻** `MP4SetTimeScale(90000)` —— 照抄参考项目那份
+ *       `SAMPLE_COMM_VENC_SaveH264ToMP4()` 的顺序(出处见 `svc_record.h` 的复用说明)。
  */
 static int open_segment(void)
 {
@@ -283,7 +284,7 @@ static void close_segment(void)
  *
  * @param[in] n SPS 那个 NALU(含 1 字节 NALU 头)
  *
- * @note 参数含义照抄厂商 sample:
+ * @note 参数含义照抄参考项目那份 `SAMPLE_COMM_VENC_SaveH264ToMP4()`(见 `svc_record.h`):
  *       `s[1]`=AVCProfileIndication `s[2]`=profile_compatibility `s[3]`=AVCLevelIndication;
  *       最后那个 `3` = **每个 NALU 前有 4 字节长度**, 填"长度-1"。
  */
@@ -333,7 +334,7 @@ static int write_mp4_sample(uint32_t total, int is_key)
  *
  * @note ★ **MP4 用的是"4 字节大端长度前缀", 不是 Annex-B 起始码**。
  *       我们的 `proto_nalu` 已经把起始码剥掉了, 所以这里是**自己补上长度前缀**;
- *       厂商 sample 因为拿到的是带起始码的缓冲, 做的是"把起始码就地改成长度" ——
+ *       参考项目那份实现因为拿到的是带起始码的缓冲, 做的是"把起始码就地改成长度" ——
  *       结果一样(起始码正好也是 4 字节), 但它那个写法会**改动源缓冲**。
  */
 static void write_sample(const proto_nalu_t *n, int is_key)
