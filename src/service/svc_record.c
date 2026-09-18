@@ -95,6 +95,18 @@ static uint8_t g_slot[SVC_RECORD_SLOT_BYTES];
  */
 static uint8_t g_mp4buf[4 + SVC_RECORD_MAX_NALU];
 
+/** 恢复残留裸流时每次读的块大小 */
+#define SVC_RECOVER_CHUNK (256 * 1024)
+
+/*
+ * 恢复残留裸流用的块缓冲
+ *   容量依据 : 一块 SVC_RECOVER_CHUNK + 一个最大 NALU(跨块的不完整 NALU 要留到下一轮)
+ *   内存区域 : 文件级静态(.bss) —— 约 512KB, 远低于 128MB 内存
+ *   唯一所有者: 本模块
+ *   释放时机 : 进程生命周期内常驻
+ */
+static uint8_t g_rec_buf[SVC_RECOVER_CHUNK + SVC_RECORD_MAX_NALU];
+
 /*
  * 环形覆盖的目录扫描表
  *   容量依据 : 最多同时管理 64 个分段(策略层的上限)
@@ -398,9 +410,23 @@ static void write_raw_frame(const uint8_t *data, uint32_t len)
 }
 
 /**
- * @brief 删掉录制目录里残留的 `*.tmp`(上次异常退出留下的半成品)
+ * @brief 名字是不是旁路裸流侧车(`.h264.tmp` 结尾)
  *
- * @note 只认后缀 `.tmp` —— 覆盖"正在写的 MP4"与"旁路裸流侧车"两种残留。
+ * @param[in] name 文件名
+ * @return 1 = 是; 0 = 不是
+ */
+static int is_raw_sidecar(const char *name)
+{
+    size_t n = strlen(name);
+
+    return (n > 9 && strcmp(name + n - 9, ".h264.tmp") == 0) ? 1 : 0;
+}
+
+/**
+ * @brief 删掉录制目录里残留的 `*.mp4.tmp`(上次异常退出留下的半成品)
+ *
+ * @note ⚠️ **只删 MP4 的半成品, 不碰裸流侧车** —— 侧车会被
+ *       `recover_leftovers()` **重新封装成能播的 MP4**(那才是它存在的意义)。
  * @note 启动时调一次(在录制线程起来之前), 避免与正在写的文件抢名字。
  */
 static void cleanup_tmp_files(void)
@@ -419,6 +445,9 @@ static void cleanup_tmp_files(void)
         if (len < 5 || strcmp(e->d_name + len - 4, ".tmp") != 0) {
             continue;
         }
+        if (is_raw_sidecar(e->d_name)) {
+            continue;                   /* 裸流留给恢复步骤, **别删** */
+        }
         if (make_path(e->d_name, path, sizeof(path)) <= 0) {
             continue;
         }
@@ -429,7 +458,7 @@ static void cleanup_tmp_files(void)
     }
     closedir(d);
     if (n > 0) {
-        LOG_INFO("录制: 启动清理完成, 共删除 %d 个 *.tmp", n);
+        LOG_INFO("录制: 启动清理完成, 共删除 %d 个 MP4 半成品", n);
     }
 }
 
@@ -753,6 +782,189 @@ static void handle_slot(size_t len)
 }
 
 /**
+ * @brief 把路径结尾的后缀 `from` 换成 `to`
+ *
+ * @param[in]  path 原路径
+ * @param[in]  from 要换掉的后缀(如 ".h264.tmp")
+ * @param[in]  to   换成什么(如 ".mp4")
+ * @param[out] out  输出
+ * @param[in]  cap  容量
+ * @return 0 成功; -1 后缀不匹配或放不下
+ */
+static int swap_ext(const char *path, const char *from, const char *to,
+                    char *out, size_t cap)
+{
+    size_t n = strlen(path);
+    size_t f = strlen(from);
+    size_t t = strlen(to);
+
+    if (n <= f || strcmp(path + n - f, from) != 0 || (n - f + t + 1) > cap) {
+        return -1;
+    }
+    memcpy(out, path, n - f);
+    snprintf(out + n - f, cap - (n - f), "%s", to);
+    return 0;
+}
+
+/**
+ * @brief 找**最后一个** Annex-B 起始码的偏移(从右往左扫)
+ *
+ * @param[in] buf 缓冲
+ * @param[in] len 字节数
+ * @return 最后一个起始码的偏移; 0 = 没找到(整块都得留到下一轮)
+ *
+ * @note 用来切块:起始码之后的内容可能是**不完整**的 NALU, 必须留到下一块 ——
+ *       否则一个切片 NALU 会被切成两个 sample, 播出来就花了。
+ * @note 只认 3 字节起始码 `00 00 01`(4 字节的 `00 00 00 01` 里也含它)。
+ */
+static size_t last_start_code(const uint8_t *buf, size_t len)
+{
+    size_t i;
+
+    if (len < 3) {
+        return 0;
+    }
+    for (i = len - 3; i > 0; i--) {
+        if (buf[i] == 0 && buf[i + 1] == 0 && buf[i + 2] == 1) {
+            return i;
+        }
+    }
+    return 0;
+}
+
+/**
+ * @brief 把裸流文件**分块**喂给 mp4v2(块边界上的不完整 NALU 留到下一轮)
+ *
+ * @param[in] fp 已打开的裸流文件
+ * @return 处理过的 NALU 个数
+ *
+ * @note 抽出来是为了让 `recover_one_raw()` 不超"函数 ≤ 50 行"的硬约束。
+ * @note 三处细节:① 用"找**最后一个**起始码"来切, 保证不把 NALU 切两半;
+ *       ② 攒够一个最大 NALU 还没等到下一个起始码就**不再等**(避免卡住);
+ *       ③ EOF 时剩下的全算完整。
+ */
+static int remux_stream(FILE *fp)
+{
+    size_t carry = 0;
+    int    nalus = 0;
+
+    for (;;) {
+        size_t got   = fread(g_rec_buf + carry, 1, SVC_RECOVER_CHUNK, fp);
+        size_t total = carry + got;
+        size_t cut;
+
+        if (got == 0 || carry >= SVC_RECORD_MAX_NALU) {
+            cut = total;
+        } else {
+            cut = last_start_code(g_rec_buf, total);
+        }
+        if (cut > 0) {
+            int n = proto_nalu_foreach(g_rec_buf, cut, 0, on_nalu_cb, NULL);
+
+            if (n > 0) {
+                nalus += n;
+            }
+        }
+        if (got == 0) {
+            break;
+        }
+        carry = total - cut;
+        memmove(g_rec_buf, g_rec_buf + cut, carry);
+    }
+    return nalus;
+}
+
+/**
+ * @brief 把一个残留的裸流侧车**就地重新封装**成 `<stamp>.mp4`
+ *
+ * @param[in] raw_name 裸流文件名(不含目录, 形如 `2026-09-18-22-35-13.h264.tmp`)
+ * @return 1 = 救回来了(生成了 .mp4 并删掉裸流); 0 = 救不回来(裸流保留);
+ *         -1 = 连文件都打不开
+ *
+ * @note ★ **为什么这件事值得在板子上做**: 强杀/断电后 `<stamp>.mp4.tmp` 没有 moov,
+ *       永远救不回来; 而侧车是 Annex-B、**靠起始码自定界、截断也能解** ——
+ *       在板子上重封一次就变回正常录像 ⇒ **断电只丢最后约 30 秒**, 而不是丢整段。
+ *       用户不用把文件拷到 PC 上再转。
+ * @note 复用**与正常录制同一套** mp4v2 调用(`on_nalu_cb` → `write_sample`),
+ *       所以封装结果和录像完全一致(同样是"4 字节长度前缀"那一套)。
+ * @note 先写成 `<stamp>.mp4.tmp`、**全部成功才改名** —— 与正常分段同一套约定:
+ *       中途被打断, 下次启动还能再来一次。
+ * @note 执行线程: 录制线程启动时、**取任何队列帧之前**(那时 mp4v2 状态是空闲的)。
+ */
+static int recover_one_raw(const char *raw_name)
+{
+    char   raw_path[SVC_RECORD_PATH_MAX];
+    char   mp4_path[SVC_RECORD_PATH_MAX];
+    char   tmp_path[SVC_RECORD_PATH_MAX];
+    FILE  *fp;
+    int    nalus;
+
+    if (make_path(raw_name, raw_path, sizeof(raw_path)) <= 0 ||
+        swap_ext(raw_path, ".h264.tmp", ".mp4", mp4_path, sizeof(mp4_path)) != 0) {
+        return -1;
+    }
+    snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", mp4_path);
+    fp = fopen(raw_path, "rb");
+    if (fp == NULL) {
+        return -1;
+    }
+
+    g.mp4 = MP4Create(tmp_path, 0);
+    if (g.mp4 == MP4_INVALID_FILE_HANDLE) {
+        g.mp4 = NULL;
+        fclose(fp);
+        return -1;
+    }
+    MP4SetTimeScale(g.mp4, SVC_RECORD_TIMESCALE);
+    g.track    = MP4_INVALID_TRACK_ID;
+    g.have_sps = 0;
+    g.have_pps = 0;
+
+    nalus = remux_stream(fp);
+    fclose(fp);
+
+    MP4Close(g.mp4, 0);
+    g.mp4   = NULL;
+    g.track = MP4_INVALID_TRACK_ID;
+
+    /* 没有 SPS(建不了轨)或一个 NALU 都没有 ⇒ 救不回来, 别留垃圾 */
+    if (g.have_sps == 0 || nalus == 0 || rename(tmp_path, mp4_path) != 0) {
+        (void)unlink(tmp_path);
+        return 0;
+    }
+    (void)unlink(raw_path);             /* 救成功了才删裸流 */
+    LOG_INFO("恢复: 残留裸流 %s → 已封装成可播 MP4(%d 个 NALU)",
+             raw_name, nalus);
+    return 1;
+}
+
+/**
+ * @brief 把目录里所有残留的裸流侧车都救一遍
+ *
+ * @return 救回来的个数
+ */
+static int recover_leftovers(void)
+{
+    DIR           *d = opendir(g.dir);
+    struct dirent *e;
+    int            n = 0;
+
+    if (d == NULL) {
+        return 0;
+    }
+    while ((e = readdir(d)) != NULL) {
+        if (is_raw_sidecar(e->d_name) && recover_one_raw(e->d_name) == 1) {
+            n++;
+        }
+    }
+    closedir(d);
+    if (n > 0) {
+        LOG_INFO("恢复: 共把 %d 个残留裸流转成了可播 MP4", n);
+    }
+    return n;
+}
+
+/**
  * @brief 录制线程主循环
  *
  * @param arg 未使用
@@ -768,6 +980,10 @@ static void *record_thread(void *arg)
     (void)prctl(PR_SET_NAME, "ipc_rec", 0, 0, 0);
     LOG_INFO("录制线程启动(目录 %s, 每段 %d 帧 ≈ %d 秒)",
              g.dir, g.segment_frames, g.segment_frames / SVC_RECORD_FPS);
+
+    /* ★ 开工前先把上次异常退出留下的**裸流侧车**救成能播的 MP4
+     *   (必须在取任何队列帧之前 —— 那时 mp4v2 状态是空闲的) */
+    (void)recover_leftovers();
 
     while (!g.stop_requested) {
         size_t len = 0;
