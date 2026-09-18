@@ -101,6 +101,23 @@ infra_sender_t *infra_sender_tcp_interleaved(int fd, uint8_t rtp_channel);
 2. 将来加 TCP interleaved 只影响 `infra_netio.c`
 3. 单测时可以注入一个"计数 sender",统计发了多少字节而不用真发网络
 
+> **⚠️ 上面第 1、2 条在 2026-09-18 之前是"纸面承诺",实际没做到 —— 已修,记在这里。**
+>
+> 事实是:`svc_sender.emit()` 当时**直接调 `proto_rtp_send_nalu()`**, 而那个函数
+> **自己 `sendto`** —— 传输方式被焊死在协议层里。后果是:
+> `infra_sender_tcp_interleaved()` 写好了却**从来没有被调用过**, 客户端一勾
+> "以 TCP 播放"就**一帧都发不出去**, 而且日志看起来一切正常
+> (`SETUP 完成(TCP 交错)`) —— 只有 `加入发送(RTP 端口 0)` 里那个 **0** 是线索。
+>
+> 修法(commit `378ee1f`):把"打包"与"发送"拆开 —— 新增
+> `proto_rtp_pack_nalu(s, n, is_last, fn, user)`(纯打包, 每个 RTP 包交给回调),
+> `proto_rtp_send_nalu()` 退化成**薄包装**;`svc_sender.emit()` 改为把每个包交给
+> `cli->sender->send()`。这样 UDP 与 TCP 交错才**真正共用同一条数据路径**,
+> 协议层也**不再碰 socket**。
+>
+> **教训**:"抽象写好了"不等于"抽象被用上了"。判断依据只有一个 ——
+> **那个实现有没有被真的调用**(grep 调用点 / 看运行期日志),而不是架构图上画了什么。
+
 > **⚠️ `destroy` 为什么收 `infra_sender_t **` 而不是 `void *ctx`(2026-09-14 修订)**
 >
 > 初版签名是 `void (*destroy)(void *ctx)`,即要求调用方传 `s->ctx`。
