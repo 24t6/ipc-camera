@@ -109,38 +109,66 @@ Ubuntu 22.04 (192.168.16.100)
 | 文件 | 职责 |
 |---|---|
 | `src/main.c` | MPP 初始化 + 线程编排 |
-| `src/nalu.c/h` | **Annex-B 解析**:剥离起始码、识别 NALU 类型 |
-| `src/rtp.c/h` | **RTP 打包**:RFC 6184(H.264)/ RFC 7798(H.265),含 FU-A 分片 |
-| `src/rtsp.c/h` | **RTSP 协议**:OPTIONS/DESCRIBE/SETUP/PLAY/TEARDOWN + SDP 生成 |
-| `src/net_loop.c/h` | epoll 事件循环 + 客户端管理 |
-| `src/queue.c/h` | 线程安全环形队列 |
-| `src/osd.c/h` | (M2)REGION 模块叠加时间 |
-| `src/record.c/h` | (M3)mp4v2 录制 + 环形覆盖 |
-| `src/mpp_init.c/h` | VI/VPSS/VENC 初始化封装 |
+| 层 | 文件 | 职责 |
+|---|---|---|
+| `protocol/` | `proto_nalu.c` | **Annex-B 解析**:剥离起始码、识别 NALU 类型(含 IDR 判定) |
+| | `proto_rtp.c` | **RTP 打包**:RFC 6184(H.264)/ RFC 7798(H.265),含 FU-A 分片 |
+| | `proto_rtsp.c` | **RTSP** 请求/响应解析与构造(含 `Transport` 交错模式) |
+| | `proto_sdp.c` | **SDP** 生成(`sprop-parameter-sets` 等) |
+| | `proto_str.c` | 字符串工具(大小写无关比较、安全拼接) |
+| `infra/` | `infra_queue.c` | 线程安全环形队列:**队满丢最旧, 永不阻塞** |
+| | `infra_poll.c` | epoll 事件循环封装 |
+| | `infra_netio.c` | 网络读写 + **RTP over TCP 交错(interleaved)发送** |
+| | `infra_log.c` | 分级日志 |
+| `service/` | `svc_media.c` | 取帧 → **扇出到两条独立队列**(发送 / 录制) |
+| | `svc_net.c` | RTSP 会话与客户端管理(跑在 epoll 线程里) |
+| | `svc_sender.c` | 发送线程:按客户端状态发 RTP(等到 IDR 才开始发) |
+| | `svc_record.c` | 录制线程:帧 → mp4v2 → 分段 MP4(**边界对齐 IDR**) |
+| | `svc_record_policy.c` | **纯函数**:分段命名 + 环形覆盖决策(PC 单测 23 条断言) |
+| | `svc_osd.c` | OSD 时间水印(每秒更新) |
+| `bsp/` | `bsp_mpp.c` | 海思 MPP:VI→VPSS→VENC 初始化与取流 |
+| | `bsp_osd.c` / `bsp_osd_render.c` | REGION 模块叠加 + 点阵字库渲染 |
+| `app/` | `app_main.c` | 起停链路 + 信号处理(优雅关闭)+ 运行状态上报 |
+
+> 共 38 个源文件, 分 5 层(**单向依赖**:`app → service → bsp/infra → protocol`;
+> `protocol` 层不碰硬件、不碰 `malloc`, 因此可在 PC 上原生单测)。
 
 ---
 
 ## 五、里程碑
 
+> 当前详细状态、验收证据与已知问题见 [`docs/STATUS.md`](docs/STATUS.md)。
+
 | # | 内容 | 状态 |
 |---|---|---|
 | **M0** | 采集→编码跑通,产出标准 H.264/H.265 | ✅ 已完成 |
-| **M1** | RTSP/RTP 服务端,PC VLC 实时播放 | 🚧 进行中 |
-| **M2** | OSD 叠加时间(REGION) | ⏳ |
-| **M3** | MP4 录制 + SD 卡环形覆盖 | ⏳ 前置条件已就绪 |
-| **M4** | PC 拉流端(Qt + FFmpeg) | ⏳ |
+| **M1** | RTSP/RTP 服务端,PC VLC 实时播放 | ✅ 已完成(仅**多客户端**未做) |
+| **M2** | OSD 叠加时间(REGION) | ✅ 已完成(板子实测) |
+| **M3** | MP4 录制 + SD 卡环形覆盖 | ✅ 已完成(验收 A4~A7 全过;分段边界零丢帧) |
+| **M4** | PC 拉流端(Qt + FFmpeg) | ⬜ 下一步(实时预览 + 回放) |
 
 ---
 
 ## 六、编译与运行
 
+交叉编译需要:海思 Hi3516CV500 SDK + `arm-himix200` 交叉工具链 + **自编译的 mp4v2 静态库**
+(见"二、开发环境")。
+
+> ⚠️ **仓库目前未附 Makefile** —— 构建脚本还在开发环境里
+> (见 [`docs/STATUS.md`](docs/STATUS.md) 已知问题 #8,计划补上)。
+> 编译要点:`-I` 指向 SDK 的 `mpp/include` 与我们的 `src/*`;链接厂商 MPP 库与
+> `libmp4v2.a`(**注意静态库的分组顺序**,否则会出现"库明明给了却报未定义符号")。
+
 ```bash
-make                      # 交叉编译,产出 ipc_camera
-cp ipc_camera ~/nfs_share/
-# 板子上:
-cp /mnt/nfs/ipc_camera /tmp/ && chmod +x /tmp/ipc_camera
-/tmp/ipc_camera
+cp ipc_app ~/nfs_share/                     # 产物拷到 NFS 共享
+# 板子上(必须先 cp 到 /tmp, 见下方坑):
+cp /mnt/nfs/ipc_app /tmp/ && chmod +x /tmp/ipc_app
+/tmp/ipc_app -p 8554 -s 1800 -r 8192        # 默认: 每段 30 分钟 / 环形上限 8 GB
 ```
+
+> 常用选项:`-s <秒>` 每段时长(默认 1800)、`-r <MB>` 环形上限(默认 8192,
+> ⚠️ **必须大于一段**)、`-no-record` 不录、`-no-osd` 不叠水印、`-h265` 取 H.265 那一路
+> (mp4v2 不支持 H.265 封装,该模式下**录制会自动关闭**)。
 
 > ⚠️ **NFS 执行坑**:直接从 `/mnt/nfs` 执行刚生成的二进制可能报
 > `No such file or directory`(NFS 属性缓存)。**先 `cp` 到 `/tmp` 再运行。**
@@ -148,6 +176,9 @@ cp /mnt/nfs/ipc_camera /tmp/ && chmod +x /tmp/ipc_camera
 ### 验证(RTSP)
 
 ```bash
-# PC 上用 VLC 打开
-rtsp://192.168.16.88:554/live
+# 用 VLC 或 ffplay 打开(端口要与 -p 一致; 注意本机防火墙要放行入站 UDP)
+ffplay  -rtsp_transport udp rtsp://192.168.16.88:8554/live
+# 或用 ffprobe 看编码参数
+ffprobe -v error -rtsp_transport udp -i rtsp://192.168.16.88:8554/live \
+        -show_entries stream=codec_name,width,height
 ```
