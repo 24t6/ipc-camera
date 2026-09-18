@@ -13,11 +13,13 @@
 #include "svc_record.h"
 
 #include <dirent.h>
+#include <errno.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/prctl.h>
 #include <sys/stat.h>
+#include <sys/statvfs.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -68,6 +70,9 @@ static struct {
     char             path_raw[SVC_RECORD_PATH_MAX];    /* <dir>/<stamp>.h264.tmp */
     FILE            *raw;                              /* NULL = 没开侧车 */
     int              raw_sidecar;                      /* 1 = 写侧车 */
+    uint64_t         max_seg_bytes;                     /* 见过的最大段(=预留依据) */
+    int              alerted_ro;                        /* 1 = 已经报过"卡变只读" */
+    int              alerted_tiny;                      /* 1 = 已经报过"盘比预留还小" */
 
     svc_record_stats_t stats;
 } g;
@@ -187,28 +192,26 @@ static int scan_dir(svc_record_policy_file_t *files, int cap)
 }
 
 /**
- * @brief 执行环形覆盖:超上限就删最旧的分段
+ * @brief 按给定上限**真的删文件**(决策来自纯函数 `svc_record_policy`)
  *
- * @note 只在这一处"决策 + 执行"交界处做 I/O; 决策本身是纯函数(`svc_record_policy`)。
+ * @param[in] lim 上限(总字节 / 文件数)
+ * @return 实际删掉的个数
+ *
+ * @note 只在这一处"决策 + 执行"交界处做 I/O;决策本身是纯函数。
  */
-static void enforce_limits(void)
+static int apply_limits(const svc_record_policy_limits_t *lim)
 {
-    svc_record_policy_limits_t lim;
-    char                       path[SVC_RECORD_PATH_MAX];
-    int                        cnt;
-    int                        n;
-    int                        i;
+    char path[SVC_RECORD_PATH_MAX];
+    int  cnt;
+    int  n;
+    int  i;
+    int  done = 0;
 
-    if (g.limit_bytes == 0 && g.limit_files == 0) {
-        return;
-    }
     cnt = scan_dir(g_scan, SVC_RECORD_POLICY_MAX_FILES);
     if (cnt <= 0) {
-        return;
+        return 0;
     }
-    lim.limit_bytes = g.limit_bytes;
-    lim.limit_files = g.limit_files;
-    n = svc_record_policy_plan_delete(g_scan, cnt, &lim, g_del,
+    n = svc_record_policy_plan_delete(g_scan, cnt, lim, g_del,
                                       SVC_RECORD_POLICY_MAX_FILES);
     for (i = 0; i < n; i++) {
         if (make_path(g_scan[g_del[i]].name, path, sizeof(path)) <= 0) {
@@ -216,10 +219,113 @@ static void enforce_limits(void)
         }
         if (unlink(path) == 0) {
             g.stats.deleted++;
+            done++;
             LOG_INFO("录制: 环形覆盖删除最旧分段 %s(%llu 字节)",
                      g_scan[g_del[i]].name,
                      (unsigned long long)g_scan[g_del[i]].size);
         }
+    }
+    return done;
+}
+
+/**
+ * @brief 执行环形覆盖:超上限就删最旧的分段
+ *
+ * @note 触发点:每次**分段收尾**(`close_segment()`)。
+ */
+static void enforce_limits(void)
+{
+    svc_record_policy_limits_t lim;
+
+    if (g.limit_bytes == 0 && g.limit_files == 0) {
+        return;                                  /* 两个都不限 = 不管 */
+    }
+    lim.limit_bytes = g.limit_bytes;
+    lim.limit_files = g.limit_files;
+    apply_limits(&lim);
+}
+
+/**
+ * @brief 预留多少空间(= "一段大小"的估计 + 余量)
+ *
+ * @return 字节数
+ *
+ * @note ★ **取"见过的最大段"而不是"上一段"**:同样时长的段, 大小会随画面复杂度浮动
+ *       (静态画面 4 Mbps, 噪声大的画面能翻好几倍)。用上一段当预留会**偏紧** ——
+ *       实测在 24 MB 小盘上, "上一段大小"当预留时每段末尾都撞一次 ENOSPC(75 秒里
+ *       876 次写失败)。改用历史最大值, 再留 25% 余量。
+ * @note 一次都没写过时用 `SVC_RECORD_HEADROOM_MIN`。
+ */
+static uint64_t headroom_bytes(void)
+{
+    uint64_t base = (g.max_seg_bytes > 0) ? g.max_seg_bytes
+                                          : SVC_RECORD_HEADROOM_MIN;
+
+    if (g.raw_sidecar) {
+        /* ★ 开了侧车, "写一段"期间要同时占 **两份**地方(MP4 + 裸流) ——
+         *   预留必须跟着翻倍, 否则会在段末尾撞 ENOSPC(实测 24 MB 小盘上必现)。 */
+        base *= 2;
+    }
+    return base + base / 4;
+}
+
+/**
+ * @brief 记住这一段的大小(只增不减, 作为下一段的预留依据)
+ *
+ * @note 在 `close_segment()` 里、`rename` 之后调用(那时文件已经是正式名)。
+ */
+static void note_seg_size(void)
+{
+    uint64_t sz = file_size_of(g.cur_name);
+
+    if (sz > g.max_seg_bytes) {
+        g.max_seg_bytes = sz;
+    }
+}
+
+/**
+ * @brief 保证文件系统至少还剩"一段大小"的可用空间(不够就提前删最旧)
+ *
+ * @note ★ 为什么这么做:清理原本只在**分段收尾**时发生, 于是"写到一半盘满"会一直
+ *       失败到这段结束(默认最多 30 分钟)。提前把空间腾出来, 让**新段一开始就有
+ *       一整段的空间**, 从源头减少 ENOSPC。
+ * @note 手法:`statvfs` 拿到容量, 把 `容量 − 预留` 当成"总字节上限"交给纯函数 ——
+ *       效果就是"删到剩余 ≥ 预留", 而且**决策仍然在纯函数里**(可 PC 单测)。
+ * @note ⚠️ 预留数值**行业没有权威出处**(见 `SVC_RECORD_HEADROOM_MIN` 的说明)。
+ */
+static void ensure_headroom(void)
+{
+    svc_record_policy_limits_t lim;
+    struct statvfs             vfs;
+    uint64_t                   headroom = headroom_bytes();
+    uint64_t                   cap;
+    uint64_t                   avail;
+
+    if (headroom == 0 || statvfs(g.dir, &vfs) != 0) {
+        return;                                  /* 查不到就不管, 别把录制停了 */
+    }
+    cap   = (uint64_t)vfs.f_blocks * (uint64_t)vfs.f_frsize;
+    avail = (uint64_t)vfs.f_bavail * (uint64_t)vfs.f_frsize;
+    if (avail >= headroom) {
+        return;
+    }
+    if (cap <= headroom) {
+        /* 盘比"一段"还小 —— 预留无从谈起。**不删**, 让"写不进去"如实报出来,
+         * 而不是把仅有的几段也删光(注意: 策略层把 limit_bytes==0 当"不限",
+         * 所以这里必须提前返回, 不能靠"算出来是 0"来表达"不删")。 */
+        if (!g.alerted_tiny) {
+            g.alerted_tiny = 1;             /* 每帧都会走到这里, 只报一次 */
+            LOG_ERROR("录制: 磁盘容量 %llu 字节比预留 %llu 字节还小, 无法预留",
+                      (unsigned long long)cap, (unsigned long long)headroom);
+        }
+        return;
+    }
+    lim.limit_bytes = cap - headroom;
+    lim.limit_files = 0;
+    /* ★ 只在**真的删掉了东西**时才打日志 —— 否则失败路径每帧都会刷一行(实测刷了 1392 行) */
+    if (apply_limits(&lim) > 0) {
+        LOG_ERROR("录制: 磁盘剩余 %llu 字节 < 预留 %llu 字节 → 已提前清理最旧分段",
+                  (unsigned long long)avail, (unsigned long long)headroom);
     }
 }
 
@@ -361,6 +467,9 @@ static int open_segment(void)
         snprintf(g.path_raw + n - 4, sizeof(g.path_raw) - (n - 4), ".h264.tmp");
     }
 
+    /* ★ 开新段之前先把空间腾够:保证"这一段有一整段的地方写" */
+    ensure_headroom();
+
     /* ★ 写进 `.tmp`:走不完 MP4Close 就**永远不是可播的分段**(见 svc_record.h) */
     g.mp4 = MP4Create(g.path_tmp, 0);
     if (g.mp4 == MP4_INVALID_FILE_HANDLE) {
@@ -406,6 +515,7 @@ static void close_segment(void)
         LOG_ERROR("录制: rename 失败(%s → %s), 该段仍以 .tmp 存在",
                   g.path_tmp, g.path_final);
     }
+    note_seg_size();                               /* 记住本段大小(下段的预留依据) */
     g.stats.segments++;
     LOG_INFO("录制: 分段收尾 %s(%d 帧, 共 %llu 段, 裸流 %llu 字节/错 %llu)",
              g.cur_name, g.frames_in_seg,
@@ -466,6 +576,41 @@ static int write_mp4_sample(uint32_t total, int is_key)
 }
 
 /**
+ * @brief 写入失败时的第一反应:先判原因, 该清理就清理
+ *
+ * @return 1 = 已清理(调用方可以重试写);0 = 清理也救不了(或不需要)
+ *
+ * @note 三种失败要**分开对待**(别混成一个"失败"):
+ *       · `EROFS`/`EACCES`/`EPERM` —— 文件系统已经不可写。板的挂载参数是
+ *         `errors=remount-ro`, 卡出 I/O 错后内核会把整盘**重挂成只读**,
+ *         这时删文件也腾不出空间 ⇒ 只报一次警, 不白费力气。
+ *       · 其它(含 `ENOSPC`) —— 当"空间不够"处理:删最旧 + 保底预留, 让调用方重试。
+ *       · `errno` 压根没设置 —— 也走清理那条路(总比什么都不做好)。
+ */
+static int recover_space_on_write_error(void)
+{
+    int saved = errno;
+
+    if (saved == EROFS || saved == EACCES || saved == EPERM) {
+        if (!g.alerted_ro) {
+            g.alerted_ro = 1;
+            LOG_ERROR("录制: 写入失败(%s) —— TF 卡可能已被内核重挂为只读"
+                      "(挂载参数 errors=remount-ro), 删文件也救不回来, 请检查卡",
+                      strerror(saved));
+        }
+        return 0;
+    }
+    g.stats.disk_full++;
+    if (g.stats.disk_full <= 3) {
+        LOG_ERROR("录制: 写入失败(%s) → 立即清理最旧分段并重试",
+                  (saved != 0) ? strerror(saved) : "errno 未设置");
+    }
+    enforce_limits();
+    ensure_headroom();
+    return 1;
+}
+
+/**
  * @brief 把一个切片 NALU 写成一个 MP4 sample
  *
  * @param[in] n      切片 NALU(含 NALU 头)
@@ -475,6 +620,8 @@ static int write_mp4_sample(uint32_t total, int is_key)
  *       我们的 `proto_nalu` 已经把起始码剥掉了, 所以这里是**自己补上长度前缀**;
  *       参考项目那份实现因为拿到的是带起始码的缓冲, 做的是"把起始码就地改成长度" ——
  *       结果一样(起始码正好也是 4 字节), 但它那个写法会**改动源缓冲**。
+ * @note ★ 写失败时**先怀疑盘满**:清理腾出空间后把同一个 NALU **重写一次**
+ *       (见 `recover_space_on_write_error()`)。**只重试一次** —— 免得在坏卡上死循环。
  */
 static void write_sample(const proto_nalu_t *n, int is_key)
 {
@@ -490,9 +637,17 @@ static void write_sample(const proto_nalu_t *n, int is_key)
     g_mp4buf[3] = (uint8_t)len;
     memcpy(g_mp4buf + 4, n->data, n->len);
 
+    errno = 0;                          /* 先清零, 才能判断失败时 errno 有没有被设置 */
     if (!write_mp4_sample(len + 4, is_key)) {
-        g.stats.write_errors++;
-        return;
+        if (!recover_space_on_write_error() || !write_mp4_sample(len + 4, is_key)) {
+            g.stats.write_errors++;
+            return;
+        }
+        g.stats.write_retry_ok++;
+        if (g.stats.write_retry_ok <= 3) {
+            LOG_INFO("录制: 清理后写入已恢复(第 %llu 次)",
+                     (unsigned long long)g.stats.write_retry_ok);
+        }
     }
     g.stats.bytes_written += n->len;
 }

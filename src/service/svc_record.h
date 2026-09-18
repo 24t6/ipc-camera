@@ -79,6 +79,17 @@
 #define SVC_RECORD_DEFAULT_SEGMENT_FRAMES \
     (SVC_RECORD_DEFAULT_SEGMENT_SEC * SVC_RECORD_FPS)
 
+/**
+ * 兜底预留空间(字节):**还没写出过任何一段**时, 用它当"一段大小"的估计。
+ *
+ * @note 实测码率 4.19 Mbps ⇒ 1 分钟约 31 MB, 这里取 **64 MB ≈ 2 分钟**。
+ * @note ⚠️ **行业没有权威水位数值** —— 调研结论:流传的"不超过 80%"都出自
+ *       容量规划建议, 不是运行时参数。所以这个数是**我们自己按实测定**的, 不是抄的。
+ *       写出过一段之后, 改用**见过的最大段 × 1.25** 当预留(见 `headroom_bytes()`)——
+ *       实测用"上一段大小"当预留**偏紧**:24 MB 小盘上每段末尾都撞一次 ENOSPC。
+ */
+#define SVC_RECORD_HEADROOM_MIN (64ULL * 1024 * 1024)
+
 /** mp4v2 的时间基与"每帧时长"。90000 / 3000 = 30fps, 与码流一致 */
 #define SVC_RECORD_TIMESCALE  90000
 #define SVC_RECORD_SAMPLE_DUR 3000
@@ -128,6 +139,8 @@ typedef struct {
     uint64_t write_errors;    /**< mp4v2 / 文件错误次数 */
     uint64_t raw_bytes;       /**< 写进旁路裸流侧车的字节数 */
     uint64_t raw_errors;      /**< 旁路裸流写失败次数(尽力而为, 不影响 MP4) */
+    uint64_t disk_full;       /**< 写入失败且判定为"空间不足"的次数 */
+    uint64_t write_retry_ok;  /**< 清理腾空间后重试成功的次数 */
     char     cur_name[64];    /**< 当前正在写的分段名(空 = 还没开) */
 } svc_record_stats_t;
 
