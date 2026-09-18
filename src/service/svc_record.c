@@ -62,6 +62,13 @@ static struct {
     int              want_close;                  /* 1 = 已达段长, 等下一个 IDR 再切 */
     char             cur_name[SVC_RECORD_POLICY_NAME_MAX];
 
+    /* ★ 分段的三条路径 + 旁路裸流(生命周期见 svc_record.h 顶部那段注释) */
+    char             path_final[SVC_RECORD_PATH_MAX];  /* <dir>/<stamp>.mp4     */
+    char             path_tmp[SVC_RECORD_PATH_MAX];    /* <dir>/<stamp>.mp4.tmp */
+    char             path_raw[SVC_RECORD_PATH_MAX];    /* <dir>/<stamp>.h264.tmp */
+    FILE            *raw;                              /* NULL = 没开侧车 */
+    int              raw_sidecar;                      /* 1 = 写侧车 */
+
     svc_record_stats_t stats;
 } g;
 
@@ -100,6 +107,10 @@ static int                      g_del[SVC_RECORD_POLICY_MAX_FILES];
  *
  * @param[in] name 文件名
  * @return 1 = 是; 0 = 不是
+ *
+ * @note ★ 这里**故意只认 `.mp4`** —— 于是 `<stamp>.mp4.tmp`(正在写)与
+ *       `<stamp>.h264.tmp`(旁路裸流)**都不算分段**:不进环形容量统计、
+ *       也不会被当成可回放的录像列出来。这是"正在写的段是显式状态"的实现方式。
  */
 static int name_is_mp4(const char *name)
 {
@@ -212,6 +223,110 @@ static void enforce_limits(void)
     }
 }
 
+/* ─────────── 旁路裸流侧车 + 残留清理 ─────────── */
+
+/**
+ * @brief 开旁路裸流侧车(尽力而为;开不了也要继续录 MP4)
+ *
+ * @note 用 `_IONBF` **不缓冲**:侧车的全部意义就是"进程突然没了, 文件里也有东西",
+ *       缓冲会让它白写。数据仍会经过内核页缓存(见 `write_raw_frame()` 的【简化上限】)。
+ */
+static void open_raw_sidecar(void)
+{
+    if (!g.raw_sidecar || g.path_raw[0] == '\0') {
+        return;
+    }
+    g.raw = fopen(g.path_raw, "wb");
+    if (g.raw == NULL) {
+        g.stats.raw_errors++;
+        LOG_ERROR("录制: 裸流侧车打不开: %s", g.path_raw);
+        return;
+    }
+    (void)setvbuf(g.raw, NULL, _IONBF, 0);
+}
+
+/**
+ * @brief 关掉旁路裸流侧车(可选顺手删掉)
+ *
+ * @param[in] unlink_it 1 = 同时删掉文件(收尾时用);0 = 只关不删
+ */
+static void close_raw_sidecar(int unlink_it)
+{
+    if (g.raw == NULL) {
+        return;
+    }
+    fclose(g.raw);
+    g.raw = NULL;
+    if (unlink_it && g.path_raw[0] != '\0') {
+        (void)unlink(g.path_raw);       /* 删不掉也只是多占一份, 不算错 */
+    }
+}
+
+/**
+ * @brief 把整帧 Annex-B 追加进旁路裸流侧车
+ *
+ * @param[in] data 整帧的 Annex-B 码流(槽位里那段)
+ * @param[in] len  字节数
+ *
+ * @note 与 MP4 里写的**是同一份码流**, 只是不加长度前缀(裸流靠起始码自定界)——
+ *       所以 MP4 被截断就打不开, 而这份**截断也能解**。
+ * @note 尽力而为:侧车写失败**不影响 MP4 录制**, 只累加 `raw_errors`。
+ *
+ * @note 【简化上限】**不调 `fsync`/`fdatasync`**, 数据只到内核页缓存
+ *       (Linux 默认 30 秒左右回写)⇒ **断电最多丢约 30 秒的侧车**, 而不是整段。
+ *       天花板:更短的丢失窗口需要周期 `fdatasync`(每秒一次即可),
+ *       但那会在录制线程里引入可能长达数百毫秒的阻塞(卡上 fsync 慢),
+ *       有拖慢录制、撑满队列的风险。**升级路径**:把侧车写到一个独立的小线程里,
+ *       再由它按秒 `fdatasync`, 这样录制线程一行都不用改。
+ */
+static void write_raw_frame(const uint8_t *data, uint32_t len)
+{
+    if (g.raw == NULL || len == 0) {
+        return;
+    }
+    if (fwrite(data, 1, len, g.raw) != len) {
+        g.stats.raw_errors++;
+        return;
+    }
+    g.stats.raw_bytes += len;
+}
+
+/**
+ * @brief 删掉录制目录里残留的 `*.tmp`(上次异常退出留下的半成品)
+ *
+ * @note 只认后缀 `.tmp` —— 覆盖"正在写的 MP4"与"旁路裸流侧车"两种残留。
+ * @note 启动时调一次(在录制线程起来之前), 避免与正在写的文件抢名字。
+ */
+static void cleanup_tmp_files(void)
+{
+    DIR           *d = opendir(g.dir);
+    struct dirent *e;
+    char           path[SVC_RECORD_PATH_MAX];
+    int            n = 0;
+
+    if (d == NULL) {
+        return;
+    }
+    while ((e = readdir(d)) != NULL) {
+        size_t len = strlen(e->d_name);
+
+        if (len < 5 || strcmp(e->d_name + len - 4, ".tmp") != 0) {
+            continue;
+        }
+        if (make_path(e->d_name, path, sizeof(path)) <= 0) {
+            continue;
+        }
+        if (unlink(path) == 0) {
+            n++;
+            LOG_INFO("录制: 清掉上次异常退出留下的半成品 %s", e->d_name);
+        }
+    }
+    closedir(d);
+    if (n > 0) {
+        LOG_INFO("录制: 启动清理完成, 共删除 %d 个 *.tmp", n);
+    }
+}
+
 /* ─────────── 分段开关 ─────────── */
 
 /**
@@ -226,6 +341,7 @@ static int open_segment(void)
 {
     struct tm tmv;
     time_t    now = time(NULL);
+    size_t    n;
 
     if (localtime_r(&now, &tmv) == NULL) {
         return -1;
@@ -233,24 +349,36 @@ static int open_segment(void)
     if (svc_record_policy_make_name(&tmv, g.cur_name, sizeof(g.cur_name)) <= 0) {
         return -1;
     }
-    if (make_path(g.cur_name, g.stats.cur_name, sizeof(g.stats.cur_name)) <= 0) {
+    if (make_path(g.cur_name, g.path_final, sizeof(g.path_final)) <= 0 ||
+        make_path(g.cur_name, g.stats.cur_name, sizeof(g.stats.cur_name)) <= 0) {
         return -1;
     }
-    g.mp4 = MP4Create(g.stats.cur_name, 0);
+    snprintf(g.path_tmp, sizeof(g.path_tmp), "%s.tmp", g.path_final);
+    /* 侧车路径:把结尾的 ".mp4" 换成 ".h264.tmp"(同样以 .tmp 结尾, 一起被清理) */
+    snprintf(g.path_raw, sizeof(g.path_raw), "%s", g.path_final);
+    n = strlen(g.path_raw);
+    if (n > 4 && strcmp(g.path_raw + n - 4, ".mp4") == 0) {
+        snprintf(g.path_raw + n - 4, sizeof(g.path_raw) - (n - 4), ".h264.tmp");
+    }
+
+    /* ★ 写进 `.tmp`:走不完 MP4Close 就**永远不是可播的分段**(见 svc_record.h) */
+    g.mp4 = MP4Create(g.path_tmp, 0);
     if (g.mp4 == MP4_INVALID_FILE_HANDLE) {
         g.mp4 = NULL;
         g.stats.cur_name[0] = '\0';
         g.stats.write_errors++;
-        LOG_ERROR("录制: MP4Create 失败: %s", g.stats.cur_name);
+        LOG_ERROR("录制: MP4Create 失败: %s", g.path_tmp);
         return -1;
     }
     MP4SetTimeScale(g.mp4, SVC_RECORD_TIMESCALE);
+    open_raw_sidecar();
     g.track         = MP4_INVALID_TRACK_ID;
     g.have_sps      = 0;
     g.have_pps      = 0;
     g.frames_in_seg = 0;
     g.want_close    = 0;
-    LOG_INFO("录制: 开始新分段 %s(%dx%d)", g.cur_name, g.width, g.height);
+    LOG_INFO("录制: 开始新分段 %s(%dx%d, 旁路裸流 %s)",
+             g.cur_name, g.width, g.height, (g.raw != NULL) ? "开" : "关");
     return 0;
 }
 
@@ -258,6 +386,8 @@ static int open_segment(void)
  * @brief 关掉当前分段
  *
  * @note ★ **`MP4Close` 就是"索引(moov)落盘"的时刻** —— 不调它, 这个文件不可播。
+ * @note ★ 顺序很重要:`MP4Close` → 删侧车 → **`rename` 成正式名**。
+ *       `rename` 放最后, 是为了让"目录里出现 `.mp4`"这件事**等价于"这段已经完整"**。
  */
 static void close_segment(void)
 {
@@ -268,11 +398,20 @@ static void close_segment(void)
     g.mp4        = NULL;
     g.track      = MP4_INVALID_TRACK_ID;
     g.want_close = 0;
+
+    /* MP4 已完整 ⇒ 侧车的使命结束:关掉并删掉(稳态磁盘占用仍是一份) */
+    close_raw_sidecar(1);
+    if (rename(g.path_tmp, g.path_final) != 0) {
+        g.stats.write_errors++;
+        LOG_ERROR("录制: rename 失败(%s → %s), 该段仍以 .tmp 存在",
+                  g.path_tmp, g.path_final);
+    }
     g.stats.segments++;
-    LOG_INFO("录制: 分段收尾 %s(%d 帧, %llu 字节, 共 %llu 段)",
+    LOG_INFO("录制: 分段收尾 %s(%d 帧, 共 %llu 段, 裸流 %llu 字节/错 %llu)",
              g.cur_name, g.frames_in_seg,
-             (unsigned long long)g.stats.bytes_written,
-             (unsigned long long)g.stats.segments);
+             (unsigned long long)g.stats.segments,
+             (unsigned long long)g.stats.raw_bytes,
+             (unsigned long long)g.stats.raw_errors);
     g.stats.cur_name[0] = '\0';
     enforce_limits();
 }
@@ -448,6 +587,8 @@ static void handle_slot(size_t len)
         g.stats.write_errors++;
         return;
     }
+    /* ★ 旁路裸流:把**整帧 Annex-B** 也写一份 —— 掉电/强杀后这份截断也能解 */
+    write_raw_frame(data, (uint32_t)h->len);
     /* ★ 只统计**真正落盘**的帧 —— 让日志里的帧数等于文件里的帧数(B033 的教训) */
     g.frames_in_seg++;
     g.stats.frames_written++;
@@ -516,11 +657,19 @@ int svc_record_start(const svc_record_cfg_t *cfg, void *queue)
     g.limit_files    = cfg->limit_files;
     g.segment_frames = (cfg->segment_frames > 0)
                        ? cfg->segment_frames : SVC_RECORD_DEFAULT_SEGMENT_FRAMES;
+    g.raw_sidecar    = (cfg->raw_sidecar != 0) ? 1 : 0;
     g.queue          = (infra_queue_t *)queue;
     g.mp4            = NULL;
+    g.raw            = NULL;
     g.track          = MP4_INVALID_TRACK_ID;
+    g.path_final[0]  = '\0';
+    g.path_tmp[0]    = '\0';
+    g.path_raw[0]    = '\0';
     g.stop_requested = 0;
     g.running        = 1;
+
+    /* ★ 清掉上次异常退出留下的 *.tmp —— 必须在录制线程起来**之前**做, 免得抢名字 */
+    cleanup_tmp_files();
 
     if (pthread_create(&g.thread, NULL, record_thread, NULL) != 0) {
         LOG_ERROR("录制线程创建失败");

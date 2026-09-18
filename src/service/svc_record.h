@@ -83,6 +83,29 @@
 #define SVC_RECORD_TIMESCALE  90000
 #define SVC_RECORD_SAMPLE_DUR 3000
 
+/*
+ * ★ 分段文件的生命周期(2026-09-17 改进:掉电可见 + 掉电可救)
+ *
+ *   正在写:      <stamp>.mp4.tmp     ← mp4v2 写这里(没走完 MP4Close 就没有 moov)
+ *                <stamp>.h264.tmp    ← 旁路裸流侧车(Annex-B, 靠起始码自定界,
+ *                                      所以**被截断也照样能解**)
+ *   MP4Close 成功:
+ *                rename(<stamp>.mp4.tmp → <stamp>.mp4)   ← 这时才"对外可见"
+ *                unlink(<stamp>.h264.tmp)                ← 侧车使命完成, 立刻删
+ *   进程启动:    扫目录删掉残留的 *.tmp(那是上次异常退出留下的半成品)
+ *
+ *   为什么正在写的那段要带 `.tmp`:目录扫描只认 `.mp4`(见 `name_is_mp4()`),
+ *   于是半成品**不进环形容量统计、不出现在检索列表**;而且断电残留**一眼可辨** ——
+ *   不再是"看着像正常文件、其实播不了"。
+ *
+ *   为什么侧车只在段进行中存在:它的唯一用途是"这一段中途死了还能救";
+ *   MP4 一收尾就多余 —— 关段即删, **稳态磁盘占用仍然是 1 份**, 环形覆盖一行都不用改。
+ *
+ *   ⚠️ 侧车让**写入量翻倍**(4.19 → 8.4 Mbps)。实测卡写速 17.5 MB/s, 吞吐不是问题;
+ *      代价在**卡寿命**(约 6 年 → 约 3 年, 见 `PROJECT_PLAN.md` §3.9)。`-no-raw` 可关。
+ *   ⚠️ `-h265` 模式下既不写侧车也不录 MP4(mp4v2 不支持 H.265 封装)。
+ */
+
 /** 录制配置(由调用方填) */
 typedef struct {
     const char *dir;             /**< 录制目录, 例如 "/mnt/sdcard" */
@@ -91,6 +114,7 @@ typedef struct {
     uint64_t    limit_bytes;     /**< 环形容量上限(字节);0 = 不限 */
     int         limit_files;     /**< 环形文件数上限;0 = 不限 */
     int         segment_frames;  /**< 每段多少帧后切新文件;<=0 = 用默认(54000 ≈ 30 分钟) */
+    int         raw_sidecar;     /**< 1 = 同时写旁路裸流侧车(掉电可救);0 = 不写 */
 } svc_record_cfg_t;
 
 /** 录制统计(用于日志与验收断言) */
@@ -102,6 +126,8 @@ typedef struct {
     uint64_t oversized;       /**< 因超过 SVC_RECORD_MAX_NALU 被丢弃的 NALU 数 */
     uint64_t slot_errors;     /**< 槽位魔数不符(不是我们写的帧)的次数 */
     uint64_t write_errors;    /**< mp4v2 / 文件错误次数 */
+    uint64_t raw_bytes;       /**< 写进旁路裸流侧车的字节数 */
+    uint64_t raw_errors;      /**< 旁路裸流写失败次数(尽力而为, 不影响 MP4) */
     char     cur_name[64];    /**< 当前正在写的分段名(空 = 还没开) */
 } svc_record_stats_t;
 

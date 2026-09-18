@@ -140,6 +140,7 @@ typedef struct {
     int         is_h265;
     int         no_osd;      /**< 1 = 不叠时间水印(默认叠) */
     int         no_record;   /**< 1 = 不录 MP4(默认录到 /mnt/sdcard) */
+    int         no_raw;      /**< 1 = 不写旁路裸流侧车(默认写;掉电后可救前一段) */
     int         rec_mb;      /**< 环形容量上限(MB);0 = 不限 */
     int         rec_seg;     /**< 每段**秒数**;0 = 用默认(1800 秒 = 30 分钟) */
     int         verbose;
@@ -158,6 +159,7 @@ static void usage(const char *prog)
            "  -h265       取 H.265 那一路(默认 H.264)\n"
            "  -no-osd     不叠时间水印(默认在右上角叠)\n"
            "  -no-record  不录 MP4(默认录到 " APP_REC_DIR ")\n"
+           "  -no-raw     不写旁路裸流侧车(默认写:掉电/强杀后能把前一段救回来)\n"
            "  -r <MB>     录制环形容量上限(默认 %d MB;0=不限)\n"
            "  -s <秒数>   每段多少秒后切新文件(默认 1800 = 30 分钟)\n"
            "  -v          打开 DEBUG 日志\n"
@@ -183,6 +185,7 @@ static int parse_args(int argc, char **argv, app_opts_t *o)
     o->is_h265   = 0;
     o->no_osd    = 0;
     o->no_record = 0;
+    o->no_raw    = 0;
     o->rec_mb    = APP_REC_LIMIT_MB;
     o->rec_seg   = 0;
     o->verbose   = 0;
@@ -205,6 +208,8 @@ static int parse_args(int argc, char **argv, app_opts_t *o)
             o->no_osd = 1;
         else if (strcmp(argv[i], "-no-record") == 0)
             o->no_record = 1;
+        else if (strcmp(argv[i], "-no-raw") == 0)
+            o->no_raw = 1;
     }
     return 0;
 }
@@ -361,6 +366,7 @@ static int start_record(const app_opts_t *o, int *started)
     rec.limit_bytes    = (o->rec_mb > 0) ? (uint64_t)o->rec_mb * 1024 * 1024 : 0;
     rec.limit_files    = 0;
     rec.segment_frames = o->rec_seg * SVC_RECORD_FPS;   /* 命令行给的是秒 */
+    rec.raw_sidecar    = o->no_raw ? 0 : 1;             /* 默认写:掉电/强杀后能救回前一段 */
 
     if (svc_record_start(&rec, g_record_queue) != 0) {
         infra_queue_destroy(g_record_queue);
@@ -368,10 +374,10 @@ static int start_record(const app_opts_t *o, int *started)
         return -2;
     }
     *started |= 16;
-    printf("录制      : %s · %dx%d · 每段 %d 秒 · 上限 %d MB\n",
+    printf("录制      : %s · %dx%d · 每段 %d 秒 · 上限 %d MB · 旁路裸流 %s\n",
            APP_REC_DIR, w, h,
            (o->rec_seg > 0) ? o->rec_seg : SVC_RECORD_DEFAULT_SEGMENT_SEC,
-           o->rec_mb);
+           o->rec_mb, o->no_raw ? "关" : "开");
     return 0;
 }
 
