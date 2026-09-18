@@ -270,18 +270,22 @@ static void report(int secs)
  *       否则所有客户端的 RTSP 请求都会被卡住。
  *       `svc_sender_add_client()` 只是"登记 + 建 sender", 不发送, 符合要求。
  */
-static void on_play(int client_index, const struct sockaddr_in *rtp_dst, void *user)
+static void on_play(int client_index, const infra_transport_t *tr, void *user)
 {
     int rc;
 
     (void)user;
-    rc = svc_sender_add_client(client_index, rtp_dst);
-    if (rc != 0)
+    rc = svc_sender_add_client(client_index, tr);
+    if (rc != 0) {
         LOG_WARN("client%d 加入发送失败 rc=%d(客户端满?)", client_index, rc);
-    else
-        LOG_INFO("client%d 开始播放 → RTP %s:%u", client_index,
-                 inet_ntoa(rtp_dst->sin_addr),
-                 (unsigned)ntohs(rtp_dst->sin_port));
+    } else if (tr->is_tcp) {
+        LOG_INFO("client%d 开始播放 → RTP over TCP 交错(fd=%d 通道=%u)",
+                 client_index, tr->rtsp_fd, (unsigned)tr->rtp_channel);
+    } else {
+        LOG_INFO("client%d 开始播放 → RTP over UDP %s:%u", client_index,
+                 inet_ntoa(tr->rtp_dst.sin_addr),
+                 (unsigned)ntohs(tr->rtp_dst.sin_port));
+    }
 }
 
 /** @brief 客户端停止播放(TEARDOWN / 断开 / 空闲超时) */

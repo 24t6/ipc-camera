@@ -58,6 +58,8 @@
 #include <netinet/in.h>
 #include <stdint.h>
 
+#include "infra_netio.h"    /* infra_transport_t —— 客户端传输方式的唯一定义处 */
+
 /** 最多同时服务多少个"正在播放"的客户端。与 svc_net 的上限一致 */
 #define SVC_SENDER_MAX_CLIENTS 8
 
@@ -123,14 +125,15 @@ int svc_sender_is_running(void);
  * @brief 通知"有个客户端开始播放了"。
  *
  * @param client_index 客户端槽位下标(`svc_net` 的 `on_play` 里的那个)
- * @param rtp_dst      该客户端的 RTP 目的地(**非 NULL**, 由 svc_net 给出)
+ * @param tr           该客户端的**传输方式**(**非 NULL**, 由 svc_net 给出):
+ *                     UDP 用 `tr->rtp_dst`, TCP 交错用 `tr->rtsp_fd` + `tr->rtp_channel`。
  * @return 0 成功; -1 参数非法; -2 客户端槽位已满
  *
  * @note 由 `svc_net` 的**事件循环线程**调用(回调里), 内部只是登记,
  *       **不阻塞、不发送**。
  * @note 新客户端会被标记为"**等待 IDR**" —— 见文件头设计决定 ②。
  */
-int svc_sender_add_client(int client_index, const struct sockaddr_in *rtp_dst);
+int svc_sender_add_client(int client_index, const infra_transport_t *tr);
 
 /**
  * @brief 通知"某个客户端停止播放/断开了"。

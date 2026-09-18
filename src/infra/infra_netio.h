@@ -70,6 +70,24 @@ struct infra_sender {
 };
 
 /**
+ * 一个客户端的**传输方式** —— 由 `svc_net` 在 PLAY 时给出, 决定用哪种 sender。
+ *
+ * @note 为什么要这么个结构(2026-09-18 修 bug 时加的): 原来 `svc_net` 只传出
+ *       "RTP 目的地", 于是 `svc_sender` **无论 SETUP 协商成什么都建 UDP sender** ——
+ *       TCP 交错那条实现(`infra_sender_tcp_interleaved()`)写好了却**没人调用**,
+ *       症状是"客户端勾了 TCP 播放就一帧都发不出去"(日志里 RTP 端口是 0)。
+ *       把"传输方式"显式传出来, 这类"**写好了没接线**"的病才不会再犯。
+ * @note 放在 infra 层是因为 **`svc_net` 与 `svc_sender` 是平级模块**,
+ *       谁都不该 include 对方的头; 而"传输方式"本来就属于发送/接收抽象这一层。
+ */
+typedef struct {
+    int                is_tcp;       /**< 1 = RTP over TCP 交错(RFC 2326 §10.12); 0 = UDP */
+    int                rtsp_fd;      /**< is_tcp 时: RTSP 那条 TCP 的 fd(交错帧写在它上面) */
+    uint8_t            rtp_channel;  /**< is_tcp 时: SETUP 协商的 RTP 交错通道号 */
+    struct sockaddr_in rtp_dst;      /**< is_tcp=0 时: UDP 目的地(IP + 客户端 RTP 端口) */
+} infra_transport_t;
+
+/**
  * @brief 创建一个 UDP sender(包到包一次 sendto)。
  *
  * @param dst    目标地址(会**按值拷贝**进 ctx, 调用方不必保持有效)
@@ -78,6 +96,7 @@ struct infra_sender {
  *
  * @note 不接管 sockfd 的所有权 —— 销毁 sender **不会**关闭 socket。
  */
+
 infra_sender_t *infra_sender_udp(const struct sockaddr_in *dst, int sockfd);
 
 /**

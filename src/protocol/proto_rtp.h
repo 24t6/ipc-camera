@@ -147,6 +147,36 @@ void proto_rtp_session_next_frame(proto_rtp_session_t *s);
 void proto_rtp_session_frame_pts(proto_rtp_session_t *s, uint64_t pts);
 
 /**
+ * 发一个 RTP 包的动作 —— **打包与传输解耦的关键**。
+ *
+ * @param user 透传(调用方的上下文)
+ * @param pkt  完整的 RTP 包(12 字节头 + 载荷)
+ * @param len  字节数
+ * @return 0 成功; 负值失败(打包立即中止并返回错误)
+ *
+ * @note 为什么要这个回调(2026-09-18): 原来 `proto_rtp_send_nalu()` **自己
+ *       `sendto`**, 于是"传输方式"被**焊死**在协议层里 ——
+ *       `svc_sender` 里新建的 TCP 交错 sender 因此**从来不被调用**
+ *       (客户端勾"以 TCP 播放"就一帧都发不出去)。把"发一个包"抽成回调之后,
+ *       协议层只管**打包**, 走 UDP 还是走 TCP 交错由上层决定。
+ * @note 副作用是好的: 协议层从此**不碰 socket**, 可以纯 PC 单测。
+ */
+typedef int proto_rtp_pkt_fn(void *user, const uint8_t *pkt, size_t len);
+
+/**
+ * @brief 把一个 NALU **打包**成 RTP 包, 每个包交给 `fn` 发出(单包 / FU 分片自动决定)。
+ *
+ * @param s       会话状态
+ * @param n       要打包的 NALU(不含起始码)
+ * @param is_last 该 NALU 是否是本帧的最后一个 —— 是则置 RTP marker 位
+ * @param fn      每包一次的回调(不能为 NULL)
+ * @param user    透传给 `fn`
+ * @return 已交付的 RTP 包个数; 负值为错误(含回调返回负值)
+ */
+int proto_rtp_pack_nalu(proto_rtp_session_t *s, const proto_nalu_t *n, int is_last,
+                        proto_rtp_pkt_fn *fn, void *user);
+
+/**
  * @brief 发送一个 NALU(自动决定单包还是 FU-A 分片)。
  *
  * @param sockfd    用于发送的 UDP socket
@@ -156,6 +186,10 @@ void proto_rtp_session_frame_pts(proto_rtp_session_t *s, uint64_t pts);
  * @param n         要发送的 NALU(不含起始码)
  * @param is_last   该 NALU 是否是本帧的最后一个 —— 是则置 RTP marker 位
  * @return 已发送的 RTP 包个数; 负值为错误
+ *
+ * @note 它是 `proto_rtp_pack_nalu()` 的**薄包装**(每包一次 `sendto`),
+ *       留给 PC 单测与"纯 UDP"的调用方;服务端主路径走 `svc_sender` 的
+ *       `sender->send()`, 以便同时支持 UDP 与 RTP over TCP 交错。
  */
 int proto_rtp_send_nalu(int sockfd, const struct sockaddr *dst, socklen_t dstlen,
                   proto_rtp_session_t *s, const proto_nalu_t *n, int is_last);

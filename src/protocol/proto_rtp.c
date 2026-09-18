@@ -57,17 +57,15 @@ static void rtp_write_header(uint8_t *p, const proto_rtp_session_t *s, int marke
 
 /* ─────────────────────── 单 NALU 模式 ─────────────────────── */
 
-static int send_single(int fd, const struct sockaddr *dst, socklen_t dstlen,
+static int send_single(proto_rtp_pkt_fn *fn, void *user,
                        proto_rtp_session_t *s, const proto_nalu_t *n, int marker)
 {
     uint8_t pkt[PROTO_RTP_HEADER_LEN + 3 + PROTO_RTP_MAX_PAYLOAD];
-    ssize_t sent;
 
     rtp_write_header(pkt, s, marker);
     memcpy(pkt + PROTO_RTP_HEADER_LEN, n->data, n->len);
 
-    sent = sendto(fd, pkt, PROTO_RTP_HEADER_LEN + n->len, 0, dst, dstlen);
-    if (sent < 0)
+    if (fn(user, pkt, PROTO_RTP_HEADER_LEN + n->len) < 0)
         return -1;
 
     s->seq++;
@@ -83,7 +81,7 @@ static int send_single(int fd, const struct sockaddr *dst, socklen_t dstlen,
  * @note 原 NALU 头被拆开复用(F/NRI 进 FU indicator, Type 进 FU header),
  *       所以每片只多 2 字节 —— 见 docs/面试问答.md Q15。
  */
-static int send_fua_h264(int fd, const struct sockaddr *dst, socklen_t dstlen,
+static int send_fua_h264(proto_rtp_pkt_fn *fn, void *user,
                          proto_rtp_session_t *s, const proto_nalu_t *n, int marker)
 {
     uint8_t pkt[PROTO_RTP_HEADER_LEN + 3 + PROTO_RTP_MAX_PAYLOAD];
@@ -97,7 +95,6 @@ static int send_fua_h264(int fd, const struct sockaddr *dst, socklen_t dstlen,
     while (remain > 0) {
         size_t frag = (remain > maxfrag) ? maxfrag : remain;
         int    last = (frag == remain);
-        ssize_t sent;
 
         rtp_write_header(pkt, s, (last && marker) ? 1 : 0);
 
@@ -110,8 +107,7 @@ static int send_fua_h264(int fd, const struct sockaddr *dst, socklen_t dstlen,
                                                  | (nalu_hdr & 0x1F));
         memcpy(pkt + PROTO_RTP_HEADER_LEN + 2, payload, frag);
 
-        sent = sendto(fd, pkt, PROTO_RTP_HEADER_LEN + 2 + frag, 0, dst, dstlen);
-        if (sent < 0)
+        if (fn(user, pkt, PROTO_RTP_HEADER_LEN + 2 + frag) < 0)
             return (npkt > 0) ? npkt : -1;
 
         s->seq++;
@@ -132,7 +128,7 @@ static int send_fua_h264(int fd, const struct sockaddr *dst, socklen_t dstlen,
  * @return >=0 已发送的 RTP 包个数; <0 失败
  * @note 与 H.264 的差别: 剥 2 字节头、补 3 字节分片头、FU 类型值 = 49。
  */
-static int send_fu_h265(int fd, const struct sockaddr *dst, socklen_t dstlen,
+static int send_fu_h265(proto_rtp_pkt_fn *fn, void *user,
                         proto_rtp_session_t *s, const proto_nalu_t *n, int marker)
 {
     uint8_t pkt[PROTO_RTP_HEADER_LEN + 3 + PROTO_RTP_MAX_PAYLOAD];
@@ -148,7 +144,6 @@ static int send_fu_h265(int fd, const struct sockaddr *dst, socklen_t dstlen,
     while (remain > 0) {
         size_t frag = (remain > maxfrag) ? maxfrag : remain;
         int    last = (frag == remain);
-        ssize_t sent;
 
         rtp_write_header(pkt, s, (last && marker) ? 1 : 0);
 
@@ -165,8 +160,7 @@ static int send_fu_h265(int fd, const struct sockaddr *dst, socklen_t dstlen,
                                                  | (fu_type & 0x3F));
         memcpy(pkt + PROTO_RTP_HEADER_LEN + 3, payload, frag);
 
-        sent = sendto(fd, pkt, PROTO_RTP_HEADER_LEN + 3 + frag, 0, dst, dstlen);
-        if (sent < 0)
+        if (fn(user, pkt, PROTO_RTP_HEADER_LEN + 3 + frag) < 0)
             return (npkt > 0) ? npkt : -1;
 
         s->seq++;
@@ -240,12 +234,34 @@ void proto_rtp_session_frame_pts(proto_rtp_session_t *s, uint64_t pts)
     s->timestamp += (uint32_t)(delta * PROTO_RTP_CLOCK_RATE / PROTO_RTP_PTS_HZ);
 }
 
-int proto_rtp_send_nalu(int sockfd, const struct sockaddr *dst, socklen_t dstlen,
-                  proto_rtp_session_t *s, const proto_nalu_t *n, int is_last)
+/** `proto_rtp_send_nalu()` 用的上下文:目标 socket + 地址 */
+typedef struct {
+    int                    fd;
+    const struct sockaddr *dst;
+    socklen_t              dstlen;
+} rtp_udp_ctx_t;
+
+/**
+ * @brief "发一个包"的默认动作 = 一次 `sendto`(给 `proto_rtp_send_nalu()` 用)
+ *
+ * @param user `rtp_udp_ctx_t *`
+ * @param pkt  完整 RTP 包
+ * @param len  字节数
+ * @return 0 成功; -1 失败
+ */
+static int udp_sendto_cb(void *user, const uint8_t *pkt, size_t len)
+{
+    rtp_udp_ctx_t *c = (rtp_udp_ctx_t *)user;
+
+    return (sendto(c->fd, pkt, len, 0, c->dst, c->dstlen) < 0) ? -1 : 0;
+}
+
+int proto_rtp_pack_nalu(proto_rtp_session_t *s, const proto_nalu_t *n, int is_last,
+                        proto_rtp_pkt_fn *fn, void *user)
 {
     size_t hdr_len;
 
-    if (n == NULL || n->len == 0)
+    if (n == NULL || fn == NULL || n->len == 0)
         return 0;
 
     /* NALU 头本身要占位, 太短说明数据异常 */
@@ -259,10 +275,21 @@ int proto_rtp_send_nalu(int sockfd, const struct sockaddr *dst, socklen_t dstlen
      * 只有大 NALU 才需要分片: 实测关键帧 55KB(H.264)/ 115KB(H.265)。
      */
     if (n->len <= PROTO_RTP_MAX_PAYLOAD)
-        return send_single(sockfd, dst, dstlen, s, n, is_last);
+        return send_single(fn, user, s, n, is_last);
 
     if (n->is_h265)
-        return send_fu_h265(sockfd, dst, dstlen, s, n, is_last);
+        return send_fu_h265(fn, user, s, n, is_last);
 
-    return send_fua_h264(sockfd, dst, dstlen, s, n, is_last);
+    return send_fua_h264(fn, user, s, n, is_last);
+}
+
+int proto_rtp_send_nalu(int sockfd, const struct sockaddr *dst, socklen_t dstlen,
+                  proto_rtp_session_t *s, const proto_nalu_t *n, int is_last)
+{
+    rtp_udp_ctx_t c;
+
+    c.fd     = sockfd;
+    c.dst    = dst;
+    c.dstlen = dstlen;
+    return proto_rtp_pack_nalu(s, n, is_last, udp_sendto_cb, &c);
 }

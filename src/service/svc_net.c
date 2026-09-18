@@ -61,6 +61,7 @@ typedef struct {
     int      session_assigned;          /* SETUP 之后为 1 */
     uint32_t session_id;
     int      playing;                   /* PLAY 之后为 1 */
+    int      transport_tcp;             /* SETUP 协商成 TCP 交错(RFC 2326 §10.12) */
     uint8_t  rtp_channel;               /* SETUP 协商结果(TCP 交错用) */
     uint8_t  rtcp_channel;
 
@@ -115,7 +116,7 @@ static struct {
 
     int                 idle_timeout_sec;
     /* 与 svc_net_cfg_t 里的两个回调保持一致(签名改一处必须改两处, 否则是 UB) */
-    void              (*on_play)(int, const struct sockaddr_in *, void *);
+    void              (*on_play)(int, const infra_transport_t *, void *);
     void              (*on_teardown)(int, void *);
     void               *user;
 
@@ -319,6 +320,7 @@ static void setup_session(svc_net_client_t *c, const proto_rtsp_request_t *req)
 
     c->session_id       = 1000u + (uint32_t)c->index;
     c->session_assigned = 1;
+    c->transport_tcp    = tcp;      /* ★ PLAY 时要把它交给上层选 sender */
     c->rtp_channel      = tcp ? req->interleaved_rtp  : SVC_NET_RTP_CHANNEL;
     c->rtcp_channel     = tcp ? req->interleaved_rtcp : SVC_NET_RTCP_CHANNEL;
     c->client_rtp_port  = req->client_rtp_port;
@@ -355,14 +357,19 @@ static int handle_play_pause(svc_net_client_t *c, const proto_rtsp_request_t *re
 
     /*
      * 先把响应发出去, 再通知上层 —— 否则上层的回调若阻塞, 客户端会先等到超时。
-     * 然后把 **RTP 目的地**一起交给上层(见 svc_net.h 里 on_play 的说明:
+     * 然后把 **传输方式**一起交给上层(见 svc_net.h 里 on_play 的说明:
      * 按值传出去, 上层不必再查表, 也就没有"查表期间客户端被清掉"的竞态)。
+     * ⚠️ TCP 交错时 `rtp_dst` 的端口是 **0** —— 目的地其实是这条 RTSP 连接的 fd。
      */
     if (playing && g.on_play != NULL) {
-        struct sockaddr_in dst;
+        infra_transport_t tr;
 
-        client_rtp_dst(c, &dst);
-        g.on_play(c->index, &dst, g.user);
+        memset(&tr, 0, sizeof(tr));
+        tr.is_tcp      = c->transport_tcp;
+        tr.rtsp_fd     = c->fd;
+        tr.rtp_channel = c->rtp_channel;
+        client_rtp_dst(c, &tr.rtp_dst);
+        g.on_play(c->index, &tr, g.user);
     }
     return 0;
 }

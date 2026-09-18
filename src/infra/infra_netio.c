@@ -12,9 +12,12 @@
 #include <arpa/inet.h>      /* inet_pton */
 #include <errno.h>
 #include <fcntl.h>
+#include <poll.h>           /* poll —— 非阻塞 socket 等可写(别空转) */
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+
+#include "infra_log.h"
 
 /** RTP-over-TCP 交错帧的头部长度:$ + channel + 2 字节长度 */
 #define INTERLEAVED_HDR_LEN 4
@@ -122,19 +125,75 @@ typedef struct {
 #define TCP_FRAME_CAP 2048
 
 /**
+ * @brief 把拼好的交错帧**写完**(必要时 poll 等可写)
+ *
+ * @param c     上下文
+ * @param total 总字节数(交错头 + 数据)
+ * @return 0 成功; -1 失败(已累加 `c->errors`)
+ *
+ * @note 抽出来是为了让 `tcp_send()` 短到不用续行、也不超"函数 ≤ 50 行"的硬约束。
+ */
+static int tcp_write_all(tcp_ctx_t *c, size_t total)
+{
+    size_t sent = 0;
+
+    while (sent < total) {
+        ssize_t n = send(c->fd, c->frame + sent, total - sent, 0);
+
+        if (n > 0) {
+            sent += (size_t)n;
+            continue;
+        }
+        if (n < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)) {
+            /*
+             * 非阻塞 socket 缓冲满:`poll` 等它可写, **不要 `continue` 空转**。
+             * ⚠️ 原来的写法就是 `continue` —— 缓冲一直满就是 100% CPU 的死循环,
+             *    而且永远发不出去(2026-09-18 顺手修掉的隐患)。
+             */
+            struct pollfd p;
+
+            p.fd      = c->fd;
+            p.events  = POLLOUT;
+            p.revents = 0;
+            if (poll(&p, 1, 100) > 0) {
+                continue;
+            }
+            if (c->errors < 3) {
+                LOG_ERROR("tcp_send: 等可写超时(fd=%d, 已发 %zu/%zu)",
+                          c->fd, sent, total);
+            }
+            c->errors++;
+            return -1;
+        }
+        /* ★ 真失败要**分类报出来**(errno 是关键线索);只报前 3 次, 免得刷屏 */
+        if (c->errors < 3) {
+            LOG_ERROR("tcp_send: send() 失败 n=%zd errno=%d(%s), 已发 %zu/%zu",
+                      n, errno, strerror(errno), sent, total);
+        }
+        c->errors++;
+        return -1;
+    }
+    return 0;
+}
+
+/**
  * @brief TCP 交错(interleaved)发送实现 —— 把 RTP 包塞进 RTSP 那条 TCP 连接
  *
  * @param ctx tcp_ctx_t
  * @param buf 待发数据
  * @param len 字节数
- * @return 0 成功; 负值失败
- * @note 这是 ADR-1 留的**预留实现**(先做 UDP); 详见 ARCHITECTURE.md。
+ * @return >=0 成功(等于 len); 负值失败
+ *
+ * @note ADR-1 当时把它当**预留实现**(先做 UDP);2026-09-18 才真正接上 ——
+ *       在此之前 `svc_sender` 不管协商成什么都建 UDP sender, 于是客户端勾
+ *       "以 TCP 播放"时一帧都发不出去。详见 `infra_transport_t` 的说明。
+ * @note 交错帧必须**一次写完**(允许多次 write 但必须字节连续),
+ *       否则多线程交错会破坏 TCP 流。
  */
 static int tcp_send(void *ctx, const void *buf, size_t len)
 {
     tcp_ctx_t *c = (tcp_ctx_t *)ctx;
     size_t     total;
-    size_t     sent = 0;
 
     if (c == NULL || buf == NULL || len == 0)
         return -1;
@@ -151,17 +210,9 @@ static int tcp_send(void *ctx, const void *buf, size_t len)
     memcpy(c->frame + INTERLEAVED_HDR_LEN, buf, len);
     total = len + INTERLEAVED_HDR_LEN;
 
-    while (sent < total) {
-        ssize_t n = send(c->fd, c->frame + sent, total - sent, 0);
-        if (n <= 0) {
-            if (n < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK))
-                continue;               /* 被打断或临时不可写, 重试 */
-            c->errors++;
-            return -1;
-        }
-        sent += (size_t)n;
+    if (tcp_write_all(c, total) != 0) {
+        return -1;
     }
-
     c->bytes   += (uint64_t)len;
     c->packets += 1;
     return (int)len;

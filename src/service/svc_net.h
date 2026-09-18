@@ -75,6 +75,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "infra_netio.h"    /* infra_transport_t —— "传输方式"的唯一定义处 */
+
 /** 最多同时接受多少个客户端。槽位在 start 时一次性分配 */
 #define SVC_NET_MAX_CLIENTS 8
 
@@ -115,8 +117,10 @@ typedef struct {
      * 会话开始时被调用(PLAY 之后)。M1-9 用它把客户端挂到 RTP 发送路径上。
      *
      * @param client_index 客户端槽位下标(唯一标识一个客户端)
-     * @param rtp_dst      **该客户端的 RTP 目的地**(IP = 对端 IP, 端口 = SETUP 里
-     *                     协商到的 `client_port` 的 RTP 那一个)。这里**保证非 NULL**。
+     * @param tr           **该客户端的传输方式**(UDP 目的地 / TCP 交错的 fd+通道号)。
+     *                     这里**保证非 NULL**。上层据此决定建哪种 sender ——
+     *                     ⚠️ 别只盯着 `tr->rtp_dst`:TCP 交错时它的端口是 **0**,
+     *                     真正的目的地是 `tr->rtsp_fd` 那条连接。
      * @param user         `svc_net_cfg_t.user` 原样回传
      *
      * @note ⚠️ **为什么把目的地当参数传, 而不是让上层去查表**(2026-09-15):
@@ -131,7 +135,7 @@ typedef struct {
      * @note 在事件循环线程里被调用, **不要在里面做阻塞操作**。
      *       建 sender / 起线程这类事应当只做"记录", 真正的发送在别的线程。
      */
-    void      (*on_play)(int client_index, const struct sockaddr_in *rtp_dst,
+    void      (*on_play)(int client_index, const infra_transport_t *tr,
                          void *user);
     /** 会话结束时被调用(TEARDOWN / 断开 / 超时)。 */
     void      (*on_teardown)(int client_index, void *user);

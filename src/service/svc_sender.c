@@ -25,6 +25,7 @@
 #include "svc_media.h"          /* ★ 槽位布局(帧头魔数/大小/字段偏移)的唯一出处 */
 
 #include <pthread.h>
+#include <arpa/inet.h>  /* inet_ntoa —— 日志里打印 UDP 目的地 */
 #include <stddef.h>     /* offsetof —— 读帧头字段偏移 */
 #include <stdio.h>      /* fprintf —— 临时诊断用(SVC_SENDER_DEBUG) */
 #include <stdlib.h>
@@ -50,8 +51,9 @@
 typedef struct {
     int                 used;           /* 0 = 空闲 */
     int                 client_index;   /* svc_net 的槽位下标(唯一标识) */
-    struct sockaddr_in  dst;            /* RTP 目的地(IP + 端口) */
-    infra_sender_t     *sender;         /* ADR-1 的发送抽象(UDP 实现) */
+    struct sockaddr_in  dst;            /* UDP 目的地(TCP 交错时端口是 0, 无意义) */
+    int                 is_tcp;         /* 1 = 该客户端走 RTP over TCP 交错 */
+    infra_sender_t     *sender;         /* ADR-1 的发送抽象(UDP / TCP 交错两种实现) */
     proto_rtp_session_t rtp;            /* 本客户端独立的 RTP 会话状态 */
     int                 waiting_idr;    /* 1 = 还没遇到关键帧, 先跳过 */
     uint64_t            frames_sent;    /* 本客户端已发帧数(诊断用) */
@@ -202,6 +204,30 @@ typedef struct {
     int                  total;         /* 本帧 NALU 总数 */
 } fanout_ctx_t;
 
+/**
+ * @brief 把一个 RTP 包交给**该客户端的 sender**(UDP 或 RTP over TCP 交错)
+ *
+ * @param user 指向 `sender_client_t`
+ * @param pkt  完整 RTP 包
+ * @param len  字节数
+ * @return 0 成功; 负值失败(会让本帧标记为失败)
+ *
+ * @note ★ 这里就是 2026-09-18 修的那个 bug 的关键:原来 `emit()` 直接调
+ *       `proto_rtp_send_nalu()`(**里面自己 `sendto`**), 于是"传输抽象"被绕过 ——
+ *       新建的 TCP 交错 sender 建了却**从不被调用**, 客户端勾"以 TCP 播放"
+ *       就一帧都发不出去。改成走 `sender->send()` 之后, UDP 与 TCP 交错
+ *       才真正共用同一条数据路径(ADR-1 的承诺这才算兑现)。
+ */
+static int sender_pkt_cb(void *user, const uint8_t *pkt, size_t len)
+{
+    sender_client_t *cli = (sender_client_t *)user;
+
+    if (cli->sender == NULL) {
+        return -1;
+    }
+    return (cli->sender->send(cli->sender->ctx, pkt, len) < 0) ? -1 : 0;
+}
+
 /** @brief 真正发一个 NALU(带 is_last 判断) */
 static void emit(fanout_ctx_t *fc, const proto_nalu_t *n, int is_last)
 {
@@ -210,10 +236,7 @@ static void emit(fanout_ctx_t *fc, const proto_nalu_t *n, int is_last)
     if (fc->failed)
         return;
 
-    npkt = proto_rtp_send_nalu(g.sockfd,
-                               (const struct sockaddr *)&fc->cli->dst,
-                               sizeof(fc->cli->dst),
-                               fc->rtp, n, is_last);
+    npkt = proto_rtp_pack_nalu(fc->rtp, n, is_last, sender_pkt_cb, fc->cli);
     if (npkt < 0) {
         fc->failed = 1;
         return;
@@ -458,11 +481,51 @@ static void *sender_thread(void *arg)
 
 /* ═══════════════ ⑤ 对接 svc_net 的两个入口 ═══════════════ */
 
-int svc_sender_add_client(int client_index, const struct sockaddr_in *rtp_dst)
+/**
+ * @brief 按客户端传来的**传输方式**建对应的 sender
+ *
+ * @param[in] tr 传输方式(由 `svc_net` 在 PLAY 时给出, 非 NULL)
+ * @return sender;NULL = 建失败
+ *
+ * @note ★ 这里就是 2026-09-18 修掉的那个 bug 的修复点:原来**不管什么传输方式都建
+ *       UDP sender** —— 于是 SETUP 协商成 TCP 交错后, 程序往"RTP 端口 0"发 UDP,
+ *       客户端一帧都收不到(`发送帧数`冻结、失败计数以约 20/秒增长)。
+ *       TCP 交错那份实现(`infra_sender_tcp_interleaved()`)其实早就写好了,
+ *       只是**从来没人调用** —— 典型的"功能写完了没接线"。
+ */
+static infra_sender_t *make_sender(const infra_transport_t *tr)
+{
+    if (tr->is_tcp) {
+        return infra_sender_tcp_interleaved(tr->rtsp_fd, tr->rtp_channel);
+    }
+    return infra_sender_udp(&tr->rtp_dst, g.sockfd);
+}
+
+/**
+ * @brief 打一行"客户端加入发送"的日志(区分 TCP 交错 / UDP)
+ *
+ * @param idx 客户端槽位下标
+ * @param tr  传输方式
+ *
+ * @note 抽出来纯粹是为了让 `svc_sender_add_client()` 不超"函数 ≤ 50 行"的硬约束。
+ */
+static void log_client_joined(int idx, const infra_transport_t *tr)
+{
+    if (tr->is_tcp) {
+        LOG_INFO("client%d 加入发送(TCP 交错 fd=%d 通道=%u, 等 IDR)",
+                 idx, tr->rtsp_fd, (unsigned)tr->rtp_channel);
+    } else {
+        LOG_INFO("client%d 加入发送(UDP %s:%u, 等 IDR)", idx,
+                 inet_ntoa(tr->rtp_dst.sin_addr),
+                 (unsigned)ntohs(tr->rtp_dst.sin_port));
+    }
+}
+
+int svc_sender_add_client(int client_index, const infra_transport_t *tr)
 {
     int i;
 
-    if (rtp_dst == NULL)
+    if (tr == NULL)
         return -1;
     if (!g.running)
         return -1;
@@ -472,15 +535,17 @@ int svc_sender_add_client(int client_index, const struct sockaddr_in *rtp_dst)
     /* 已存在(同一槽位重复 PLAY)→ 更新目的地, 不新占槽位、不重置会话 */
     for (i = 0; i < SVC_SENDER_MAX_CLIENTS; i++) {
         if (g.clients[i].used && g.clients[i].client_index == client_index) {
-            g.clients[i].dst = *rtp_dst;
+            g.clients[i].dst    = tr->rtp_dst;
+            g.clients[i].is_tcp = tr->is_tcp;
             if (g.clients[i].sender != NULL) {
                 infra_sender_t *old = g.clients[i].sender;
 
                 old->destroy(&old);
             }
-            g.clients[i].sender = infra_sender_udp(rtp_dst, g.sockfd);
+            g.clients[i].sender = make_sender(tr);
             pthread_mutex_unlock(&g.lock);
-            LOG_INFO("client%d 更新 RTP 目的地", client_index);
+            LOG_INFO("client%d 更新传输方式(%s)", client_index,
+                     tr->is_tcp ? "TCP 交错" : "UDP");
             return 0;
         }
     }
@@ -499,19 +564,19 @@ int svc_sender_add_client(int client_index, const struct sockaddr_in *rtp_dst)
     memset(&g.clients[i], 0, sizeof(g.clients[i]));
     g.clients[i].used         = 1;
     g.clients[i].client_index = client_index;
-    g.clients[i].dst          = *rtp_dst;
+    g.clients[i].dst          = tr->rtp_dst;
+    g.clients[i].is_tcp       = tr->is_tcp;
     g.clients[i].waiting_idr  = 1;  /* ★ 从 IDR 开始 —— 见 svc_sender.h 设计决定② */
     /* 两个客户端的 RTP 初值必须不同, 否则序列号/SSRC 会撞 */
     proto_rtp_session_init(&g.clients[i].rtp, g.is_h265,
                            (uint32_t)time(NULL) ^ ((uint32_t)client_index * 2654435761u),
                            30);
-    g.clients[i].sender = infra_sender_udp(rtp_dst, g.sockfd);
+    g.clients[i].sender = make_sender(tr);
 
     g.stats.clients_joined++;
     pthread_mutex_unlock(&g.lock);
 
-    LOG_INFO("client%d 加入发送(RTP 端口 %u, 等 IDR)",
-             client_index, (unsigned)ntohs(rtp_dst->sin_port));
+    log_client_joined(client_index, tr);
     return 0;
 }
 

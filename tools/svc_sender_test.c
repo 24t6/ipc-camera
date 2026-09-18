@@ -190,6 +190,26 @@ static uint32_t rtp_ssrc(const uint8_t *p)     { return ((uint32_t)p[8] << 24) |
 static int      rtp_marker(const uint8_t *p)   { return (p[1] & 0x80) ? 1 : 0; }
 static int      rtp_pt(const uint8_t *p)       { return p[1] & 0x7F; }
 
+/**
+ * 测试辅助:本测试**全是 UDP**, 这里包一层省得每处都写 transport。
+ *
+ * @param idx 客户端槽位下标
+ * @param dst UDP 目的地;传 NULL 用于测"参数非法"那条分支
+ * @return 同 `svc_sender_add_client()`
+ */
+static int add_udp_client(int idx, const struct sockaddr_in *dst)
+{
+    infra_transport_t tr;
+
+    if (dst == NULL) {
+        return svc_sender_add_client(idx, NULL);    /* 测参数校验 */
+    }
+    memset(&tr, 0, sizeof(tr));
+    tr.is_tcp  = 0;
+    tr.rtp_dst = *dst;
+    return svc_sender_add_client(idx, &tr);
+}
+
 /* ─────────────────── 主流程 ─────────────────── */
 
 int main(void)
@@ -245,7 +265,7 @@ int main(void)
         }
 
         /* 客户端加入 —— 此时队列里已有 P 帧 */
-        check("add_client 返回 0", svc_sender_add_client(0, &dst) == 0, NULL);
+        check("add_client 返回 0", add_udp_client(0, &dst) == 0, NULL);
         check("客户端数为 1", svc_sender_client_count() == 1, NULL);
 
         /* 等一会儿: 队列里那 2 个 P 帧应当被**跳过**(不发) */
@@ -321,8 +341,8 @@ int main(void)
                 ;
         }
 
-        check("add client 1", svc_sender_add_client(1, &d1) == 0, NULL);
-        check("add client 2", svc_sender_add_client(2, &d2) == 0, NULL);
+        check("add client 1", add_udp_client(1, &d1) == 0, NULL);
+        check("add client 2", add_udp_client(2, &d2) == 0, NULL);
 
         /*
          * ⚠️ 取样前必须**先把两个 socket 排空**。
@@ -475,7 +495,7 @@ int main(void)
         struct sockaddr_in d;
 
         check("add_client(NULL) 返回 -1",
-              svc_sender_add_client(3, NULL) == -1, NULL);
+              add_udp_client(3, NULL) == -1, NULL);
         check("remove 不存在的客户端是安全的(no-op)", 1, NULL);
         svc_sender_remove_client(99);
         check("remove(NULL 概念) 后计数仍为 0",
@@ -486,9 +506,9 @@ int main(void)
             int fd = make_rx(&d);
 
             g_rx_fd = fd;
-            check("首次 add", svc_sender_add_client(4, &d) == 0, NULL);
+            check("首次 add", add_udp_client(4, &d) == 0, NULL);
             check("重复 add 同一 index 返回 0",
-                  svc_sender_add_client(4, &d) == 0, NULL);
+                  add_udp_client(4, &d) == 0, NULL);
             check("★ 重复 add 不新增槽位(仍为 1)",
                   svc_sender_client_count() == 1, NULL);
             svc_sender_remove_client(4);
