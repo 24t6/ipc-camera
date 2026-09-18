@@ -3,6 +3,12 @@
 推流端:Hi3516DV300 + 海思 MPP(VI→VPSS→VENC)+ 自研 RTSP/RTP 服务端
 拉流端:PC(Qt + FFmpeg)
 
+> **当前进度 / 关键决策 / 已知问题 → [`docs/STATUS.md`](docs/STATUS.md)**
+> 规划与验收标准 → [`docs/PROJECT_PLAN.md`](docs/PROJECT_PLAN.md) ·
+> 架构 → [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) ·
+> 代码规范 → [`docs/CODING_STYLE.md`](docs/CODING_STYLE.md) ·
+> 行业调研笔记(133 条来源) → [`docs/research/`](docs/research/)
+
 ---
 
 ## 一、硬件与系统
