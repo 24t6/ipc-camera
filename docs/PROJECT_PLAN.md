@@ -114,13 +114,13 @@ GC2053 ─MIPI CSI─→ VI ─→ VPSS ─┬─→ VENC ch0 (H.265 1080p30)
 | M1-1 | 定位取流路径 | ✅ 完成 |
 | M1-2 | `nalu.c` Annex-B 解析 | ✅ 完成 + 验证 |
 | M1-3 | `rtp.c` RTP 打包 + FU-A 分片 | ✅ 完成 + 验证 |
-| M1-4 | `sdp.c` SDP 会话描述生成 | ⏳ 下一步 |
-| M1-5 | `rtsp.c` RTSP 状态机 | ⏳ |
-| M1-6 | `net_loop.c` epoll 事件循环 + 客户端管理 | ⏳ |
-| M1-7 | `queue.c` 线程安全环形队列 | ⏳ |
-| M1-8 | `main.c` 集成到 MPP 取流线程 | ⏳ |
-| M1-9 | VLC 联调(核心难点) | ⏳ |
-| M1-10 | 多客户端支持 | ⏳ |
+| M1-4 | `sdp.c` SDP 会话描述生成 | ✅ 完成(`proto_sdp.c`) |
+| M1-5 | `rtsp.c` RTSP 状态机 | ✅ 完成(`proto_rtsp.c`) |
+| M1-6 | `net_loop.c` epoll 事件循环 + 客户端管理 | ✅ 完成(`infra_poll.c` + `svc_net.c`) |
+| M1-7 | `queue.c` 线程安全环形队列 | ✅ 完成(`infra_queue.c`) |
+| M1-8 | `main.c` 集成到 MPP 取流线程 | ✅ 完成(`app_main.c` + `svc_media.c`) |
+| M1-9 | VLC 联调(核心难点) | ✅ 完成(`ffprobe` RC=0;过程中的坑见 B017/B027) |
+| M1-10 | 多客户端支持 | ✅ 完成(槽位/空闲超时;**M1-11 用第二个客户端实测仍未做**) |
 
 **M1-4 SDP 是最大风险点**。SDP 写错一个字段 VLC 直接"无法播放"。要用实测数据填:
 
