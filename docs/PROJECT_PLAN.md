@@ -217,7 +217,7 @@ GC2053 ─MIPI CSI─→ VI ─→ VPSS ─┬─→ VENC ch0 (H.265 1080p30)
 | **掉电时正在写的段** | ffmpeg 官方:普通 MP4"未正常结束即不可解码";fMP4(`moof`)可中断解码;GStreamer `qtmux` 有 Robust Muxing(开头预留 header + 周期重写) | ✅ **已实现旁路裸流侧车**。实测(5 组对照):决定"截断后能否播"的是**文件里有没有索引**,不是 `moov` 在不在末尾 —— 无 `moov`=0 帧、fMP4=300/600、**裸流 Annex-B=301/600**。上板实测:`kill -9` 后残段报 `moov atom not found`(0 帧),而**同内容的侧车解出 315 帧**。**不换 fMP4**:mp4v2 结构上不支持(14 个头文件里 `moof/mvex/tfhd` 零命中),收益与裸流相同 |
 | **分段边界** | ffmpeg `segment` muxer 官方原文:新段从"指定时间**之后第一个关键帧**"开始 ⇒ 不丢帧但段会变长 | ✅ **与 B033 的修法完全一致**(我们独立踩出来, ffmpeg 是同一个解法) |
 | **分段依据** | 海康 SDK 是**按字节切**(`i64FileSize`、`byNotSplitRecordFile` 默认 0);FAT32 单文件上限 2^32−1 ≈ 4 GiB(Microsoft 官方) | 已按时间切;**补"按大小也切"**(时间到或大小到, 谁先到算谁) |
-| **卡满(策略)** | Milestone `Classic`(删最旧)/`Evidence collection`(停录保全);海康"循环写入"复选框;TP-LINK 列为**持续报警** | 保留环形覆盖;**补 `-no-overwrite`**(写满即停 + 状态显式) |
+| **卡满(策略)** | Milestone `Classic`(删最旧)/`Evidence collection`(停录保全);海康"循环写入"复选框;TP-LINK 列为**持续报警** | ✅ **选定"覆盖最旧"** —— 等价于 Milestone 的 `Classic` / 海康"循环写入"的勾选态:**满了就删最旧腾地方**。**不做"写满即停"**(那是 Evidence collection 路线, 本项目选择"最新可用")。实测见 A5(环形覆盖)与 A10(小盘上自动清理、录制不停) |
 | **清理水位** | ⚠️ **"预留 xx%"不是跨厂商统一参数**(所有"不超过 80%"都出自容量规划建议)。有具体值的是开源实现:ZoneMinder 出厂 `DiskPercent>=95` + 删最旧;Frigate 用"剩余不足约 1 小时录像量" | 改成**保底"剩余 ≥ 一段大小"**(自洽、无魔数)+ **写失败时立即清理**(ZoneMinder/Frigate 都是周期轮询,**没人专门处理"段中间盘满"**, 这一步超出开源实践) |
 | **正在写的那段** | Axis 边存官方:正在写的是 `recording.tmp`,写完才转正 | ✅ **已实现**:写 `<stamp>.mp4.tmp` → `MP4Close` 成功后 `rename` 成 `.mp4`;启动清残留 `*.tmp`。目录扫描只认 `.mp4` ⇒ 半成品不进环形容量、不进检索列表,断电残留一眼可辨 |
 | **单段保护** | 海康手册:检索结果可**锁定, 锁定后不会被覆盖**;ISAPI 的 `mediaSegmentDescriptor` 带 `lockStatus` | **补:锁定段跳过环形删除**(纯函数加一条规则) |
