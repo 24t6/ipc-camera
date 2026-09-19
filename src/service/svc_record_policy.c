@@ -118,3 +118,15 @@ int svc_record_policy_plan_delete(const svc_record_policy_file_t *files, int cou
     }
     return n;
 }
+
+int svc_record_policy_should_close(uint32_t frames_in_seg, uint32_t segment_frames,
+                                   uint64_t bytes_in_seg, uint64_t segment_bytes)
+{
+    if (segment_frames > 0 && frames_in_seg >= segment_frames) {
+        return 1;               /* 时间(帧数)到了 */
+    }
+    if (segment_bytes > 0 && bytes_in_seg >= segment_bytes) {
+        return 1;               /* 大小到了 */
+    }
+    return 0;
+}

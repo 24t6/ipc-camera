@@ -80,4 +80,28 @@ int svc_record_policy_plan_delete(const svc_record_policy_file_t *files, int cou
                               const svc_record_policy_limits_t *lim,
                               int *del_idx, int del_cap);
 
+/**
+ * @brief 分段"该收了吗" —— **时间到 或 大小到, 谁先到算谁**(纯函数)
+ *
+ * @param[in] frames_in_seg   本段**已真正写进文件**的帧数
+ * @param[in] segment_frames  帧数上限;**0 = 不限**
+ * @param[in] bytes_in_seg    本段**已真正写进文件**的码流字节数
+ * @param[in] segment_bytes   字节数上限;**0 = 不限**
+ * @return 1 = 该收段了; 0 = 继续写
+ *
+ * @note ★ **为什么要有大小这一维**:TF 卡是 vfat(FAT32), **单文件硬上限 4 GiB**。
+ *       只按时间切时, 段大小是"时长 × 码率"的结果 —— 而码率会随画面内容浮动
+ *       (静态画面约 4 Mbps, 暗光/噪声大的画面能翻好几倍)。30 分钟段一旦超过 4 GiB,
+ *       写入就会在**段中间**失败。加一条大小上限, 让文件大小有**确定性上界**。
+ * @note 两个条件都是 `>=`:`should_close` 由调用方在**写完这一帧之后**调用,
+ *       "刚好到达上限"也该收段。
+ * @note ⚠️ **它只回答"该收了", 不决定"什么时候收"** —— 真正的切段必须等
+ *       下一个关键帧(IDR), 否则新段建不了轨、刀口上还会丢帧(见 B033 与
+ *       `svc_record.c` 的 `handle_slot()`)。所以实际段长会比上限**多出一个 GOP 的零头**。
+ * @note 传入的必须是**产物计数**(真正落盘的帧/字节), 不是"处理过多少"
+ *       —— 口径错了这个函数就是在给假数据下判断(B033 的教训)。
+ */
+int svc_record_policy_should_close(uint32_t frames_in_seg, uint32_t segment_frames,
+                                   uint64_t bytes_in_seg, uint64_t segment_bytes);
+
 #endif /* __SVC_RECORD_POLICY_H__ */

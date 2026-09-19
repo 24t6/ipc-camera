@@ -170,12 +170,50 @@ static void test_ring_edges(void)
     CHECK(svc_record_policy_plan_delete(f, 0, &lim, del, 8) == 0, "0 个文件应返回 0");
 }
 
+/**
+ * @brief 分段"该收了吗" —— 时间到 **或** 大小到(谁先到算谁)
+ *
+ * @note 重点测**两个条件互相独立**:只到时间 / 只到大小 / 都到 / 都没到;
+ *       以及"0 = 不限"这条约定(否则 `-s 0` 或 `-m 0` 会被误判成"立刻收段")。
+ */
+static void test_should_close(void)
+{
+    const uint32_t F = 54000;                    /* 30 分钟 × 30fps */
+    const uint64_t B = 1024ULL * 1024 * 1024;    /* 1 GiB */
+
+    printf("\n[3] 分段该收了吗(时间 OR 大小)\n");
+
+    /* 都没到 → 继续写 */
+    CHECK(svc_record_policy_should_close(100, F, 1000, B) == 0, "都没到不该收段");
+    /* 时间到(边界是 >=) */
+    CHECK(svc_record_policy_should_close(F - 1, F, 0, B) == 0, "差一帧不该收段");
+    CHECK(svc_record_policy_should_close(F, F, 0, B) == 1, "刚好到帧数上限应收段");
+    CHECK(svc_record_policy_should_close(F + 29, F, 0, B) == 1, "超过帧数上限应收段");
+    /* 大小到 */
+    CHECK(svc_record_policy_should_close(0, F, B - 1, B) == 0, "差一字节不该收段");
+    CHECK(svc_record_policy_should_close(0, F, B, B) == 1, "刚好到大小上限应收段");
+    /* 只到大小、帧数远没到 —— 这是新增的那一维, 必须能单独触发 */
+    CHECK(svc_record_policy_should_close(500, F, B + 1, B) == 1,
+          "帧数远没到、但大小到了, 也该收段");
+    /* 两个都到 */
+    CHECK(svc_record_policy_should_close(F, F, B, B) == 1, "两个都到应收段");
+    /* 0 = 该项不限(⚠️ 注意: 要把**另一维**给到上限才能验证"这一维不再拦" ——
+     *   第一版这两条断言我把参数填反了, 于是"测试失败"其实是**测试写错了**) */
+    CHECK(svc_record_policy_should_close(F + 1, 0, B, B) == 1,
+          "帧数不限(0)时, 仍能由大小触发");
+    CHECK(svc_record_policy_should_close(F, F, B * 100, 0) == 1,
+          "大小不限(0)时, 仍能由时间触发");
+    CHECK(svc_record_policy_should_close(100, 0, 1000, 0) == 0,
+          "两个都不限 ⇒ 永不自动收段(只能靠停机收尾)");
+}
+
 int main(void)
 {
     printf("==== 录制策略(纯函数)PC 单测 ====\n");
     test_name();
     test_ring();
     test_ring_edges();
+    test_should_close();
 
     printf("\n==== 结果: %d 通过 / %d 失败 ====\n", g_pass, g_fail);
     return (g_fail == 0) ? 0 : 1;

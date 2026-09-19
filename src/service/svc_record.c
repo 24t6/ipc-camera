@@ -61,7 +61,9 @@ static struct {
     int              have_sps;
     int              have_pps;
     int              frames_in_seg;
-    int              want_close;                  /* 1 = 已达段长, 等下一个 IDR 再切 */
+    int              want_close;                  /* 1 = 已达段长/段大小, 等下一个 IDR 再切 */
+    uint64_t         bytes_in_seg;                /* 本段**已真正落盘**的码流字节数 */
+    uint64_t         segment_bytes;               /* 每段字节上限;0 = 不限 */
     char             cur_name[SVC_RECORD_POLICY_NAME_MAX];
 
     /* ★ 分段的三条路径 + 旁路裸流(生命周期见 svc_record.h 顶部那段注释) */
@@ -266,12 +268,21 @@ static void enforce_limits(void)
  *       (静态画面 4 Mbps, 噪声大的画面能翻好几倍)。用上一段当预留会**偏紧** ——
  *       实测在 24 MB 小盘上, "上一段大小"当预留时每段末尾都撞一次 ENOSPC(75 秒里
  *       876 次写失败)。改用历史最大值, 再留 25% 余量。
- * @note 一次都没写过时用 `SVC_RECORD_HEADROOM_MIN`。
+ * @note ★ 一旦设了**段大小上限**(`-m`, 默认 1024 MB), 就直接用那个上限当基准 ——
+ *       它才是"一段最坏多大"的**确定性上界**, 比历史最大值更硬。
+ * @note 一次都没写过、也没设上限时用 `SVC_RECORD_HEADROOM_MIN`。
  */
 static uint64_t headroom_bytes(void)
 {
-    uint64_t base = (g.max_seg_bytes > 0) ? g.max_seg_bytes
-                                          : SVC_RECORD_HEADROOM_MIN;
+    uint64_t base;
+
+    /* ★ 设了段大小上限时,**上限本身就是"一段最坏多大"的确定性上界** ——
+     *   比"见过的最大段"更硬(历史最大值只覆盖见过的画面复杂度)。 */
+    if (g.segment_bytes > 0) {
+        base = g.segment_bytes;
+    } else {
+        base = (g.max_seg_bytes > 0) ? g.max_seg_bytes : SVC_RECORD_HEADROOM_MIN;
+    }
 
     if (g.raw_sidecar) {
         /* ★ 开了侧车, "写一段"期间要同时占 **两份**地方(MP4 + 裸流) ——
@@ -514,6 +525,7 @@ static int open_segment(void)
     g.have_sps      = 0;
     g.have_pps      = 0;
     g.frames_in_seg = 0;
+    g.bytes_in_seg  = 0;
     g.want_close    = 0;
     LOG_INFO("录制: 开始新分段 %s(%dx%d, 旁路裸流 %s)",
              g.cur_name, g.width, g.height, (g.raw != NULL) ? "开" : "关");
@@ -546,11 +558,16 @@ static void close_segment(void)
     }
     note_seg_size();                               /* 记住本段大小(下段的预留依据) */
     g.stats.segments++;
-    LOG_INFO("录制: 分段收尾 %s(%d 帧, 共 %llu 段, 裸流 %llu 字节/错 %llu)",
+    /* ★ 日志里同时报"计数"和"**实际文件大小**":两者不一致就说明我的口径错了
+     *   (B033 的教训)—— 差别应该只是 MP4 封装开销 + 等 IDR 的零头, 几 % 量级 */
+    LOG_INFO("录制: 分段收尾 %s(%d 帧, 码流 %llu 字节 / 实际文件 %llu 字节, "
+             "段上限 %llu 帧·%llu 字节, 共 %llu 段)",
              g.cur_name, g.frames_in_seg,
-             (unsigned long long)g.stats.segments,
-             (unsigned long long)g.stats.raw_bytes,
-             (unsigned long long)g.stats.raw_errors);
+             (unsigned long long)g.bytes_in_seg,
+             (unsigned long long)file_size_of(g.cur_name),
+             (unsigned long long)g.segment_frames,
+             (unsigned long long)g.segment_bytes,
+             (unsigned long long)g.stats.segments);
     g.stats.cur_name[0] = '\0';
     enforce_limits();
 }
@@ -679,6 +696,8 @@ static void write_sample(const proto_nalu_t *n, int is_key)
         }
     }
     g.stats.bytes_written += n->len;
+    /* ★ 本段字节计数也只加**真正写成功**的那些 —— 分段大小判据要用它(B033 的口径教训) */
+    g.bytes_in_seg += n->len;
 }
 
 /**
@@ -717,6 +736,23 @@ static int on_nalu_cb(const proto_nalu_t *n, void *user)
         write_sample(n, n->is_key);
     }
     return 0;
+}
+
+/**
+ * @brief "本段到点了没有" —— 把纯函数 `svc_record_policy_should_close()` 的调用收在一处
+ *
+ * @return 1 = 该收段(时间到**或**大小到); 0 = 继续写
+ *
+ * @note 抽出来是为了**避免深续行**:7 个参数的嵌套转换直接写在 `if (...)` 里,
+ *       续行会缩进到 9 层, 被 `check_style.py` 判超 §9.1(≤5 层)。
+ * @note 传进去的是**产物计数**(`bytes_in_seg` 只在写入成功时累加), 不是"处理过多少"。
+ */
+static int seg_should_close(void)
+{
+    uint32_t frames = (uint32_t)g.frames_in_seg;
+    uint32_t segf   = (uint32_t)g.segment_frames;
+
+    return svc_record_policy_should_close(frames, segf, g.bytes_in_seg, g.segment_bytes);
 }
 
 /**
@@ -773,10 +809,10 @@ static void handle_slot(size_t len)
     }
     /* ★ 旁路裸流:把**整帧 Annex-B** 也写一份 —— 掉电/强杀后这份截断也能解 */
     write_raw_frame(data, (uint32_t)h->len);
-    /* ★ 只统计**真正落盘**的帧 —— 让日志里的帧数等于文件里的帧数(B033 的教训) */
+    /* ★ 只统计**真正落盘**的帧与字节 —— 让判据的数字来自产物, 不是"处理过的动作"(B033) */
     g.frames_in_seg++;
     g.stats.frames_written++;
-    if (g.segment_frames > 0 && g.frames_in_seg >= g.segment_frames) {
+    if (seg_should_close()) {
         g.want_close = 1;               /* 不立刻关:等下一个 IDR 再切 */
     }
 }
@@ -1031,6 +1067,36 @@ static void *record_thread(void *arg)
 
 /* ─────────── 对外接口 ─────────── */
 
+/**
+ * @brief 配置校验:把"能配但会出事"的组合**在启动时就喊出来**
+ *
+ * @note 两条都是**本项目踩过/写过文档的陷阱**, 但不该靠人记得:
+ *       ① 段大小上限逼近 4 GiB —— vfat(FAT32)单文件上限是 4 GiB, 写到一半会失败;
+ *       ② 环形容量上限比"一段"还小 —— 每满一段就删上一段, **环形覆盖会静默退化成
+ *          "只留一段"**(见 `svc_record_policy.h` 与面试问答 Q42)。
+ * @note 只**告警不改行为**:配置是操作者的决定, 程序不替他改(规矩:不夸大、不越权)。
+ */
+static void warn_cfg(void)
+{
+    /* ⚠️ 注意这里**没有**"段大小=0(不限)"那一条:配置里 0 表示"用默认 1024 MB",
+     *   所以进程里 `g.segment_bytes` **永远 > 0** —— 大小上限**故意不提供"关闭"**。
+     *   理由:vfat 单文件 4 GiB 是硬约束, 关掉它只会在段中间写失败;
+     *   真要放宽就设一个接近上限的值, 下面会告警。 */
+    if (g.segment_bytes > SVC_RECORD_FAT32_MAX_FILE / 4 * 3) {
+        LOG_ERROR("录制: 段大小上限 %llu 字节 > FAT32 单文件上限的 3/4(%llu 字节)"
+                  " —— 加上封装开销有冲破上限的风险, 建议不超过 3 GB",
+                  (unsigned long long)g.segment_bytes,
+                  (unsigned long long)(SVC_RECORD_FAT32_MAX_FILE / 4 * 3));
+    }
+    if (g.limit_bytes > 0 && g.segment_bytes > 0 &&
+        g.limit_bytes < g.segment_bytes * 2) {
+        LOG_ERROR("录制: 环形上限 %llu MB < 一段上限的 2 倍(%llu MB)"
+                  " —— 每满一段就会删掉上一段, 环形覆盖会退化成\"只留一段\"",
+                  (unsigned long long)(g.limit_bytes / (1024 * 1024)),
+                  (unsigned long long)(g.segment_bytes * 2 / (1024 * 1024)));
+    }
+}
+
 int svc_record_start(const svc_record_cfg_t *cfg, void *queue)
 {
     if (g.running) {
@@ -1050,16 +1116,22 @@ int svc_record_start(const svc_record_cfg_t *cfg, void *queue)
     g.limit_files    = cfg->limit_files;
     g.segment_frames = (cfg->segment_frames > 0)
                        ? cfg->segment_frames : SVC_RECORD_DEFAULT_SEGMENT_FRAMES;
+    g.segment_bytes  = (cfg->segment_bytes > 0)
+                       ? cfg->segment_bytes
+                       : (uint64_t)SVC_RECORD_DEFAULT_SEGMENT_MB * 1024 * 1024;
     g.raw_sidecar    = (cfg->raw_sidecar != 0) ? 1 : 0;
     g.queue          = (infra_queue_t *)queue;
     g.mp4            = NULL;
     g.raw            = NULL;
+    g.bytes_in_seg   = 0;
     g.track          = MP4_INVALID_TRACK_ID;
     g.path_final[0]  = '\0';
     g.path_tmp[0]    = '\0';
     g.path_raw[0]    = '\0';
     g.stop_requested = 0;
     g.running        = 1;
+
+    warn_cfg();
 
     /* ★ 清掉上次异常退出留下的 *.tmp —— 必须在录制线程起来**之前**做, 免得抢名字 */
     cleanup_tmp_files();

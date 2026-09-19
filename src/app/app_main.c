@@ -143,6 +143,7 @@ typedef struct {
     int         no_raw;      /**< 1 = 不写旁路裸流侧车(默认写;掉电后可救前一段) */
     int         rec_mb;      /**< 环形容量上限(MB);0 = 不限 */
     int         rec_seg;     /**< 每段**秒数**;0 = 用默认(1800 秒 = 30 分钟) */
+    int         rec_seg_mb;  /**< 每段**大小上限**(MB);0 = 用默认(1024 MB) */
     int         verbose;
 } app_opts_t;
 
@@ -162,9 +163,12 @@ static void usage(const char *prog)
            "  -no-raw     不写旁路裸流侧车(默认写:掉电/强杀后能把前一段救回来)\n"
            "  -r <MB>     录制环形容量上限(默认 %d MB;0=不限)\n"
            "  -s <秒数>   每段多少秒后切新文件(默认 1800 = 30 分钟)\n"
+           "  -m <MB>     每段多少 MB 后切新文件(默认 %d MB;与 -s 谁先到算谁;\n"
+           "              0=用默认。⚠️ 这一维不能关 —— vfat 单文件上限 4 GiB)\n"
            "  -v          打开 DEBUG 日志\n"
            "  -h          显示本帮助\n",
-           prog, APP_DEFAULT_PORT, APP_REC_LIMIT_MB);
+           prog, APP_DEFAULT_PORT, APP_REC_LIMIT_MB,
+           SVC_RECORD_DEFAULT_SEGMENT_MB);
 }
 
 /**
@@ -188,15 +192,17 @@ static int parse_args(int argc, char **argv, app_opts_t *o)
     o->no_raw    = 0;
     o->rec_mb    = APP_REC_LIMIT_MB;
     o->rec_seg   = 0;
+    o->rec_seg_mb = 0;
     o->verbose   = 0;
 
-    while ((opt = getopt(argc, argv, "p:b:r:s:hv")) != -1) {
+    while ((opt = getopt(argc, argv, "p:b:r:s:m:hv")) != -1) {
         switch (opt) {
-        case 'p': o->port    = (uint16_t)atoi(optarg); break;
-        case 'b': o->bind_ip = optarg;                 break;
-        case 'r': o->rec_mb  = atoi(optarg);           break;
-        case 's': o->rec_seg = atoi(optarg);           break;
-        case 'v': o->verbose = 1;                      break;
+        case 'p': o->port       = (uint16_t)atoi(optarg); break;
+        case 'b': o->bind_ip    = optarg;                 break;
+        case 'r': o->rec_mb     = atoi(optarg);           break;
+        case 's': o->rec_seg    = atoi(optarg);           break;
+        case 'm': o->rec_seg_mb = atoi(optarg);           break;
+        case 'v': o->verbose    = 1;                      break;
         case 'h': return 2;
         default:  return 1;
         }
@@ -370,6 +376,9 @@ static int start_record(const app_opts_t *o, int *started)
     rec.limit_bytes    = (o->rec_mb > 0) ? (uint64_t)o->rec_mb * 1024 * 1024 : 0;
     rec.limit_files    = 0;
     rec.segment_frames = o->rec_seg * SVC_RECORD_FPS;   /* 命令行给的是秒 */
+    /* 命令行给的是 MB;0 = 交给 svc_record 用默认值(1024 MB) */
+    rec.segment_bytes  = (o->rec_seg_mb > 0)
+                         ? (uint64_t)o->rec_seg_mb * 1024 * 1024 : 0;
     rec.raw_sidecar    = o->no_raw ? 0 : 1;             /* 默认写:掉电/强杀后能救回前一段 */
 
     if (svc_record_start(&rec, g_record_queue) != 0) {
@@ -378,9 +387,11 @@ static int start_record(const app_opts_t *o, int *started)
         return -2;
     }
     *started |= 16;
-    printf("录制      : %s · %dx%d · 每段 %d 秒 · 上限 %d MB · 旁路裸流 %s\n",
+    printf("录制      : %s · %dx%d · 每段 %d 秒 或 %d MB(谁先到算谁, 边界对齐关键帧)"
+           " · 环形上限 %d MB · 旁路裸流 %s\n",
            APP_REC_DIR, w, h,
            (o->rec_seg > 0) ? o->rec_seg : SVC_RECORD_DEFAULT_SEGMENT_SEC,
+           (o->rec_seg_mb > 0) ? o->rec_seg_mb : SVC_RECORD_DEFAULT_SEGMENT_MB,
            o->rec_mb, o->no_raw ? "关" : "开");
     return 0;
 }
