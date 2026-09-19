@@ -36,6 +36,7 @@
 typedef struct {
     char     name[SVC_RECORD_POLICY_NAME_MAX];  /**< 文件名(只比较, 不解析) */
     uint64_t size;                          /**< 字节数 */
+    int      locked;                        /**< 1 = 被用户**锁定**, 环形覆盖必须跳过它 */
 } svc_record_policy_file_t;
 
 /** 环形覆盖的两个上限。**填 0 表示该项不限** */
@@ -75,6 +76,14 @@ int svc_record_policy_make_name(const struct tm *tmv, char *out, size_t cap);
  *
  * @note 只**给出决策**, 不执行删除 —— 删文件是 I/O, 由调用方做。
  *       这样这个函数保持纯的、可 PC 单测。
+ *
+ * @note ★ **被锁定的分段永不删除**(`files[i].locked == 1`)—— 这是监控行业的通用语义:
+ *       海康:检索结果可**锁定, 锁定后不会被覆盖**;ISAPI 的 `mediaSegmentDescriptor`
+ *       带 `lockStatus` 字段。跳过锁定的那一个之后,**继续看下一个最旧的**,
+ *       而不是"遇到锁就放弃清理"。
+ * @note ⚠️ 因此会出现"**能删的都删完了还是超限**"的情况(全被锁定)⇒ 本函数只返回
+ *       实际能删的个数, **不做自动解锁**:锁代表用户的意图, 程序不替他改。
+ *       调用方(见 `svc_record.c` 的 `apply_limits()`)在"超限却无段可删"时**明确报错**。
  */
 int svc_record_policy_plan_delete(const svc_record_policy_file_t *files, int count,
                               const svc_record_policy_limits_t *lim,

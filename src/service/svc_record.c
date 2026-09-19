@@ -119,6 +119,17 @@ static uint8_t g_rec_buf[SVC_RECOVER_CHUNK + SVC_RECORD_MAX_NALU];
 static svc_record_policy_file_t g_scan[SVC_RECORD_POLICY_MAX_FILES];
 static int                      g_del[SVC_RECORD_POLICY_MAX_FILES];
 
+/*
+ * 锁定清单(每行一个分段文件名)的内容
+ *   容量依据 : 最多 64 个 × 64 字节 = 4KB(策略层的名字上限)
+ *   内存区域 : **文件级静态** —— 放栈上会顶到 §6.3 的 4KB 线
+ *   唯一所有者: 本模块
+ *   释放时机 : 进程生命周期内常驻
+ */
+static char g_locks[SVC_RECORD_LOCK_MAX][SVC_RECORD_POLICY_NAME_MAX];
+static int  g_lock_count;
+static int  g_lock_logged = -1;      /* 上次报过的锁定个数(变了才再报一次) */
+
 /* ─────────── 文件名/路径小工具 ─────────── */
 
 /**
@@ -171,7 +182,102 @@ static uint64_t file_size_of(const char *name)
     return (stat(path, &st) == 0) ? (uint64_t)st.st_size : 0;
 }
 
-/* ─────────── 环形覆盖:扫描目录 + 执行删除 ─────────── */
+/* ─────────── 锁定清单(读) + 环形覆盖:扫描目录 + 执行删除 ─────────── */
+
+/**
+ * @brief 这个字符算不算"行尾空白"
+ *
+ * @param[in] c 字符
+ * @return 1 = 是; 0 = 不是
+ *
+ * @note 抽出来纯粹是为了**压缩进**:把四个 `||` 写在 `while` 条件里, 续行会到 6 层,
+ *       超 §9.1 的 5 层上限。
+ */
+static int is_line_blank(char c)
+{
+    return (c == '\n' || c == '\r' || c == ' ' || c == '\t') ? 1 : 0;
+}
+
+/**
+ * @brief 去掉行尾空白(换行/回车/空格/制表符), 原地改
+ *
+ * @param[in,out] line 以 '\0' 结尾的一行
+ * @return 去掉之后的有效长度
+ */
+static size_t trim_line_end(char *line)
+{
+    size_t n = strlen(line);
+
+    while (n > 0 && is_line_blank(line[n - 1])) {
+        line[--n] = '\0';
+    }
+    return n;
+}
+
+/**
+ * @brief 读一次锁定清单(`<dir>/.locked`, 每行一个分段文件名)
+ *
+ * @note 调用时机:每次扫描目录之前(= 每次分段收尾 / 提前腾空间时)。
+ *       **每次都重读**是故意的:阶段 2 的管理接口只要改这个文件, 这里立刻生效,
+ *       不需要任何进程内状态同步。
+ * @note 没有清单文件 = 一个都没锁, 是**正常情况**(不是错误)。
+ * @note 【简化上限】只读前 `SVC_RECORD_LOCK_MAX` 行, 超出的**明确告警**而不是静默丢弃。
+ */
+static void load_locks(void)
+{
+    char  path[SVC_RECORD_PATH_MAX];
+    char  line[SVC_RECORD_POLICY_NAME_MAX + 8];
+    FILE *fp;
+
+    g_lock_count = 0;
+    if (make_path(SVC_RECORD_LOCK_FILE, path, sizeof(path)) <= 0) {
+        return;
+    }
+    fp = fopen(path, "r");
+    if (fp == NULL) {
+        return;
+    }
+    while (fgets(line, sizeof(line), fp) != NULL) {
+        size_t n = trim_line_end(line);
+
+        if (n == 0 || line[0] == '#') {
+            continue;                   /* 空行 / 注释 */
+        }
+        if (g_lock_count >= SVC_RECORD_LOCK_MAX) {
+            LOG_ERROR("录制: 锁定清单超过 %d 行, 多出来的被忽略",
+                      SVC_RECORD_LOCK_MAX);
+            break;
+        }
+        snprintf(g_locks[g_lock_count], sizeof(g_locks[0]), "%s", line);
+        g_lock_count++;
+    }
+    fclose(fp);
+    if (g_lock_count != g_lock_logged) {
+        g_lock_logged = g_lock_count;
+        if (g_lock_count > 0) {
+            LOG_INFO("录制: 锁定清单里有 %d 个分段, 环形覆盖会跳过它们",
+                     g_lock_count);
+        }
+    }
+}
+
+/**
+ * @brief 这个名字在不在锁定清单里
+ *
+ * @param[in] name 文件名
+ * @return 1 = 已锁定; 0 = 没锁
+ */
+static int is_locked(const char *name)
+{
+    int i;
+
+    for (i = 0; i < g_lock_count; i++) {
+        if (strcmp(g_locks[i], name) == 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
 
 /**
  * @brief 扫描录制目录, 收集所有分段文件(排除**正在写的那个**)
@@ -193,16 +299,44 @@ static int scan_dir(svc_record_policy_file_t *files, int cap)
     if (d == NULL) {
         return -1;
     }
+    load_locks();                       /* ★ 每次都重读 —— 清单是唯一真相源 */
     while ((e = readdir(d)) != NULL && n < cap) {
         if (!name_is_mp4(e->d_name) || strcmp(e->d_name, g.cur_name) == 0) {
             continue;
         }
         snprintf(files[n].name, sizeof(files[n].name), "%s", e->d_name);
-        files[n].size = file_size_of(e->d_name);
+        files[n].size   = file_size_of(e->d_name);
+        files[n].locked = is_locked(e->d_name);      /* 锁定的, 环删会跳过 */
         n++;
     }
     closedir(d);
     return n;
+}
+
+/**
+ * @brief 这批文件是不是**已经超了**给定的上限(只看总量/个数, 不看锁定)
+ *
+ * @param[in] files 文件表
+ * @param[in] count 个数
+ * @param[in] lim   上限
+ * @return 1 = 超了; 0 = 没超
+ *
+ * @note 用途:当策略层算出"一个都不该删"(或没有可删的)时, 靠它区分两种情况 ——
+ *       "本来就没超" vs "**超了但删不动**(全被锁定 / 只剩一个)"。后者必须明确报错。
+ */
+static int limits_exceeded(const svc_record_policy_file_t *files, int count,
+                           const svc_record_policy_limits_t *lim)
+{
+    uint64_t total = 0;
+    int      i;
+
+    for (i = 0; i < count; i++) {
+        total += files[i].size;
+    }
+    if (lim->limit_bytes > 0 && total > lim->limit_bytes) {
+        return 1;
+    }
+    return (lim->limit_files > 0 && count > lim->limit_files) ? 1 : 0;
 }
 
 /**
@@ -227,6 +361,14 @@ static int apply_limits(const svc_record_policy_limits_t *lim)
     }
     n = svc_record_policy_plan_delete(g_scan, cnt, lim, g_del,
                                       SVC_RECORD_POLICY_MAX_FILES);
+    if (n == 0 && limits_exceeded(g_scan, cnt, lim)) {
+        /* 超了却一个都删不动:要么全被锁定, 要么只剩正在写的那个。
+         * ★ 如实报错, **不自动解锁**(锁是用户的意图), 也不停录制 ——
+         *   后面还有"写失败立即清理 + 重试一次"那条路兜着(见 A10)。 */
+        LOG_ERROR("录制: 已超环形上限但没有可删的分段(只剩正在写的那个, "
+                  "或全部被锁定 —— 锁定清单 %s); 请解锁或调大 -r, "
+                  "否则写入随时可能失败", SVC_RECORD_LOCK_FILE);
+    }
     for (i = 0; i < n; i++) {
         if (make_path(g_scan[g_del[i]].name, path, sizeof(path)) <= 0) {
             continue;

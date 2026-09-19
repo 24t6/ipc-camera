@@ -34,7 +34,8 @@ static int g_fail;
 static void mk(svc_record_policy_file_t *f, const char *name, uint64_t size)
 {
     snprintf(f->name, sizeof(f->name), "%s", name);
-    f->size = size;
+    f->size   = size;
+    f->locked = 0;      /* ★ 必须清掉:局部数组是栈上的垃圾值, 不清会让用例随机失败 */
 }
 
 /* ─────────── ① 文件名 ─────────── */
@@ -85,6 +86,63 @@ static void fill_shuffled(svc_record_policy_file_t *f)
     mk(&f[2], "2026-09-16-21-00-04.mp4", 10);
     mk(&f[3], "2026-09-16-21-00-01.mp4", 10);   /* 最旧 */
     mk(&f[4], "2026-09-16-21-00-03.mp4", 10);
+}
+
+/**
+ * @brief **锁定段保护**:被锁的分段环形覆盖必须跳过, 并且继续删下一个最旧的
+ *
+ * @note 这是"锁一个不影响清理其它"的核心语义 —— 反例(错的实现)是"遇到锁就 break",
+ *       那会导致:一个锁定段把整个环形清理**卡死**(盘满了却谁也不删)。
+ */
+static void test_lock(void)
+{
+    svc_record_policy_file_t   f[5];
+    svc_record_policy_limits_t lim;
+    int                        del[8];
+    int                        n;
+
+    printf("\n[4] 锁定段保护(锁定的跳过, 但继续删下一个最旧的)\n");
+
+    /* ① 锁住**最旧**的那个:上限 30(总量 50)本该删 2 个 ⇒
+     *    现在应改成删 -02 和 -03, 而 -01(锁定)**一个字节都不许动** */
+    fill_shuffled(f);
+    f[3].locked = 1;                            /* f[3] = 21-00-01, 最旧 */
+    memset(&lim, 0, sizeof(lim));
+    lim.limit_bytes = 30;
+    n = svc_record_policy_plan_delete(f, 5, &lim, del, 8);
+    printf("    锁住最旧的 21-00-01, 上限 30 → 要删 %d 个: %s\n", n,
+           (n > 0 && n <= 2) ? f[del[0]].name : "?");
+    CHECK(n == 2, "锁定一个不该减少清理个数(应照样删 2 个)");
+    if (n == 2) {
+        CHECK(strcmp(f[del[0]].name, "2026-09-16-21-00-02.mp4") == 0,
+              "★ 跳过锁定的 21-00-01, 第一个该删 21-00-02");
+        CHECK(strcmp(f[del[1]].name, "2026-09-16-21-00-03.mp4") == 0,
+              "★ 继续删下一个最旧的 21-00-03(而不是遇到锁就放弃)");
+    }
+
+    /* ② 锁住**最新**的那个:它本来就不该被删, 结果应完全不变 */
+    fill_shuffled(f);
+    f[0].locked = 1;                            /* f[0] = 21-00-05, 最新 */
+    n = svc_record_policy_plan_delete(f, 5, &lim, del, 8);
+    CHECK(n == 2 && strcmp(f[del[0]].name, "2026-09-16-21-00-01.mp4") == 0 &&
+          strcmp(f[del[1]].name, "2026-09-16-21-00-02.mp4") == 0,
+          "锁最新的那个不影响结果(仍从最旧开始删)");
+
+    /* ③ **全被锁定** ⇒ 一个也删不掉(调用方要如实报错, 不许自动解锁) */
+    fill_shuffled(f);
+    for (n = 0; n < 5; n++) {
+        f[n].locked = 1;
+    }
+    n = svc_record_policy_plan_delete(f, 5, &lim, del, 8);
+    printf("    全部锁定 + 上限 30 → 要删 %d 个(应为 0, 由调用方报错)\n", n);
+    CHECK(n == 0, "全被锁定时不许删任何东西");
+
+    /* ④ 只剩 1 个且被锁 ⇒ 仍然"至少留一个", 不越界 */
+    fill_shuffled(f);
+    f[3].locked = 1;
+    lim.limit_bytes = 1;
+    n = svc_record_policy_plan_delete(f, 5, &lim, del, 8);
+    CHECK(n == 4, "上限 1 时仍应删 4 个(留最新那个)");
 }
 
 static void test_ring(void)
@@ -214,6 +272,7 @@ int main(void)
     test_ring();
     test_ring_edges();
     test_should_close();
+    test_lock();
 
     printf("\n==== 结果: %d 通过 / %d 失败 ====\n", g_pass, g_fail);
     return (g_fail == 0) ? 0 : 1;

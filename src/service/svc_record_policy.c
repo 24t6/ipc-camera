@@ -112,6 +112,11 @@ int svc_record_policy_plan_delete(const svc_record_policy_file_t *files, int cou
         if (n >= del_cap) {
             break;                          /* 输出缓冲满 —— 剩下的下一轮再删 */
         }
+        if (files[order[i]].locked) {
+            /* ★ 锁定的分段跳过, **但它仍然占着容量** ——
+             *   继续看下一个最旧的(不 break), 否则"有一个锁就谁也不删" */
+            continue;
+        }
         del_idx[n++] = order[i];
         total -= files[order[i]].size;
         kept--;
