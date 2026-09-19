@@ -942,18 +942,40 @@ static int recover_one_raw(const char *raw_name)
  * @brief 把目录里所有残留的裸流侧车都救一遍
  *
  * @return 救回来的个数
+ *
+ * @note ⚠️ 本函数**同步跑在录制线程里**、而且在取第一帧之前 ⇒ 重封期间
+ *       取流线程照常往录制队列塞帧, 队列只有 `SVC_MEDIA_QUEUE_SLOTS` 槽,
+ *       **满了就丢** ⇒ 这段时间的实时画面录不进去。
+ *       上板实测(2026-09-19): 80 MB 的裸流重封 13 秒, 期间录制丢 **252 帧**
+ *       (≈8.4 秒); 按 30 分钟一段(~950 MB)线性外推大约丢 **2 分钟**。
+ * @note 【简化上限】停机式恢复: 好处是**一行代码都不用改 mp4v2 的用法**
+ *       (重封与正常录制共用同一套全局状态 `g.mp4`/`g.track`, 天然不会并发),
+ *       天花板是"恢复期间不录新帧"。
+ *       **升级路径**: ① 把 `on_nalu_cb`/`write_sample` 的 mp4v2 句柄从全局 `g.*`
+ *       改成显式上下文结构体, 恢复用**另一套**上下文 ⇒ 就能挪到独立低优先级线程,
+ *       与录制并行而不丢帧; ② 更省事的折中: 恢复挪到 `bsp_mpp_init()` **之前**
+ *       (取流还没开始, 队列里不会有帧被丢), 代价是开机多等同样长的时间。
  */
 static int recover_leftovers(void)
 {
     DIR           *d = opendir(g.dir);
     struct dirent *e;
     int            n = 0;
+    int            i = 0;
 
     if (d == NULL) {
         return 0;
     }
     while ((e = readdir(d)) != NULL) {
-        if (is_raw_sidecar(e->d_name) && recover_one_raw(e->d_name) == 1) {
+        if (!is_raw_sidecar(e->d_name)) {
+            continue;
+        }
+        /* ★ 先报一声再干活: 重封大文件要几十秒, 没有这一行操作者只会
+         *   看到"程序起来了但不录像"(见上面的【简化上限】) */
+        i++;
+        LOG_INFO("恢复: 第 %d 个残留裸流 %s —— 重封期间不录新帧, 请稍等",
+                 i, e->d_name);
+        if (recover_one_raw(e->d_name) == 1) {
             n++;
         }
     }
