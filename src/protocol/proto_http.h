@@ -44,6 +44,9 @@
 /** 目标(路径)缓冲上限 */
 #define PROTO_HTTP_TARGET_MAX 192
 
+/** `Host` 头缓冲上限(生成绝对 URL 要用它: 形如 `192.168.16.88:8080`) */
+#define PROTO_HTTP_HOST_MAX 64
+
 /** 分段名字缓冲上限(与 svc_record 的文件名上限一致) */
 #define PROTO_HTTP_NAME_MAX 64
 
@@ -75,6 +78,8 @@ typedef struct {
     uint64_t range_last;                      /**< 结束偏移(含); `bytes=N-` 时为 UINT64_MAX */
     int      has_content_length;              /**< 1 = 有 Content-Length(锁定的 body) */
     uint64_t content_length;
+    int      has_host;                        /**< 1 = 有 Host 头 */
+    char     host[PROTO_HTTP_HOST_MAX];       /**< `Host` 头原文(用于拼**绝对 URL**) */
 } proto_http_request_t;
 
 /** 路径判决(回放服务的三个入口) */

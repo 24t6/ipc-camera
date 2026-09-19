@@ -30,6 +30,7 @@
 #include "infra_netio.h"
 #include "proto_http.h"
 #include "proto_str.h"
+#include "svc_http_page.h"
 #include "svc_record.h"
 
 /** 请求缓冲(头 + 小的 body;`proto_http` 的头区上限是 1024) */
@@ -38,8 +39,8 @@
 /** 应答头缓冲(JSON 列表的 Content-Length 可能 5 位以上, 留足) */
 #define HTTP_HEAD_BUF  1024
 
-/** JSON 列表缓冲:64 条 × 约 190 字节 ≈ 12KB, 给到 16KB */
-#define HTTP_JSON_BUF  16384
+/** 文本 body 缓冲(JSON 列表 / m3u 播放列表): 64 条上限, JSON 约 12KB、m3u 约 6KB */
+#define HTTP_TEXT_BUF  16384
 
 /** 取文件时每次读多少字节写出去(32KB:卡上顺序读 + 一次 send 都不吃亏) */
 #define HTTP_CHUNK     32768
@@ -73,7 +74,7 @@ static struct {
     /* 下面的缓冲只归本线程用(串行处理 ⇒ 不需要加锁) */
     char             req[HTTP_REQ_BUF];
     char             head[HTTP_HEAD_BUF];
-    char             json[HTTP_JSON_BUF];
+    char             text[HTTP_TEXT_BUF];   /* 文本类 body 的拼装缓冲(JSON / m3u) */
     uint8_t          chunk[HTTP_CHUNK];
     svc_record_policy_file_t segs[HTTP_SEG_MAX];
 } g;
@@ -214,29 +215,29 @@ static int handle_list(int cfd)
     if (n < 0 || proto_str_u32((uint32_t)n, num, sizeof(num)) < 0) {
         return send_error(cfd, 500, NULL);
     }
-    if (proto_str_append(g.json, sizeof(g.json), &used, "{\"count\":") != 0 ||
-        proto_str_append(g.json, sizeof(g.json), &used, num) != 0 ||
-        proto_str_append(g.json, sizeof(g.json), &used, ",\"segments\":[") != 0) {
+    if (proto_str_append(g.text, sizeof(g.text), &used, "{\"count\":") != 0 ||
+        proto_str_append(g.text, sizeof(g.text), &used, num) != 0 ||
+        proto_str_append(g.text, sizeof(g.text), &used, ",\"segments\":[") != 0) {
         return send_error(cfd, 500, NULL);
     }
     for (i = 0; i < n; i++) {
         if (i > 0) {
-            if (proto_str_append(g.json, sizeof(g.json), &used, ",") != 0) {
+            if (proto_str_append(g.text, sizeof(g.text), &used, ",") != 0) {
                 return send_error(cfd, 500, NULL);
             }
         }
-        if (append_entry(g.json, sizeof(g.json), &used, &g.segs[i]) != 0) {
+        if (append_entry(g.text, sizeof(g.text), &used, &g.segs[i]) != 0) {
             return send_error(cfd, 500, NULL);      /* 列表太长放不下 */
         }
     }
-    if (proto_str_append(g.json, sizeof(g.json), &used, "]}\n") != 0) {
+    if (proto_str_append(g.text, sizeof(g.text), &used, "]}\n") != 0) {
         return send_error(cfd, 500, NULL);
     }
     if (send_head_only(cfd, 200, "application/json; charset=utf-8", used,
                        NULL) != 0) {
         return -1;
     }
-    if (infra_tcp_write_all(cfd, g.json, used) != 0) {
+    if (infra_tcp_write_all(cfd, g.text, used) != 0) {
         return -1;
     }
     g.stats.bytes_sent += used;
@@ -499,19 +500,105 @@ static int handle_lock(int cfd, const char *name, const proto_http_request_t *re
     return 0;
 }
 
+/**
+ * @brief `GET /playlist.m3u` —— 给 VLC / mpv 的**整段回放**播放列表
+ *
+ * @param[in] cfd 连接
+ * @param[in] req 请求(用它的 `Host` 拼绝对 URL)
+ * @return 0 成功; -1 失败
+ *
+ * @note ★ 顺序是**旧 → 新**:播放列表是拿来"从头连着看"的, 时间必须顺着走
+ *       (列表接口 `GET /recordings` 反而是新→旧, 因为人先看最新的)。
+ * @note ★ URL 用**客户端自己发的 `Host`** 拼绝对地址 —— 服务端不该猜"板子 IP 是多少"
+ *       (可能多网卡、可能被 NAT)。客户端没发 `Host` 时退回**相对 URL**
+ *       (VLC 会相对播放列表自身地址解析)。
+ * @note ⚠️ 【简化上限】`#EXTINF` 的时长写 **-1(未知)**:要报准确时长就得解析每个 MP4 的
+ *       `mvhd`/`mdhd`(或用码率估), 而我们**不存**这个信息。
+ *       用估算值会让 VLC 的时间轴长度是错的 —— **宁可写"未知"也不写假数字**。
+ *       升级路径: 收尾时把时长写进文件名旁的 sidecar, 或在 `GET /recordings` 里带上它。
+ */
+static int handle_playlist(int cfd, const proto_http_request_t *req)
+{
+    const char *host = req->has_host ? req->host : NULL;
+    size_t      used = 0;
+    int         n;
+    int         i;
+
+    n = svc_record_list(g.segs, HTTP_SEG_MAX);
+    if (n < 0) {
+        return send_error(cfd, 500, NULL);
+    }
+    if (proto_str_append(g.text, sizeof(g.text), &used, "#EXTM3U\n") != 0) {
+        return send_error(cfd, 500, NULL);
+    }
+    for (i = n - 1; i >= 0; i--) {              /* 旧 → 新 */
+        int bad = 0;
+
+        bad |= proto_str_append(g.text, sizeof(g.text), &used, "#EXTINF:-1,");
+        bad |= proto_str_append(g.text, sizeof(g.text), &used, g.segs[i].name);
+        bad |= proto_str_append(g.text, sizeof(g.text), &used, "\n");
+        if (host != NULL) {
+            bad |= proto_str_append(g.text, sizeof(g.text), &used, "http://");
+            bad |= proto_str_append(g.text, sizeof(g.text), &used, host);
+        }
+        bad |= proto_str_append(g.text, sizeof(g.text), &used, "/recordings/");
+        bad |= proto_str_append(g.text, sizeof(g.text), &used, g.segs[i].name);
+        bad |= proto_str_append(g.text, sizeof(g.text), &used, "\n");
+        if (bad != 0) {
+            return send_error(cfd, 500, NULL);  /* 列表太长放不下 */
+        }
+    }
+    if (send_head_only(cfd, 200, "audio/x-mpegurl", used, NULL) != 0) {
+        return -1;
+    }
+    if (infra_tcp_write_all(cfd, g.text, used) != 0) {
+        return -1;
+    }
+    g.stats.bytes_sent += used;
+    g.stats.playlists++;
+    return 0;
+}
+
+/**
+ * @brief `GET /` —— 把回放页面发出去(浏览器直接当客户端用)
+ *
+ * @param[in] cfd 连接
+ * @return 0 成功; -1 失败
+ *
+ * @note 页面是**常量字符串**(`svc_http_page.c`), 不带任何前端构建步骤。
+ */
+static int handle_page(int cfd)
+{
+    size_t len = strlen(svc_http_page_html);
+
+    if (send_head_only(cfd, 200, "text/html; charset=utf-8", len, NULL) != 0) {
+        return -1;
+    }
+    if (infra_tcp_write_all(cfd, svc_http_page_html, len) != 0) {
+        return -1;
+    }
+    g.stats.bytes_sent += len;
+    g.stats.pages++;
+    return 0;
+}
+
 /** 帮助页(纯文本, 给人看的) */
 static const char HTTP_HELP[] =
     "IPC 回放服务\n"
-    "  GET  /recordings              列出现有分段(JSON)\n"
+    "  GET  /                        回放页面(浏览器直接当客户端用)\n"
+    "  GET  /help                    本帮助(纯文本)\n"
+    "  GET  /playlist.m3u            整段回放列表(给 VLC / mpv, 旧→新)\n"
+    "  GET  /recordings              列出现有分段(JSON, 新→旧)\n"
     "  GET  /recordings/<名字>        取流(支持 Range: bytes=)\n"
     "  HEAD /recordings/<名字>        只取响应头(探大小)\n"
     "  PUT  /recordings/<名字>/lock   body 1=锁定 / 0=解锁\n"
     "\n"
     "例: curl -r 0-1023 http://<板子IP>:8080/recordings/<名字> -o head.bin\n"
-    "    ffplay http://<板子IP>:8080/recordings/<名字>\n";
+    "    ffplay http://<板子IP>:8080/recordings/<名字>\n"
+    "    vlc    http://<板子IP>:8080/playlist.m3u     ← 一整天连着放\n";
 
 /**
- * @brief 按解析结果分派:列表 / 取文件 / 锁定 / 帮助
+ * @brief 按解析结果分派:页面 / 播放列表 / 列表 / 取文件 / 锁定 / 帮助
  *
  * @param[in] cfd      连接
  * @param[in] req      已解析的请求
@@ -533,7 +620,13 @@ static int dispatch(int cfd, const proto_http_request_t *req,
         return send_error(cfd, 400, NULL);
     }
     if (strcmp(path, "/") == 0) {
+        return handle_page(cfd);
+    }
+    if (strcmp(path, "/help") == 0) {
         return send_text(cfd, HTTP_HELP);
+    }
+    if (strcmp(path, "/playlist.m3u") == 0 || strcmp(path, "/playlist") == 0) {
+        return handle_playlist(cfd, req);
     }
     kind = proto_http_match_path(path, name, sizeof(name));
     if (kind == PROTO_HTTP_PATH_LIST) {

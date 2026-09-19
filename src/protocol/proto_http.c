@@ -223,7 +223,7 @@ static int parse_range(const char *v, proto_http_request_t *req)
 }
 
 /**
- * @brief 处理一个头行(只关心 Range 与 Content-Length, 其余忽略)
+ * @brief 处理一个头行(只关心 Range / Content-Length / Host, 其余忽略)
  *
  * @param[in]  line 头行(就地切分)
  * @param[out] req  结果
@@ -251,8 +251,19 @@ static void handle_header(char *line, proto_http_request_t *req, int *bad)
             req->has_content_length = 1;
             req->content_length     = v;
         }
+        return;
     }
-    /* 其它头( Host / User-Agent / Connection … )一律忽略 */
+    if (proto_str_eq_ci(trim(line), "Host")) {
+        /* ★ 留着 Host:回放播放列表里的 URL 要**绝对**的(给 VLC 的 m3u 用),
+         *   而服务端自己不该猜"板子 IP 是多少"(可能多网卡/NAT)——
+         *   客户端发什么 Host, 就用什么。 */
+        if (value[0] != '\0') {
+            snprintf(req->host, sizeof(req->host), "%s", value);
+            req->has_host = 1;
+        }
+        return;
+    }
+    /* 其它头( User-Agent / Connection … )一律忽略 */
 }
 
 /**

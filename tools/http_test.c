@@ -117,6 +117,18 @@ static void test_parse(void)
     g_fails += check("★ body 以冒号开头也不影响(B042 同类)",
                      n > 0 && r.method == PROTO_HTTP_GET);
 
+    /* Host:回放列表要拼**绝对 URL**, 而服务端不该猜自己 IP —— 用客户端给的 Host */
+    n = parse("GET / HTTP/1.1\r\nHost: 192.168.16.88:8080\r\n\r\n", &r);
+    g_fails += check("Host 头被解析(含端口)",
+                     n > 0 && r.has_host == 1 &&
+                     strcmp(r.host, "192.168.16.88:8080") == 0);
+    n = parse("GET / HTTP/1.1\r\nhOsT:   board.local  \r\n\r\n", &r);
+    g_fails += check("Host 头名大小写无关且裁掉空白",
+                     n > 0 && r.has_host == 1 &&
+                     strcmp(r.host, "board.local") == 0);
+    n = parse("GET / HTTP/1.1\r\n\r\n", &r);
+    g_fails += check("没有 Host 也不报错(回退相对 URL)", n > 0 && r.has_host == 0);
+
     memset(big, 'x', sizeof(big) - 1);
     big[sizeof(big) - 1] = '\0';
     memcpy(big, "GET /x HTTP/1.1\r\n", 17);
