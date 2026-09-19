@@ -220,7 +220,7 @@ GC2053 ─MIPI CSI─→ VI ─→ VPSS ─┬─→ VENC ch0 (H.265 1080p30)
 | **卡满(策略)** | Milestone `Classic`(删最旧)/`Evidence collection`(停录保全);海康"循环写入"复选框;TP-LINK 列为**持续报警** | ✅ **选定"覆盖最旧"** —— 等价于 Milestone 的 `Classic` / 海康"循环写入"的勾选态:**满了就删最旧腾地方**。**不做"写满即停"**(那是 Evidence collection 路线, 本项目选择"最新可用")。实测见 A5(环形覆盖)与 A10(小盘上自动清理、录制不停) |
 | **清理水位** | ⚠️ **"预留 xx%"不是跨厂商统一参数**(所有"不超过 80%"都出自容量规划建议)。有具体值的是开源实现:ZoneMinder 出厂 `DiskPercent>=95` + 删最旧;Frigate 用"剩余不足约 1 小时录像量" | 改成**保底"剩余 ≥ 一段大小"**(自洽、无魔数)+ **写失败时立即清理**(ZoneMinder/Frigate 都是周期轮询,**没人专门处理"段中间盘满"**, 这一步超出开源实践) |
 | **正在写的那段** | Axis 边存官方:正在写的是 `recording.tmp`,写完才转正 | ✅ **已实现**:写 `<stamp>.mp4.tmp` → `MP4Close` 成功后 `rename` 成 `.mp4`;启动清残留 `*.tmp`。目录扫描只认 `.mp4` ⇒ 半成品不进环形容量、不进检索列表,断电残留一眼可辨 |
-| **单段保护** | 海康手册:检索结果可**锁定, 锁定后不会被覆盖**;ISAPI 的 `mediaSegmentDescriptor` 带 `lockStatus` | **补:锁定段跳过环形删除**(纯函数加一条规则) |
+| **单段保护** | 海康手册:检索结果可**锁定, 锁定后不会被覆盖**;ISAPI 的 `mediaSegmentDescriptor` 带 `lockStatus` | ✅ **已实现(2026-09-19)**:清单文件 `<dir>/.locked`(每行一个分段名)⇒ 策略层跳过锁定的、**继续删下一个最旧的**;全锁定时明确报错且不停录。上板三相位实测见 A15(对照/锁定/全锁定降级) |
 | **文件系统** | SD 协会:SDHC(≤32 GB)规定 **FAT32** ⇒ 我们**合规**;Axis 官方建议 **ext4**(断电后恢复更快、更不易损坏) | **保持 vfat**(为"拔卡插电脑直接看"),取舍写进文档 |
 | **卡寿命** | Axis:NAND P/E(SLC 10 万 / MLC 1 万 / TLC 3 千 / QLC 1 千);Samsung:PRO Endurance 128 GB @26 Mbps = 43,800 h / 5 年 | 实测 4.19 Mbps ⇒ 32 GB TLC ≈ 96 TB 总写入 ≈ **6 年**;旁路裸流写两倍 ⇒ **约 3 年**(开发板可接受) |
 | **回放** | ⚠️ **ONVIF Profile G 完全不管分段**(19 页规范里 `Segment/Retention/Storage/Export` 命中全为 0);回放惯例是 RTSP `PLAY` + `Range`(npt/clock, RFC 2326) | **不写"符合 Profile G"**;回放按"**设备给 URI、客户端原样回填**"的形状做(海康 ISAPI 就是这个形状) |
