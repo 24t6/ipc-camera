@@ -147,6 +147,23 @@ int infra_udp_bind(const char *ip, uint16_t port);
 /** @brief 把 socket 设为非阻塞。@return 0 成功, -1 失败 */
 int infra_set_nonblocking(int fd);
 
+/**
+ * @brief 把一段数据**写完**(处理 `EINTR` / `EAGAIN`, 必要时 `poll` 等可写)
+ *
+ * @param[in] fd  已连接的 socket
+ * @param[in] buf 数据
+ * @param[in] len 字节数
+ * @return 0 = 全部写完; -1 = 失败(等可写超时 / 对端关闭 / 其它错误)
+ *
+ * @note ★ **唯一的"写满一个 TCP 流"实现**:TCP 交错发送器、RTSP 响应、
+ *       HTTP 回放服务都走这里 —— 三处各写一遍的话, 改一处忘两处就是 bug
+ *       (本项目已经因为"两份实现"栽过:见 B036)。
+ * @note ⚠️ **会阻塞**(最长 poll 100 ms 一轮)。只允许在**网络线程 / HTTP 线程**里调用;
+ *       取流线程里绝不能调 —— 那是 ADR-3 要防的"网络慢拖死取流"。
+ * @note 失败时把 `errno` 与已发字节数打进日志, 但**只打前 3 次**(免得刷屏)。
+ */
+int infra_tcp_write_all(int fd, const void *buf, size_t len);
+
 /** @brief 关闭 socket 并置 -1(避免野句柄重复关闭)。 */
 void infra_close(int *fd);
 

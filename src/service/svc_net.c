@@ -212,25 +212,8 @@ static int client_count(void)
  */
 static int send_all(int fd, const char *buf, size_t len)
 {
-    size_t sent = 0;
-
-    while (sent < len) {
-        ssize_t n = send(fd, buf + sent, len - sent, MSG_NOSIGNAL);
-
-        if (n > 0) {
-            sent += (size_t)n;
-            continue;
-        }
-        if (n < 0 && errno == EINTR)
-            continue;
-        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-            /* 发送缓冲满: 短暂让出 CPU 再试。响应很小, 不会转很久 */
-            struct timespec ts = { 0, 1000000 };    /* 1 ms */
-
-            nanosleep(&ts, NULL);
-            continue;
-        }
-        return -1;
+    if (infra_tcp_write_all(fd, buf, len) != 0) {
+        return -1;                      /* 真正的循环在 infra 层, 三处共用一份 */
     }
     g.stats.responses_sent++;
     return 0;

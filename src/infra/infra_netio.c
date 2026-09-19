@@ -25,6 +25,55 @@
 /** 交错帧头首字节固定为 '$'(ASCII 0x24), 见 RFC 2326 §10.12 */
 #define INTERLEAVED_MAGIC   0x24
 
+/** `infra_tcp_write_all` 的失败计数(只用来限制日志次数, 不必精确) */
+static uint64_t g_tcp_write_errors;
+
+int infra_tcp_write_all(int fd, const void *buf, size_t len)
+{
+    const char *p    = (const char *)buf;
+    size_t      sent = 0;
+
+    if (fd < 0 || (buf == NULL && len > 0)) {
+        return -1;
+    }
+    while (sent < len) {
+        ssize_t n = send(fd, p + sent, len - sent, MSG_NOSIGNAL);
+
+        if (n > 0) {
+            sent += (size_t)n;
+            continue;
+        }
+        if (n < 0 && errno == EINTR) {
+            continue;
+        }
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            /* 缓冲满: `poll` 等可写, **不要 `continue` 空转** ——
+             * 那是 100% CPU 的死循环, 而且永远发不出去(2026-09-18 修掉的隐患)。 */
+            struct pollfd pfd;
+
+            pfd.fd      = fd;
+            pfd.events  = POLLOUT;
+            pfd.revents = 0;
+            if (poll(&pfd, 1, 100) > 0) {
+                continue;
+            }
+            if (g_tcp_write_errors < 3) {
+                LOG_ERROR("tcp_write_all: 等可写超时(fd=%d, 已发 %zu/%zu)",
+                          fd, sent, len);
+            }
+            g_tcp_write_errors++;
+            return -1;
+        }
+        if (g_tcp_write_errors < 3) {
+            LOG_ERROR("tcp_write_all: send() 失败 n=%zd errno=%d(%s), 已发 %zu/%zu",
+                      n, errno, strerror(errno), sent, len);
+        }
+        g_tcp_write_errors++;
+        return -1;
+    }
+    return 0;
+}
+
 /* ─────────────────── UDP sender ─────────────────── */
 
 /** UDP sender 的上下文:目标地址 + fd + 统计 */
@@ -125,51 +174,18 @@ typedef struct {
 #define TCP_FRAME_CAP 2048
 
 /**
- * @brief 把拼好的交错帧**写完**(必要时 poll 等可写)
+ * @brief 把拼好的交错帧**写完**
  *
  * @param c     上下文
  * @param total 总字节数(交错头 + 数据)
  * @return 0 成功; -1 失败(已累加 `c->errors`)
  *
- * @note 抽出来是为了让 `tcp_send()` 短到不用续行、也不超"函数 ≤ 50 行"的硬约束。
+ * @note 真正的循环在 `infra_tcp_write_all()` —— 这里只负责把失败记进本 sender
+ *       的统计(原来是一份独立实现, 2026-09-19 合并成一处)。
  */
 static int tcp_write_all(tcp_ctx_t *c, size_t total)
 {
-    size_t sent = 0;
-
-    while (sent < total) {
-        ssize_t n = send(c->fd, c->frame + sent, total - sent, 0);
-
-        if (n > 0) {
-            sent += (size_t)n;
-            continue;
-        }
-        if (n < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)) {
-            /*
-             * 非阻塞 socket 缓冲满:`poll` 等它可写, **不要 `continue` 空转**。
-             * ⚠️ 原来的写法就是 `continue` —— 缓冲一直满就是 100% CPU 的死循环,
-             *    而且永远发不出去(2026-09-18 顺手修掉的隐患)。
-             */
-            struct pollfd p;
-
-            p.fd      = c->fd;
-            p.events  = POLLOUT;
-            p.revents = 0;
-            if (poll(&p, 1, 100) > 0) {
-                continue;
-            }
-            if (c->errors < 3) {
-                LOG_ERROR("tcp_send: 等可写超时(fd=%d, 已发 %zu/%zu)",
-                          c->fd, sent, total);
-            }
-            c->errors++;
-            return -1;
-        }
-        /* ★ 真失败要**分类报出来**(errno 是关键线索);只报前 3 次, 免得刷屏 */
-        if (c->errors < 3) {
-            LOG_ERROR("tcp_send: send() 失败 n=%zd errno=%d(%s), 已发 %zu/%zu",
-                      n, errno, strerror(errno), sent, total);
-        }
+    if (infra_tcp_write_all(c->fd, c->frame, total) != 0) {
         c->errors++;
         return -1;
     }

@@ -83,6 +83,7 @@
 #include "infra_log.h"
 #include "infra_queue.h"
 #include "proto_sdp.h"
+#include "svc_http.h"
 #include "svc_media.h"
 #include "svc_net.h"
 #include "svc_osd.h"
@@ -141,11 +142,45 @@ typedef struct {
     int         no_osd;      /**< 1 = 不叠时间水印(默认叠) */
     int         no_record;   /**< 1 = 不录 MP4(默认录到 /mnt/sdcard) */
     int         no_raw;      /**< 1 = 不写旁路裸流侧车(默认写;掉电后可救前一段) */
+    int         no_http;     /**< 1 = 不起回放服务(默认起) */
     int         rec_mb;      /**< 环形容量上限(MB);0 = 不限 */
     int         rec_seg;     /**< 每段**秒数**;0 = 用默认(1800 秒 = 30 分钟) */
     int         rec_seg_mb;  /**< 每段**大小上限**(MB);0 = 用默认(1024 MB) */
+    uint16_t    http_port;   /**< 回放服务端口;0 = 用默认(8080) */
     int         verbose;
 } app_opts_t;
+
+/*
+ * ⚠️ `-h265` / `-no-osd` / `-no-record` / `-no-raw` 这些"多字符选项"**必须走长选项**
+ *    (2026-09-19 修的 B040):原来它们交给 `getopt()` 之后**一个都不生效** ——
+ *    `-no-record` 被当成选项簇 → `-n` 不认识 → 直接打印用法退出;
+ *    `-h265` 更阴, 被当成 `-h`(帮助)→ **退出码还是 0**, 脚本根本看不出错。
+ *    glibc 的 `getopt_long()` **接受单横线长选项**(`-no-record` 与 `--no-record` 等价),
+ *    所以文档里的写法不用改, 功能就修好了。
+ */
+#define OPT_H265       0x101
+#define OPT_NO_OSD     0x102
+#define OPT_NO_RECORD  0x103
+#define OPT_NO_RAW     0x104
+#define OPT_NO_HTTP    0x105
+
+/** 长选项表(单横线写法也认, 见上面的说明) */
+static const struct option LONG_OPTS[] = {
+    { "port",       required_argument, NULL, 'p' },
+    { "bind",       required_argument, NULL, 'b' },
+    { "ring",       required_argument, NULL, 'r' },
+    { "segment",    required_argument, NULL, 's' },
+    { "segment-mb", required_argument, NULL, 'm' },
+    { "http",       required_argument, NULL, 'H' },
+    { "h265",       no_argument,       NULL, OPT_H265 },
+    { "no-osd",     no_argument,       NULL, OPT_NO_OSD },
+    { "no-record",  no_argument,       NULL, OPT_NO_RECORD },
+    { "no-raw",     no_argument,       NULL, OPT_NO_RAW },
+    { "no-http",    no_argument,       NULL, OPT_NO_HTTP },
+    { "verbose",    no_argument,       NULL, 'v' },
+    { "help",       no_argument,       NULL, 'h' },
+    { NULL,         0,                 NULL, 0 }
+};
 
 /**
  * @brief 打印命令行用法
@@ -161,13 +196,15 @@ static void usage(const char *prog)
            "  -no-osd     不叠时间水印(默认在右上角叠)\n"
            "  -no-record  不录 MP4(默认录到 " APP_REC_DIR ")\n"
            "  -no-raw     不写旁路裸流侧车(默认写:掉电/强杀后能把前一段救回来)\n"
+           "  -no-http    不起回放服务(默认起)\n"
+           "  -H <端口>   回放服务的 HTTP 端口(默认 %d)\n"
            "  -r <MB>     录制环形容量上限(默认 %d MB;0=不限)\n"
            "  -s <秒数>   每段多少秒后切新文件(默认 1800 = 30 分钟)\n"
            "  -m <MB>     每段多少 MB 后切新文件(默认 %d MB;与 -s 谁先到算谁;\n"
            "              0=用默认。⚠️ 这一维不能关 —— vfat 单文件上限 4 GiB)\n"
            "  -v          打开 DEBUG 日志\n"
            "  -h          显示本帮助\n",
-           prog, APP_DEFAULT_PORT, APP_REC_LIMIT_MB,
+           prog, APP_DEFAULT_PORT, SVC_HTTP_DEFAULT_PORT, APP_REC_LIMIT_MB,
            SVC_RECORD_DEFAULT_SEGMENT_MB);
 }
 
@@ -176,46 +213,42 @@ static void usage(const char *prog)
  *
  * @return 0 = 继续运行; 1 = 参数错(已打印用法); 2 = 用户要 -h 帮助(正常退出)
  *
- * @note `-h265` 这种"多字符短选项"getopt 认不了, 所以单独扫一遍 argv。
- *       (要么改成 `--h265` 长选项, 要么手工扫 —— 这里选后者, 保持命令行短。)
+ * @note 用 `getopt_long` 而不是 `getopt`:这样"多字符选项"才有地方放(见上面 B040 说明)。
  */
 static int parse_args(int argc, char **argv, app_opts_t *o)
 {
-    int i;
     int opt;
 
-    o->port      = APP_DEFAULT_PORT;
-    o->bind_ip   = "0.0.0.0";
-    o->is_h265   = 0;
-    o->no_osd    = 0;
-    o->no_record = 0;
-    o->no_raw    = 0;
-    o->rec_mb    = APP_REC_LIMIT_MB;
-    o->rec_seg   = 0;
-    o->rec_seg_mb = 0;
-    o->verbose   = 0;
+    o->port        = APP_DEFAULT_PORT;
+    o->bind_ip     = "0.0.0.0";
+    o->is_h265     = 0;
+    o->no_osd      = 0;
+    o->no_record   = 0;
+    o->no_raw      = 0;
+    o->no_http     = 0;
+    o->rec_mb      = APP_REC_LIMIT_MB;
+    o->rec_seg     = 0;
+    o->rec_seg_mb  = 0;
+    o->http_port   = SVC_HTTP_DEFAULT_PORT;
+    o->verbose     = 0;
 
-    while ((opt = getopt(argc, argv, "p:b:r:s:m:hv")) != -1) {
+    while ((opt = getopt_long(argc, argv, "p:b:r:s:m:H:hv", LONG_OPTS, NULL)) != -1) {
         switch (opt) {
         case 'p': o->port       = (uint16_t)atoi(optarg); break;
         case 'b': o->bind_ip    = optarg;                 break;
         case 'r': o->rec_mb     = atoi(optarg);           break;
         case 's': o->rec_seg    = atoi(optarg);           break;
         case 'm': o->rec_seg_mb = atoi(optarg);           break;
+        case 'H': o->http_port  = (uint16_t)atoi(optarg); break;
+        case OPT_H265:      o->is_h265   = 1;             break;
+        case OPT_NO_OSD:    o->no_osd    = 1;             break;
+        case OPT_NO_RECORD: o->no_record = 1;             break;
+        case OPT_NO_RAW:    o->no_raw    = 1;             break;
+        case OPT_NO_HTTP:   o->no_http   = 1;             break;
         case 'v': o->verbose    = 1;                      break;
         case 'h': return 2;
         default:  return 1;
         }
-    }
-    for (i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "-h265") == 0)
-            o->is_h265 = 1;
-        else if (strcmp(argv[i], "-no-osd") == 0)
-            o->no_osd = 1;
-        else if (strcmp(argv[i], "-no-record") == 0)
-            o->no_record = 1;
-        else if (strcmp(argv[i], "-no-raw") == 0)
-            o->no_raw = 1;
     }
     return 0;
 }
@@ -233,18 +266,21 @@ static void report(int secs)
     svc_net_stats_t    ns;
     svc_osd_stats_t    os;
     svc_record_stats_t rs;
+    svc_http_stats_t   hs;
 
     svc_media_get_stats(&ms);
     svc_sender_get_stats(&ss);
     svc_net_get_stats(&ns);
     svc_osd_get_stats(&os);
     svc_record_get_stats(&rs);
+    svc_http_get_stats(&hs);
 
     printf("[%4ds] 取流 %llu 帧 | 发送 %llu 帧/%llu 包 | 客户端 %d 在发(%llu 等IDR)"
            " | RTSP %llu 连接/%llu 请求 | 丢 %llu | 错误 %llu"
            " | ★帧龄 现/最小/最大 %.0f/%.0f/%.0f ms 漂移 %.0f ms"
            " | OSD %llu 次/错 %llu"
-           " | 录制 %llu 段/%llu 帧 删 %llu 丢 %llu 错 %llu\n",
+           " | 录制 %llu 段/%llu 帧 删 %llu 丢 %llu 错 %llu"
+           " | 回放 %llu 请求/%llu 是206\n",
            secs,
            (unsigned long long)ms.frames,
            (unsigned long long)ss.frames_sent,
@@ -263,7 +299,9 @@ static void report(int secs)
            (unsigned long long)rs.frames_written,
            (unsigned long long)rs.deleted,
            (unsigned long long)ms.record_dropped,
-           (unsigned long long)rs.write_errors);
+           (unsigned long long)rs.write_errors,
+           (unsigned long long)hs.requests,
+           (unsigned long long)hs.partials);
     fflush(stdout);
 }
 
@@ -335,6 +373,10 @@ static int build_sdp(const app_opts_t *o, char *out, size_t cap)
  */
 static void shutdown_chain(int started)
 {
+    /* ★ 回放服务最先停:它是"纯读卡"的旁观者, 先让它收手, 免得录制收尾时
+     *   还有人正在读卡(卡上的 I/O 是共享的, 越早安静越好)。 */
+    if (started & 32)
+        svc_http_stop();
     if (started & 8)
         svc_osd_stop();
     if (started & 1)
@@ -345,6 +387,33 @@ static void shutdown_chain(int started)
         svc_sender_stop();
     if (started & 4)
         svc_net_stop();
+}
+
+/**
+ * @brief 起回放服务(阶段 2 的 HTTP 服务)
+ *
+ * @param[in]  o       命令行选项(端口 / 是否关闭)
+ * @param[out] started 位掩码,成功则置上 bit5
+ * @return 0 成功; 负值失败
+ *
+ * @note 抽出来是为了让 `start_chain()` 别太长(项目硬约束: 代码行 ≤ 50)。
+ * @note 依赖"录制已经起来了"(要它的录制目录)—— 所以排在 `start_record()` 之后。
+ * @note 失败**不致命**:看不了回放不该让直播和录制起不来, 但要明确告警。
+ */
+static int start_http(const app_opts_t *o, int *started)
+{
+    svc_http_cfg_t cfg;
+
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.bind_ip = o->bind_ip;
+    cfg.port    = o->http_port;
+    if (svc_http_start(&cfg) != 0) {
+        return -1;
+    }
+    *started |= 32;
+    printf("回放服务  : http://<板子IP>:%u/recordings(列分段 / Range 取流 / 锁定)\n",
+           (unsigned)svc_http_port());
+    return 0;
 }
 
 /**
@@ -489,6 +558,18 @@ static infra_queue_t *start_chain(const app_opts_t *o, int *started)
         }
     }
 
+    /*
+     * ③.6 回放服务(阶段 2)。
+     *   位置: 在录制**之后** —— 它要读录制目录(分段列表 / 取流 / 锁定清单)。
+     *   失败**不致命**(与录制同): 看不了回放不该让直播起不来, 但要明确告警。
+     */
+    if (o->no_http) {
+        printf("回放服务  : 已按 -no-http 关闭\n");
+    } else if (start_http(o, started) != 0) {
+        printf("⚠️  回放服务启动失败(端口 %u 被占?推流/录制照常)\n",
+               (unsigned)o->http_port);
+    }
+
     /* ④ 最后起取流(生产者) */
     printf("\n正在初始化 MPP 通路(约 5~10 秒, 请稍等)…\n");
     if (svc_media_start(queue, g_record_queue, o->is_h265) != 0) {
@@ -514,8 +595,14 @@ static infra_queue_t *start_chain(const app_opts_t *o, int *started)
     }
 
     printf("✅ 全链路已启动。用 VLC / ffplay 拉流:\n");
-    printf("     ffplay -rtsp_transport udp rtsp://<板子IP>:%u/live\n\n",
+    printf("     ffplay -rtsp_transport udp rtsp://<板子IP>:%u/live\n",
            (unsigned)svc_net_port());
+    if ((*started & 32) != 0) {
+        printf("     回放列表: curl http://<板子IP>:%u/recordings\n\n",
+               (unsigned)svc_http_port());
+    } else {
+        printf("\n");
+    }
     return queue;
 }
 
@@ -554,6 +641,8 @@ int main(int argc, char **argv)
     printf("RTSP 监听 : %s:%u\n", o.bind_ip, (unsigned)o.port);
     printf("OSD 水印  : %s\n", o.no_osd ? "关闭" : "右上角时间(每秒更新)");
     printf("录制      : %s\n", o.no_record ? "关闭" : APP_REC_DIR " 的 MP4 分段");
+    printf("回放服务  : %s\n", o.no_http ? "关闭"
+           : "HTTP(列分段 / Range 取流 / 锁定)");
     printf("拉流地址  : rtsp://<板子IP>:%u/live\n\n", (unsigned)o.port);
 
     signal(SIGINT, on_sigint);
