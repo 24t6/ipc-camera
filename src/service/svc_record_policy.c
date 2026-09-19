@@ -135,3 +135,125 @@ int svc_record_policy_should_close(uint32_t frames_in_seg, uint32_t segment_fram
     }
     return 0;
 }
+
+void svc_record_policy_sort(svc_record_policy_file_t *files, int count, int desc)
+{
+    int i;
+    int j;
+
+    if (files == NULL || count <= 1) {
+        return;
+    }
+    for (i = 1; i < count; i++) {
+        svc_record_policy_file_t key = files[i];
+
+        for (j = i - 1; j >= 0; j--) {
+            int cmp = strcmp(files[j].name, key.name);
+
+            /* desc(新→旧)时把"谁该排前面"反过来; 相等就保持原顺序(稳定) */
+            if (desc ? (cmp < 0) : (cmp > 0)) {
+                files[j + 1] = files[j];
+                continue;
+            }
+            break;
+        }
+        files[j + 1] = key;
+    }
+}
+
+/**
+ * @brief 这一行(长度 len)是不是 `name`(容忍行尾的 '\r' 与空格)
+ *
+ * @param[in] line 行首
+ * @param[in] len  行长度(不含换行)
+ * @param[in] name 要比的名字
+ * @return 1 = 是; 0 = 不是
+ */
+static int line_is_name(const char *line, size_t len, const char *name)
+{
+    size_t n = strlen(name);
+
+    while (len > 0 && (line[len - 1] == '\r' || line[len - 1] == ' ' ||
+                       line[len - 1] == '\t')) {
+        len--;                          /* 裁掉行尾空白 */
+    }
+    return (len == n && memcmp(line, name, n) == 0) ? 1 : 0;
+}
+
+int svc_record_policy_lock_has(const char *buf, size_t used, const char *name)
+{
+    size_t r = 0;
+
+    if (buf == NULL || name == NULL || name[0] == '\0') {
+        return 0;
+    }
+    while (r < used) {
+        size_t start = r;
+
+        while (r < used && buf[r] != '\n') {
+            r++;
+        }
+        if (line_is_name(buf + start, r - start, name)) {
+            return 1;
+        }
+        r++;                            /* 跳过换行 */
+    }
+    return 0;
+}
+
+int svc_record_policy_lock_edit(char *buf, size_t cap, size_t used,
+                                const char *name, int on)
+{
+    size_t r;
+    size_t w;
+
+    if (buf == NULL || name == NULL || name[0] == '\0' || used >= cap) {
+        return -1;
+    }
+    /* 名字里带换行 = 能往清单里注入额外的行 —— 直接拒绝 */
+    if (strpbrk(name, "\r\n") != NULL) {
+        return -1;
+    }
+    if (on) {
+        size_t n = strlen(name);
+
+        if (svc_record_policy_lock_has(buf, used, name)) {
+            return (int)used;           /* 幂等: 已经在里面了 */
+        }
+        /* 末尾不是换行就先补一个(文件最后一行也要有换行, 便于逐行读) */
+        if (used > 0 && buf[used - 1] != '\n') {
+            if (used + 1 >= cap) {
+                return -1;
+            }
+            buf[used++] = '\n';
+        }
+        if (used + n + 2 > cap) {
+            return -1;                  /* 放不下(含结尾的 '\n' 与 '\0') */
+        }
+        memcpy(buf + used, name, n);
+        buf[used + n] = '\n';
+        buf[used + n + 1] = '\0';
+        return (int)(used + n + 1);
+    }
+
+    /* 删除: 逐行搬, 把不是 name 的行留下 */
+    r = 0;
+    w = 0;
+    while (r < used) {
+        size_t start = r;
+
+        while (r < used && buf[r] != '\n') {
+            r++;
+        }
+        if (!line_is_name(buf + start, r - start, name)) {
+            size_t len = r - start;
+
+            memmove(buf + w, buf + start, len);
+            w += len;
+            buf[w++] = '\n';
+        }
+        r++;
+    }
+    buf[w] = '\0';
+    return (int)w;
+}

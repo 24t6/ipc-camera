@@ -55,6 +55,8 @@
 
 #include <stdint.h>
 
+#include "svc_record_policy.h"
+
 /** 目录路径的最大长度(含结尾 '\0') */
 #define SVC_RECORD_PATH_MAX 256
 
@@ -142,6 +144,14 @@
 
 /** 最多同时记住多少个锁定分段(超出部分忽略并告警) */
 #define SVC_RECORD_LOCK_MAX 64
+
+/**
+ * 锁定清单读写缓冲的字节数。
+ *
+ * @note 按"最坏情况"给满:`SVC_RECORD_LOCK_MAX` 行 × (名字上限 + 换行) + 结尾。
+ *       放**文件级静态**(约 4 KB), 不放栈 —— §6.3 规定栈数组不超过 4 KB。
+ */
+#define SVC_RECORD_LOCK_BUF (SVC_RECORD_LOCK_MAX * (SVC_RECORD_POLICY_NAME_MAX + 1) + 8)
 
 /*
  * ★ 分段文件的生命周期(2026-09-17 改进:掉电可见 + 掉电可救)
@@ -241,5 +251,51 @@ int svc_record_is_running(void);
 
 /** @brief 取统计快照。 */
 void svc_record_get_stats(svc_record_stats_t *out);
+
+/* ─────────────────── 回放服务要用的三个接口(阶段 2) ─────────────────── */
+
+/**
+ * @brief 列出**当前可回放的分段**(新 → 旧)。
+ *
+ * @param[out] out 输出数组(调用方提供, 元素类型来自 `svc_record_policy.h`)
+ * @param[in]  cap 数组容量(建议 `SVC_RECORD_POLICY_MAX_FILES`)
+ * @return 列出的个数(>=0); -1 = 目录打不开
+ *
+ * @note **只认 `.mp4`** ⇒ 正在写的 `<stamp>.mp4.tmp` 与旁路裸流 `<stamp>.h264.tmp`
+ *       天然不会出现在回放列表里(与环形覆盖的扫描用的是同一条判据)。
+ * @note 排序是**目录名的字典序倒序** —— 名字是零填充时间戳 ⇒ 正好是"最新在前"。
+ * @note ⚠️ **可以在别的线程调用**(回放服务就是这么用的): 它**不碰**录制线程那张
+ *       共享扫描表(`g_scan`/`g_del`), 用调用方的数组;改动锁定缓存时会取锁。
+ */
+int svc_record_list(svc_record_policy_file_t *out, int cap);
+
+/**
+ * @brief 锁定 / 解锁一个分段(改录制目录里的 `.locked` 清单)。
+ *
+ * @param[in] name 分段名(必须形如 `<stamp>.mp4`)
+ * @param[in] on   1 = 锁定(环形覆盖会跳过它);0 = 解锁
+ * @return 0 成功; -1 失败(名字不合法 / 清单读不出来 / 写不进去)
+ *
+ * @note **原子替换**:先写 `<dir>/.locked.tmp` 再 `rename` —— 中途掉电不会留下
+ *       半个清单(旧清单仍然完整)。写完会 `fsync`, 因为"哪几段不能删"是**用户的意图**,
+ *       丢不起。
+ * @note 改完立刻让环形覆盖看到新清单(它会重读), 不需要重启。
+ * @note ⚠️ **可以在别的线程调用**;内部有互斥锁保护清单缓存。
+ */
+int svc_record_set_lock(const char *name, int on);
+
+/**
+ * @brief 把分段名拼成完整路径(`<dir>/<name>`)。
+ *
+ * @param[in]  name 分段名
+ * @param[out] out  输出缓冲
+ * @param[in]  cap  容量
+ * @return 写入字符数; <=0 = 名字不合法或放不下
+ *
+ * @note 名字必须**以 `.mp4` 结尾** —— 这一条就是回放服务的最后一道门:
+ *       除了"已经收尾的分段", 谁也不许通过这里拿到路径(`.tmp`、`.locked` 都不行)。
+ * @note 任何线程都可调用(`g.dir` 启动后只读)。
+ */
+int svc_record_make_path(const char *name, char *out, size_t cap);
 
 #endif /* __SVC_RECORD_H__ */

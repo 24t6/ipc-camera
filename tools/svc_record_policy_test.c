@@ -265,6 +265,97 @@ static void test_should_close(void)
           "两个都不限 ⇒ 永不自动收段(只能靠停机收尾)");
 }
 
+/**
+ * @brief 排序(回放列表要"新→旧", 环形覆盖要"旧→新")
+ */
+static void test_sort(void)
+{
+    svc_record_policy_file_t f[5];
+
+    printf("\n[5] 按名字(= 时间)排序\n");
+
+    fill_shuffled(f);
+    svc_record_policy_sort(f, 5, 0);            /* 旧 → 新 */
+    CHECK(strcmp(f[0].name, "2026-09-16-21-00-01.mp4") == 0 &&
+          strcmp(f[4].name, "2026-09-16-21-00-05.mp4") == 0,
+          "升序: 最旧在前");
+
+    fill_shuffled(f);
+    svc_record_policy_sort(f, 5, 1);            /* 新 → 旧(回放列表用) */
+    CHECK(strcmp(f[0].name, "2026-09-16-21-00-05.mp4") == 0 &&
+          strcmp(f[4].name, "2026-09-16-21-00-01.mp4") == 0,
+          "降序: 最新在前");
+    CHECK(f[1].size == 10 && f[1].locked == 0, "排序时 size/locked 跟着一起搬");
+
+    svc_record_policy_sort(f, 0, 1);            /* 不该崩 */
+    svc_record_policy_sort(NULL, 5, 1);
+    CHECK(1, "0 个 / NULL 不崩");
+}
+
+/**
+ * @brief 锁定清单的**文本**增删查(读写文件在 svc_record.c, 这里只测纯逻辑)
+ */
+static void test_lock_list(void)
+{
+    char   buf[128];
+    size_t used = 0;
+    int    n;
+
+    printf("\n[6] 锁定清单文本(增 / 删 / 查)\n");
+    buf[0] = '\0';
+
+    n = svc_record_policy_lock_edit(buf, sizeof(buf), used, "a.mp4", 1);
+    CHECK(n == 6 && strcmp(buf, "a.mp4\n") == 0, "空清单加入 a.mp4");
+    used = (size_t)n;
+
+    n = svc_record_policy_lock_edit(buf, sizeof(buf), used, "a.mp4", 1);
+    CHECK(n == (int)used && strcmp(buf, "a.mp4\n") == 0, "重复加入是幂等的");
+
+    n = svc_record_policy_lock_edit(buf, sizeof(buf), used, "b.mp4", 1);
+    used = (size_t)n;
+    CHECK(strcmp(buf, "a.mp4\nb.mp4\n") == 0, "再加一个 → 两行");
+
+    CHECK(svc_record_policy_lock_has(buf, used, "b.mp4") == 1, "查得到 b.mp4");
+    CHECK(svc_record_policy_lock_has(buf, used, "c.mp4") == 0, "查不到 c.mp4");
+    CHECK(svc_record_policy_lock_has(buf, used, "") == 0, "空名字查不到");
+
+    n = svc_record_policy_lock_edit(buf, sizeof(buf), used, "a.mp4", 0);
+    used = (size_t)n;
+    CHECK(strcmp(buf, "b.mp4\n") == 0, "删掉 a.mp4 只剩 b.mp4");
+    CHECK(svc_record_policy_lock_has(buf, used, "a.mp4") == 0, "删完查不到");
+
+    n = svc_record_policy_lock_edit(buf, sizeof(buf), used, "zzz.mp4", 0);
+    CHECK(n == (int)used, "删一个不在清单里的名字 = 原样返回");
+    n = svc_record_policy_lock_edit(buf, sizeof(buf), used, "x.mp4", 1);
+    used = (size_t)n;
+    CHECK(strcmp(buf, "b.mp4\nx.mp4\n") == 0, "再删再加后顺序正确");
+
+    /* 注释行 / 空行 / 行尾 CR 都要能容忍(清单可能被人手工编辑过) */
+    {
+        const char *raw = "# 这是注释\n\nb.mp4\r\n  \n";
+
+        CHECK(svc_record_policy_lock_has(raw, strlen(raw), "b.mp4") == 1,
+              "手工编辑过的清单: CR/空行/注释都能容忍");
+        CHECK(svc_record_policy_lock_has(raw, strlen(raw), "#") == 0,
+              "注释行不算名字");
+    }
+
+    /* 放不下 → -1, 且**缓冲没被改坏** */
+    {
+        char small[12];
+
+        strcpy(small, "b.mp4\nx.mp4");      /* 12 字节, 正好放满 */
+        n = svc_record_policy_lock_edit(small, sizeof(small), strlen(small),
+                                        "yyyyyyyy.mp4", 1);
+        CHECK(n == -1 && strcmp(small, "b.mp4\nx.mp4") == 0,
+              "放不下 → -1 且原文本不变");
+    }
+
+    /* ★ 名字里带换行 = 会往清单里注入额外的行 —— 必须拒绝 */
+    n = svc_record_policy_lock_edit(buf, sizeof(buf), used, "bad\nname", 1);
+    CHECK(n == -1, "★ 名字含换行 → 拒绝(否则能注入清单)");
+}
+
 int main(void)
 {
     printf("==== 录制策略(纯函数)PC 单测 ====\n");
@@ -273,6 +364,8 @@ int main(void)
     test_ring_edges();
     test_should_close();
     test_lock();
+    test_sort();
+    test_lock_list();
 
     printf("\n==== 结果: %d 通过 / %d 失败 ====\n", g_pass, g_fail);
     return (g_fail == 0) ? 0 : 1;

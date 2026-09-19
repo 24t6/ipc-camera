@@ -113,4 +113,46 @@ int svc_record_policy_plan_delete(const svc_record_policy_file_t *files, int cou
 int svc_record_policy_should_close(uint32_t frames_in_seg, uint32_t segment_frames,
                                    uint64_t bytes_in_seg, uint64_t segment_bytes);
 
+/**
+ * @brief 按名字(= 时间)排序分段数组
+ *
+ * @param[in,out] files 分段数组
+ * @param[in]     count 个数
+ * @param[in]     desc  1 = **新 → 旧**(回放列表要这个);0 = 旧 → 新(环形覆盖要这个)
+ *
+ * @note 名字是补零的固定宽度 ⇒ **字典序 == 时间序**, 所以 `strcmp` 就够。
+ * @note 用插入排序:个数 ≤ 64, 而且顺序通常已接近有序(目录按创建时间返回)。
+ */
+void svc_record_policy_sort(svc_record_policy_file_t *files, int count, int desc);
+
+/**
+ * @brief 在锁定清单**文本**里加入/移除一个名字(纯函数, 就地改文本)
+ *
+ * @param[in,out] buf  清单全文(以 '\0' 结尾), 由调用方提供并拥有
+ * @param[in]     cap  缓冲总容量(含结尾 '\0')
+ * @param[in]     used 当前有效长度
+ * @param[in]     name 要加/删的分段名
+ * @param[in]     on   1 = 加入;0 = 移除
+ * @return 新的有效长度; -1 = 参数非法或放不下(缓冲**未被修改**)
+ *
+ * @note 已经在清单里再加一次 = 原样返回(幂等);不在清单里删一次也一样。
+ * @note 只做**文本**操作 —— 读文件/写文件在 `svc_record.c`, 这样这段逻辑能在 PC 上单测。
+ * @note ⚠️ 名字里不允许出现换行(`\n` / `\r`)—— 否则一行能变成两行,
+ *       清单就被注入了。出现换行时返回 -1。
+ */
+int svc_record_policy_lock_edit(char *buf, size_t cap, size_t used,
+                                const char *name, int on);
+
+/**
+ * @brief 名字在不在锁定清单文本里(逐行比较)
+ *
+ * @param[in] buf  清单全文(以 '\0' 结尾;长度以 `used` 为准)
+ * @param[in] used 有效长度
+ * @param[in] name 名字
+ * @return 1 = 在; 0 = 不在(或参数非法)
+ *
+ * @note 忽略空行与 `#` 开头的注释行;行尾的 `\r`/空格会被容忍。
+ */
+int svc_record_policy_lock_has(const char *buf, size_t used, const char *name);
+
 #endif /* __SVC_RECORD_POLICY_H__ */

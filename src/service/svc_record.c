@@ -130,6 +130,30 @@ static char g_locks[SVC_RECORD_LOCK_MAX][SVC_RECORD_POLICY_NAME_MAX];
 static int  g_lock_count;
 static int  g_lock_logged = -1;      /* 上次报过的锁定个数(变了才再报一次) */
 
+/*
+ * 锁定清单读写缓冲
+ *   容量依据 : 最坏情况 —— 64 行 × (64 字节名字 + 换行) + 结尾
+ *   内存区域 : **文件级静态**(约 4KB) —— 放栈上会顶到 §6.3 的 4KB 线
+ *   唯一所有者: 本模块
+ *   释放时机 : 进程生命周期内常驻
+ */
+static char g_lock_buf[SVC_RECORD_LOCK_BUF];
+
+/*
+ * 保护**锁定清单缓存**(`g_locks` / `g_lock_count` / `g_lock_buf`)的互斥锁
+ *
+ * 为什么需要它(阶段 2 引入):回放服务在**另一个线程**里跑, 它会
+ *   · 调 `svc_record_list()`  —— 要读"哪几段被锁了"
+ *   · 调 `svc_record_set_lock()` —— 要改清单
+ * 而录制线程会在每次扫目录前重读清单。两边都碰同一个缓存 ⇒ 必须串行化。
+ *
+ * ⚠️ 锁的粒度刻意做得很小(只护"缓存"这几百字节), **不护整个目录扫描**:
+ *    录制线程扫目录/删文件时不持锁, 回放列表不会被它卡住。
+ *    两条扫描路径也**不共用**扫描表(`g_scan`/`g_del` 只归录制线程, 回放列表用
+ *    调用方自己的数组)—— 这是"共享可变状态"最容易出事的地方, 干脆不共享。
+ */
+static pthread_mutex_t g_lock_mtx = PTHREAD_MUTEX_INITIALIZER;
+
 /* ─────────── 文件名/路径小工具 ─────────── */
 
 /**
@@ -215,15 +239,9 @@ static size_t trim_line_end(char *line)
 }
 
 /**
- * @brief 读一次锁定清单(`<dir>/.locked`, 每行一个分段文件名)
- *
- * @note 调用时机:每次扫描目录之前(= 每次分段收尾 / 提前腾空间时)。
- *       **每次都重读**是故意的:阶段 2 的管理接口只要改这个文件, 这里立刻生效,
- *       不需要任何进程内状态同步。
- * @note 没有清单文件 = 一个都没锁, 是**正常情况**(不是错误)。
- * @note 【简化上限】只读前 `SVC_RECORD_LOCK_MAX` 行, 超出的**明确告警**而不是静默丢弃。
+ * @brief 真正读清单(调用方**必须已持有** `g_lock_mtx`)
  */
-static void load_locks(void)
+static void lock_cache_load_locked(void)
 {
     char  path[SVC_RECORD_PATH_MAX];
     char  line[SVC_RECORD_POLICY_NAME_MAX + 8];
@@ -262,21 +280,42 @@ static void load_locks(void)
 }
 
 /**
+ * @brief 读一次锁定清单(`<dir>/.locked`, 每行一个分段文件名)
+ *
+ * @note 调用时机:每次扫描目录之前(= 每次分段收尾 / 提前腾空间时)。
+ *       **每次都重读**是故意的:回放服务的锁定/解锁接口只要改这个文件, 这里立刻生效。
+ * @note 没有清单文件 = 一个都没锁, 是**正常情况**(不是错误)。
+ * @note 【简化上限】只读前 `SVC_RECORD_LOCK_MAX` 行, 超出的**明确告警**而不是静默丢弃。
+ */
+static void load_locks(void)
+{
+    (void)pthread_mutex_lock(&g_lock_mtx);
+    lock_cache_load_locked();
+    (void)pthread_mutex_unlock(&g_lock_mtx);
+}
+
+/**
  * @brief 这个名字在不在锁定清单里
  *
  * @param[in] name 文件名
  * @return 1 = 已锁定; 0 = 没锁
+ *
+ * @note 任何线程都可调用(内部取锁)。
  */
 static int is_locked(const char *name)
 {
     int i;
+    int hit = 0;
 
+    (void)pthread_mutex_lock(&g_lock_mtx);
     for (i = 0; i < g_lock_count; i++) {
         if (strcmp(g_locks[i], name) == 0) {
-            return 1;
+            hit = 1;
+            break;
         }
     }
-    return 0;
+    (void)pthread_mutex_unlock(&g_lock_mtx);
+    return hit;
 }
 
 /**
@@ -1316,4 +1355,136 @@ void svc_record_get_stats(svc_record_stats_t *out)
         return;
     }
     *out = g.stats;
+}
+
+/* ─────────── 回放服务要用的三个接口(阶段 2) ─────────── */
+
+/**
+ * @brief 扫出所有**可回放的分段**(`*.mp4`), 结果写进调用方数组
+ *
+ * @param[out] out 输出数组
+ * @param[in]  cap 容量
+ * @return 个数; -1 = 目录打不开
+ *
+ * @note 与录制线程那条 `scan_dir()` **刻意分开**:那条用文件级静态表 `g_scan`/`g_del`
+ *       (省内存)且会读 `g.cur_name`;这条只碰调用方数组, 因此**可以从别的线程调**。
+ *       两份扫描的唯一共同点就是 `name_is_mp4()` 这一条判据。
+ */
+static int scan_segments(svc_record_policy_file_t *out, int cap)
+{
+    DIR           *d;
+    struct dirent *e;
+    int            n = 0;
+
+    if (out == NULL || cap <= 0) {
+        return -1;
+    }
+    d = opendir(g.dir);
+    if (d == NULL) {
+        return -1;
+    }
+    while ((e = readdir(d)) != NULL && n < cap) {
+        if (!name_is_mp4(e->d_name)) {
+            continue;                   /* `.mp4.tmp` / `.h264.tmp` / `.locked` 全被排除 */
+        }
+        snprintf(out[n].name, sizeof(out[n].name), "%s", e->d_name);
+        out[n].size   = file_size_of(e->d_name);
+        out[n].locked = is_locked(e->d_name);
+        n++;
+    }
+    closedir(d);
+    return n;
+}
+
+int svc_record_list(svc_record_policy_file_t *out, int cap)
+{
+    int n = scan_segments(out, cap);
+
+    if (n < 0) {
+        return -1;
+    }
+    svc_record_policy_sort(out, n, 1);           /* 新 → 旧(回放列表要这个顺序) */
+    return n;
+}
+
+int svc_record_make_path(const char *name, char *out, size_t cap)
+{
+    if (name == NULL || out == NULL || !name_is_mp4(name)) {
+        return -1;                      /* 只放行"已收尾的分段", 别的名字一律不给路径 */
+    }
+    return make_path(name, out, cap);
+}
+
+/**
+ * @brief 读清单 → 改一行 → **原子**写回(调用方必须已持有 `g_lock_mtx`)
+ *
+ * @param[in] name 分段名
+ * @param[in] on   1 = 加锁; 0 = 解锁
+ * @return 0 成功; -1 失败
+ *
+ * @note 顺序:写 `.locked.tmp` → `fflush` + `fsync` → `rename` 覆盖 `.locked`。
+ *       这样**掉电也不会留下半个清单**(旧清单要么完整保留, 要么被完整替换)。
+ * @note `.locked.tmp` 以 `.tmp` 结尾, 所以启动清理会顺手收掉异常退出留下的半成品。
+ */
+static int lock_write(const char *name, int on)
+{
+    char   path[SVC_RECORD_PATH_MAX];
+    char   tmp[SVC_RECORD_PATH_MAX];
+    FILE  *fp;
+    size_t used = 0;
+    int    n;
+
+    if (make_path(SVC_RECORD_LOCK_FILE, path, sizeof(path)) <= 0 ||
+        snprintf(tmp, sizeof(tmp), "%s.tmp", path) <= 0) {
+        return -1;
+    }
+    fp = fopen(path, "r");
+    if (fp != NULL) {
+        used = fread(g_lock_buf, 1, sizeof(g_lock_buf) - 1, fp);
+        (void)fclose(fp);
+        g_lock_buf[used] = '\0';
+    } else {
+        g_lock_buf[0] = '\0';
+    }
+    n = svc_record_policy_lock_edit(g_lock_buf, sizeof(g_lock_buf), used, name, on);
+    if (n < 0) {
+        LOG_ERROR("回放: 锁定清单改动失败(放不下?名字非法?): %s", name);
+        return -1;
+    }
+    fp = fopen(tmp, "w");
+    if (fp == NULL) {
+        LOG_ERROR("回放: 打不开锁定清单临时文件: %s", tmp);
+        return -1;
+    }
+    if (fwrite(g_lock_buf, 1, (size_t)n, fp) != (size_t)n || fflush(fp) != 0) {
+        (void)fclose(fp);
+        (void)unlink(tmp);
+        return -1;
+    }
+    (void)fsync(fileno(fp));            /* 清单很小, fsync 便宜; "哪几段不能删"丢不起 */
+    (void)fclose(fp);
+    if (rename(tmp, path) != 0) {
+        LOG_ERROR("回放: 替换锁定清单失败: %s", path);
+        (void)unlink(tmp);
+        return -1;
+    }
+    return 0;
+}
+
+int svc_record_set_lock(const char *name, int on)
+{
+    int rc;
+
+    if (name == NULL || !name_is_mp4(name)) {
+        return -1;                      /* 只给"真分段"上锁 */
+    }
+    (void)pthread_mutex_lock(&g_lock_mtx);
+    rc = lock_write(name, on);
+    if (rc == 0) {
+        lock_cache_load_locked();       /* 立刻让环形覆盖看到新清单 */
+        LOG_INFO("回放: %s %s(%s)", on ? "锁定" : "解锁", name,
+                 on ? "环形覆盖不会再删它" : "又可以被环形覆盖删了");
+    }
+    (void)pthread_mutex_unlock(&g_lock_mtx);
+    return rc;
 }
