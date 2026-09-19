@@ -35,6 +35,19 @@
 int proto_str_u32(uint32_t v, char *out, size_t cap);
 
 /**
+ * @brief 把 64 位无符号整数写成十进制文本(HTTP 用得上:文件大小/偏移可超 4 GiB)。
+ *
+ * @param v    要转换的值
+ * @param out  输出缓冲
+ * @param cap  out 的容量(含结尾 '\0');**至少 21 字节**(uint64 最大 20 位)
+ * @return 写入的字符数(不含 '\0'); -1 = 缓冲不够
+ *
+ * @note 为什么需要它:`Content-Length` / `Content-Range` 里的文件大小是 64 位的
+ *       (vfat 单文件上限 4 GiB, 正好越过 uint32 的边界), 用 32 位版本会**静默截断**。
+ */
+int proto_str_u64(uint64_t v, char *out, size_t cap);
+
+/**
  * @brief 解析十进制无符号整数(遇非数字即停, 不报错)。
  *
  * @param p    文本起点
@@ -42,8 +55,22 @@ int proto_str_u32(uint32_t v, char *out, size_t cap);
  * @return 消耗的字符数; **0 表示没解析到数字**
  *
  * @note 只接受 0~9;允许后面紧跟分隔符(如 ';'、'-'、'\0')
+ * @note ★ **会溢出就停在溢出前**(返回已解析的位数), **不静默回绕** ——
+ *       `4294967296` 绕回来会变成 0, 是最难查的一类错。
  */
 size_t proto_str_parse_u32(const char *p, uint32_t *out);
+
+/**
+ * @brief 解析十进制无符号 64 位整数(遇非数字即停)。
+ *
+ * @param p    文本起点
+ * @param out  解析结果
+ * @return 消耗的字符数; **0 表示没解析到数字**
+ *
+ * @note 溢出时**停在溢出前**(返回已解析的位数), 不报错 —— 调用方按"不合法"处理即可。
+ *       这一条是 `parse_range()` 判断 `bytes=99999999999999999999-` 这类垃圾的依据。
+ */
+size_t proto_str_parse_u64(const char *p, uint64_t *out);
 
 /**
  * @brief 把一段文本追加到缓冲末尾(就地追加, 自带容量检查)。
@@ -61,6 +88,12 @@ int proto_str_append(char *out, size_t cap, size_t *used, const char *text);
  * @return 0 = 成功; -1 = 容量不够
  */
 int proto_str_append_u32(char *out, size_t cap, size_t *used, uint32_t v);
+
+/**
+ * @brief 把 64 位无符号整数转文本后追加。
+ * @return 0 = 成功; -1 = 容量不够
+ */
+int proto_str_append_u64(char *out, size_t cap, size_t *used, uint64_t v);
 
 /**
  * @brief ASCII 转小写。

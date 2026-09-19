@@ -41,7 +41,57 @@ size_t proto_str_parse_u32(const char *p, uint32_t *out)
         return 0;
 
     while (p[n] >= '0' && p[n] <= '9' && n < 10) {
-        v = v * 10u + (uint32_t)(p[n] - '0');
+        uint32_t d = (uint32_t)(p[n] - '0');
+
+        /* ★ 会溢出就**停在这里**(而不是静默回绕)——
+         *   `4294967296` 这一类值绕回来会变成 0, 是最难查的一类错 */
+        if (v > (UINT32_MAX - d) / 10u)
+            break;
+        v = v * 10u + d;
+        n++;
+    }
+    if (n == 0)
+        return 0;
+    *out = v;
+    return n;
+}
+
+int proto_str_u64(uint64_t v, char *out, size_t cap)
+{
+    char tmp[24];
+    int  n = 0;
+    int  i;
+
+    if (out == NULL || cap < 21)
+        return -1;
+
+    if (v == 0)
+        tmp[n++] = '0';
+    while (v > 0) {
+        tmp[n++] = (char)('0' + (int)(v % 10u));
+        v /= 10u;
+    }
+    for (i = 0; i < n; i++)
+        out[i] = tmp[n - 1 - i];
+    out[n] = '\0';
+    return n;
+}
+
+size_t proto_str_parse_u64(const char *p, uint64_t *out)
+{
+    uint64_t v = 0;
+    size_t   n = 0;
+
+    if (p == NULL || out == NULL)
+        return 0;
+
+    /* 最多 20 位十进制(uint64 上限); 再读下去会溢出, 就地停住 */
+    while (p[n] >= '0' && p[n] <= '9' && n < 20) {
+        uint64_t d = (uint64_t)(p[n] - '0');
+
+        if (v > (UINT64_MAX - d) / 10u)
+            break;                      /* ★ 溢出前停住, 不回绕 */
+        v = v * 10u + d;
         n++;
     }
     if (n == 0)
@@ -70,6 +120,15 @@ int proto_str_append_u32(char *out, size_t cap, size_t *used, uint32_t v)
     char num[12];
 
     if (proto_str_u32(v, num, sizeof(num)) < 0)
+        return -1;
+    return proto_str_append(out, cap, used, num);
+}
+
+int proto_str_append_u64(char *out, size_t cap, size_t *used, uint64_t v)
+{
+    char num[24];
+
+    if (proto_str_u64(v, num, sizeof(num)) < 0)
         return -1;
     return proto_str_append(out, cap, used, num);
 }

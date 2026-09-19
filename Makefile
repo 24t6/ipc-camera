@@ -90,6 +90,7 @@ HOST_CFLAGS := $(WARN) -O2 -std=c11 -D_DEFAULT_SOURCE -pthread \
 # 每条规则的**先决条件就是它的源文件**(recipe 里用 $^ 展开) —— 一眼能看出
 # 这个测试到底覆盖了哪几个模块。
 PC_TESTS := $(BUILD)/pc/svc_record_policy_test \
+            $(BUILD)/pc/http_test \
             $(BUILD)/pc/rtp_test \
             $(BUILD)/pc/sdp_test \
             $(BUILD)/pc/rtsp_test \
@@ -144,6 +145,11 @@ $(OUT): $(OBJS) $(VND_OBJS)
 
 $(BUILD)/pc/svc_record_policy_test: tools/svc_record_policy_test.c \
                                     src/service/svc_record_policy.c
+	@mkdir -p $(@D)
+	$(HOSTCC) $(HOST_CFLAGS) -o $@ $^
+
+$(BUILD)/pc/http_test: tools/http_test.c src/protocol/proto_http.c \
+                       src/protocol/proto_str.c
 	@mkdir -p $(@D)
 	$(HOSTCC) $(HOST_CFLAGS) -o $@ $^
 
