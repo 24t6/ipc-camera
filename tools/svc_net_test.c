@@ -46,31 +46,36 @@ static int g_passes;
 static uint16_t g_port;
 
 /*
- * ── on_play 回调的捕获器(M1-9 新增)──
+ * ── on_play 回调的捕获器(M1-9 新增;B036 后改为收 `infra_transport_t`)──
  *
  * 为什么要"捕获"而不是只让回调非 NULL:
  *   加了参数之后, **只验证回调被调到是不够的** —— 如果上层拿到的目的地
  *   是错的(比如端口填成了 RTSP 端口), 回调照样"被调到了"。
- *   所以要把传进来的 sockaddr_in **存下来**, 再断言它的 IP 和端口。
+ *   所以要把传进来的**传输方式**存下来, 再断言它的 IP/端口/是否 TCP。
  *   这是本项目的老规矩: 断言要能证伪, 不能只断言"函数被调了"。
+ *
+ * ⚠️ **这里曾经腐烂过一次**(2026-09-19 被 `make test` 抓出来):
+ *   B036 把回调参数从 `const struct sockaddr_in *` 换成了
+ *   `const infra_transport_t *`, 我重跑了 `rtp_test` 与 `svc_sender_test`,
+ *   **漏了这一个** —— 于是它带着不兼容的函数指针(只有一条 warning)继续"通过",
+ *   直到补上 `make test` 才暴露。教训见项目 bug log。
  */
 static int                 g_play_calls;      /* on_play 被调了几次 */
 static int                 g_play_index = -1; /* 最后一次的 client_index */
-static struct sockaddr_in  g_play_dst;        /* 最后一次收到的 RTP 目的地 */
-static int                 g_play_dst_null;   /* 收到过 NULL 目的地的次数(应为 0) */
+static infra_transport_t   g_play_tr;         /* 最后一次收到的传输方式 */
+static int                 g_play_dst_null;   /* 收到过 NULL 传输方式的次数(应为 0) */
 static int                 g_teardown_calls;
 
-static void fake_on_play(int client_index, const struct sockaddr_in *rtp_dst,
-                         void *user)
+static void fake_on_play(int client_index, const infra_transport_t *tr, void *user)
 {
     (void)user;
     g_play_calls++;
     g_play_index = client_index;
-    if (rtp_dst == NULL) {
+    if (tr == NULL) {
         g_play_dst_null++;
         return;
     }
-    g_play_dst = *rtp_dst;
+    g_play_tr = *tr;
 }
 
 static void fake_on_teardown(int client_index, void *user)
@@ -418,6 +423,12 @@ int main(int argc, char **argv)
     got = cli_recv(fd, resp, sizeof(resp), 2000, 150);
     check("PLAY 拿到 200", cli_count_200(resp) == 1, NULL);
     check("PLAY 带 Session", strstr(resp, "Session: ") != NULL, NULL);
+    /* ★ B036 的核心:SETUP 协商成 TCP 交错之后, on_play 必须**把传输方式带出去**
+     *   (那两个根因之一就是"svc_sender 不看传输方式, 一律建 UDP sender") */
+    check("★ TCP 会话: on_play 传出的传输方式是 TCP 交错",
+          g_play_tr.is_tcp == 1, NULL);
+    check("★ TCP 会话: 交错通道 = SETUP 协商的 0", g_play_tr.rtp_channel == 0, NULL);
+    check("★ TCP 会话: 带上了 RTSP 连接的 fd", g_play_tr.rtsp_fd >= 0, NULL);
 
     rl = mk_req(req, sizeof(req), "PAUSE", 33, "/live", "Session: 1000\r\n");
     send(fd, req, rl, 0);
@@ -474,13 +485,15 @@ int main(int argc, char **argv)
         check("UDP PLAY 拿到 200", cli_count_200(resp) == 1, NULL);
 
         check("★ on_play 被调用了", g_play_calls == before + 1, NULL);
-        check("★ 传出的目的地不是 NULL", g_play_dst_null == 0, NULL);
+        check("★ 传出的传输方式不是 NULL", g_play_dst_null == 0, NULL);
+        check("★ UDP 会话: 传输方式是 UDP(不是 TCP 交错)",
+              g_play_tr.is_tcp == 0, NULL);
         check("★ 目的地 IP 是客户端 IP(127.0.0.1)",
-              g_play_dst.sin_addr.s_addr == htonl(INADDR_LOOPBACK), NULL);
+              g_play_tr.rtp_dst.sin_addr.s_addr == htonl(INADDR_LOOPBACK), NULL);
         check("★ 目的地端口 = SETUP 协商的 client_port(50000)",
-              ntohs(g_play_dst.sin_port) == 50000, NULL);
+              ntohs(g_play_tr.rtp_dst.sin_port) == 50000, NULL);
         check("★ 用同一个值反查端口也能对上(证明字节序没错)",
-              ntohs(g_play_dst.sin_port) != 50001, NULL);
+              ntohs(g_play_tr.rtp_dst.sin_port) != 50001, NULL);
 
         /* 收尾: TEARDOWN → 应触发 on_teardown */
         rl = mk_req(req, sizeof(req), "TEARDOWN", 37, "/live", "Session: 1000\r\n");

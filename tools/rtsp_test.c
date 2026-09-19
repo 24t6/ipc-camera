@@ -300,7 +300,7 @@ int main(int argc, char **argv)
     {
         proto_rtsp_request_t r;
         char  small_sdp[] = "v=0\r\n";
-        int   n, i;
+        int   i;
 
         struct {
             const char *name;
