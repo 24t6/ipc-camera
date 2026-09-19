@@ -274,6 +274,7 @@ VENC 的编码缓冲有限(实测 `HI_MPI_VENC_GetStream` 后必须尽快 `Relea
 | `proto_str` | `proto_str_append()`, `proto_str_u32/u64()`, `proto_str_parse_u32/u64()`, `proto_str_eq_ci*()` | 无(协议层共用小工具) |
 | `proto_http` | `proto_http_parse()`, `proto_http_match_path()`, `proto_http_name_ok()`, `proto_http_build_head()` | `proto_str` |
 | `svc_http` | `svc_http_start()`, `svc_http_stop()`, `svc_http_port()`, `svc_http_get_stats()` | `proto_http`, `svc_record`, `infra_netio` |
+| `svc_http_page` | 回放页面(一段常量 HTML;**浏览器就是客户端**) | 无 |
 
 ---
 
@@ -289,7 +290,7 @@ ipc_camera/
 │   ├── bsp/       bsp_mpp.c/h  bsp_osd.c/h  bsp_osd_render.c/h
 │   ├── service/   svc_media.c/h  svc_net.c/h  svc_sender.c/h  svc_osd.c/h
 │   │              svc_record.c/h  svc_record_policy.c/h  svc_record_mp4.h
-│   │              svc_http.c/h                      ← 阶段 2 回放服务
+│   │              svc_http.c/h  svc_http_page.c/h  ← 阶段 2 回放服务 + 板子自带页面
 │   ├── protocol/  proto_nalu.c/h  proto_rtp.c/h  proto_rtsp.c/h
 │   │              proto_sdp.c/h   proto_str.c/h   proto_http.c/h
 │   └── infra/     infra_queue.c/h  infra_netio.c/h  infra_poll.c/h  infra_log.c/h
@@ -311,4 +312,6 @@ ipc_camera/
 | 5 | M3 MP4 分段录制 + 环形覆盖 + 掉电可救 + 大小上限 + 锁定段 | ✅ 完成(验收 A4~A15) |
 | 6 | **阶段 2 回放(服务端)**:列分段 / `Range` 取流 / 锁定解锁 | ✅ 完成(验收 A17) |
 | 7 | 仓库自带构建脚本 + PC 单测入口 | ✅ 完成(A16: `make test`) |
-| 8 | **阶段 2 回放(客户端)**:Qt + FFmpeg 时间轴、拖动、锁定按钮 | ⬜ 下一步 |
+| 8 | **回放客户端(零安装路线)**:板子自带页面 + `playlist.m3u` | ✅ 完成(A18) |
+| 9 | (可选)自研 C 客户端:**SDL2 + FFmpeg**(可选 ImGui);seek 直接映射成 HTTP `Range` | ⬜ 想讲"解复用→解码→上屏"时再做 |
+| 10 | (可选)接入第三方 NVR(Frigate / ZoneMinder)证明标准可接入 | ⬜ |

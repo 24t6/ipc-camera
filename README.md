@@ -1,7 +1,7 @@
 # IPC Camera —— 海思 Hi3516DV300 网络监控系统
 
-推流端:Hi3516DV300 + 海思 MPP(VI→VPSS→VENC)+ 自研 RTSP/RTP 服务端
-拉流端:PC(Qt + FFmpeg)
+推流端:Hi3516DV300 + 海思 MPP(VI→VPSS→VENC)+ 自研 RTSP/RTP 服务端 + MP4 分段录制
+回放端:**设备自带的 HTTP 回放服务**(浏览器页面 / VLC 播放列表 / REST 接口)
 
 > **当前进度 / 关键决策 / 已知问题 → [`docs/STATUS.md`](docs/STATUS.md)**
 > 规划与验收标准 → [`docs/PROJECT_PLAN.md`](docs/PROJECT_PLAN.md) ·
@@ -80,7 +80,11 @@ Ubuntu 22.04 (192.168.16.100)
    └────────┬────────┘   └────────┬─────────────────┘
             ▼                     ▼
       PC 拉流端            HTTP 回放服务(8080)
-      (Qt + FFmpeg)        列分段 / Range 取流 / 锁定
+      (Qt + FFmpeg)        列分段 / Range 取流 / 锁定 / 播放列表
+                                  │
+                                  ▼
+                       客户端**任选**:浏览器(板子自带页面)
+                       · VLC/mpv(playlist.m3u) · 自研 C 客户端
 ```
 
 ### 3.2 线程模型
@@ -145,7 +149,7 @@ ipc_http     : HTTP 回放服务(串行处理客户端,见 docs/ARCHITECTURE.md 
 | **M1** | RTSP/RTP 服务端,PC VLC 实时播放 | ✅ 已完成(UDP + **RTP over TCP 交错**, 多客户端已实测) |
 | **M2** | OSD 叠加时间(REGION) | ✅ 已完成(板子实测) |
 | **M3** | MP4 录制 + SD 卡环形覆盖 | ✅ 已完成(验收 **A4~A16**:掉电可救 / 盘满不停 / 按时间或大小分段 / 锁定段保护) |
-| **M4** | PC 拉流端(实时预览 + 回放) | 🔄 **回放服务端已通(A17)**:HTTP 列分段 + `Range` 取流 + 锁定接口;Qt 客户端待做 |
+| **M4** | PC 拉流端(实时预览 + 回放) | 🔄 **回放已通(A17/A18)**:浏览器页面 / VLC 播放列表 / REST 接口;自研 C 客户端(SDL2+FFmpeg)为可选加分项 |
 
 ---
 
@@ -211,24 +215,46 @@ cp /mnt/nfs/ipc_app /tmp/ && chmod +x /tmp/ipc_app
 
 | 接口 | 说明 |
 |---|---|
-| `GET /recordings` | 列出可回放的分段(JSON,**新→旧**),每条带 `name / size / locked / uri / lock_uri` |
+| `GET /` | **回放页面**(浏览器直接当客户端用,**零安装**):分段列表 + 播放 + 锁定/另存 + 时间轴 |
+| `GET /playlist.m3u` | **整段回放播放列表**(旧→新)—— VLC/mpv 打开它就能"一整天连着看" |
+| `GET /help` | 纯文本帮助(curl / 终端友好) |
+| `GET /recordings` | 列出现有分段(JSON,**新→旧**),每条带 `name / size / locked / uri / lock_uri` |
 | `GET /recordings/<名字>` | 取流,**支持 `Range: bytes=…`** ⇒ `206` + `Content-Range`;不存在 ⇒ 404 |
 | `HEAD /recordings/<名字>` | 只取头(播放器常用来探大小) |
 | `PUT /recordings/<名字>/lock` | body `1` = 锁定、`0` = 解锁(不写 body 默认锁定);锁定后**环形覆盖不会删它** |
-| `GET /` | 一页纯文本帮助 |
 
 ```bash
-curl -s http://<板子IP>:8080/recordings                 # 列分段
+# ① 浏览器(推荐先试这个, 什么都不用装)
+用浏览器打开  http://<板子IP>:8080/
+
+# ② 播放器:一整天连着回放 + 可拖进度条
+vlc  http://<板子IP>:8080/playlist.m3u
+mpv  http://<板子IP>:8080/playlist.m3u
+
+# ③ 手工 / 脚本
+curl -s http://<板子IP>:8080/recordings                 # 列分段(JSON)
 curl -r 0-1023 http://<板子IP>:8080/recordings/<名字> -o head.bin   # 取前 1 KB
-ffplay http://<板子IP>:8080/recordings/<名字>           # 直接播(拖动进度条走 Range)
+ffplay http://<板子IP>:8080/recordings/<名字>           # 直接播(拖动走 Range)
 curl -X PUT  http://<板子IP>:8080/recordings/<名字>/lock        # 锁定
 curl -X PUT -d 0 http://<板子IP>:8080/recordings/<名字>/lock    # 解锁
 ```
+
+**客户端路线是可以换的**(这是有意的取舍 —— 不该把项目最有价值的部分绑死在某个 GUI 框架上):
+
+| 路线 | 成本 | 说明 |
+|---|---|---|
+| ✅ **浏览器**(板子自己发页面) | **零安装** | 真实监控产品的客户端就是浏览器;页面调的就是上面那几个 REST 接口 |
+| ✅ **VLC / mpv**(播放列表) | 零代码 | 证明"服务端不挑客户端";拖动进度条走我们的 `Range` |
+| ⬜ **自研 C 客户端**(SDL2 + FFmpeg,可选 ImGui) | 中等 | 想讲"解复用→解码→YUV 上屏"这条链路时再做;比 Qt 依赖小得多 |
+| ⬜ **接第三方开源 NVR**(Frigate / ZoneMinder / Agent DVR) | 零代码 | 证明设备**标准可接入**;它们的回放读自己的盘, 不读板子的分段 |
+| ❌ Qt + FFmpeg(原计划) | 大 | 框架本身要学一遍;对嵌入式岗的加分不如"协议+解码"本身 |
 
 > ⚠️ **没有鉴权** —— 任何能连上这个端口的人都能下载全部录像、改锁定清单。
 > 定位是**局域网里的开发板演示**,不适合公网。
 > ⚠️ 服务是**串行**的:一个正在下载大分段的客户端会占住它几十秒(见 `docs/ARCHITECTURE.md` 的 ADR-5)。
 > ✅ 但"客户端不读数据"**不会**卡死服务:超时会主动丢掉那个连接(验收 A17 第 ⑨ 条)。
+> ⚠️ 播放列表里每段的时长写的是 `-1`(未知):要报准确时长得解析每个 MP4 的 `mvhd`,
+> 而我们不存这个信息 —— **宁可写"未知"也不写假数字**。
 
 ### 6.5 验证(RTSP)
 
