@@ -142,33 +142,64 @@ Ubuntu 22.04 (192.168.16.100)
 | # | 内容 | 状态 |
 |---|---|---|
 | **M0** | 采集→编码跑通,产出标准 H.264/H.265 | ✅ 已完成 |
-| **M1** | RTSP/RTP 服务端,PC VLC 实时播放 | ✅ 已完成(仅**多客户端**未做) |
+| **M1** | RTSP/RTP 服务端,PC VLC 实时播放 | ✅ 已完成(UDP + **RTP over TCP 交错**, 多客户端已实测) |
 | **M2** | OSD 叠加时间(REGION) | ✅ 已完成(板子实测) |
-| **M3** | MP4 录制 + SD 卡环形覆盖 | ✅ 已完成(验收 A4~A7 全过;分段边界零丢帧) |
+| **M3** | MP4 录制 + SD 卡环形覆盖 | ✅ 已完成(验收 **A4~A15** 全过:掉电可救 / 盘满不停 / 按时间或大小分段 / 锁定段保护) |
 | **M4** | PC 拉流端(Qt + FFmpeg) | ⬜ 下一步(实时预览 + 回放) |
 
 ---
 
 ## 六、编译与运行
 
-交叉编译需要:海思 Hi3516CV500 SDK + `arm-himix200` 交叉工具链 + **自编译的 mp4v2 静态库**
-(见"二、开发环境")。
+### 6.1 交叉编译(给板子)
 
-> ⚠️ **仓库目前未附 Makefile** —— 构建脚本还在开发环境里
-> (见 [`docs/STATUS.md`](docs/STATUS.md) 已知问题 #8,计划补上)。
-> 编译要点:`-I` 指向 SDK 的 `mpp/include` 与我们的 `src/*`;链接厂商 MPP 库与
-> `libmp4v2.a`(**注意静态库的分组顺序**,否则会出现"库明明给了却报未定义符号")。
+需要三样**仓库外**的东西(体积与许可原因没进仓库), 用变量指过去即可:
+
+| 变量 | 是什么 | 默认值 |
+|---|---|---|
+| `SDK_DIR` | 海思 Hi3516CV500 SDK(头文件 + 静态库 + `sample/common`) | `$HOME/hi3516_sdk/Hi3516CV500_SDK_V2.0.2.0` |
+| `MP4V2_DIR` | 自己交叉编译的 mp4v2 静态库(见"二、开发环境") | `$HOME/mp4v2-arm` |
+| `CROSS_COMPILE` | 交叉工具链前缀(含结尾 `-`) | `/opt/hisi-linux/toolchain/arm-himix200-linux/arm-himix200-linux/bin/arm-himix200-linux-` |
 
 ```bash
-cp ipc_app ~/nfs_share/                     # 产物拷到 NFS 共享
-# 板子上(必须先 cp 到 /tmp, 见下方坑):
-cp /mnt/nfs/ipc_app /tmp/ && chmod +x /tmp/ipc_app
-/tmp/ipc_app -p 8554 -s 1800 -r 8192        # 默认: 每段 30 分钟 / 环形上限 8 GB
+make                     # → build/ipc_app
+# 路径不同就覆盖变量:
+make SDK_DIR=/opt/Hi3516CV500_SDK_V2.0.2.0 MP4V2_DIR=$HOME/mp4v2-arm \
+     CROSS_COMPILE=/opt/toolchain/bin/arm-himix200-linux-
+make help                # 看当前生效的变量
 ```
 
-> 常用选项:`-s <秒>` 每段时长(默认 1800)、`-r <MB>` 环形上限(默认 8192,
-> ⚠️ **必须大于一段**)、`-no-record` 不录、`-no-osd` 不叠水印、`-h265` 取 H.265 那一路
-> (mp4v2 不支持 H.265 封装,该模式下**录制会自动关闭**)。
+> ⚠️ 链接时**所有静态库(含系统库)必须在同一个 `--start-group` 里** —— 厂商库之间有
+> 循环依赖, 分组顺序错了会报"库明明给了却未定义符号"(踩过, 见项目 bug log B021)。
+> ⚠️ mp4v2 的头文件是 **C++** 的, 所以**故意不把它的 `include/` 加进 `-I`**,
+> 我们用自己的垫片 `src/service/svc_record_mp4.h`。
+
+### 6.2 PC 原生单测(**不需要 SDK, 也不需要板子**)
+
+```bash
+make test                                 # 跑到 7 条;另外 2 条要裸流样本, 会**显式跳过**
+make test RAW_STREAM=stream_chn1.h264     # 9 条全跑(样本 = 任意一段 Annex-B 裸流)
+```
+
+`protocol` / `infra` / 录制策略层都不碰硬件, 所以用**宿主 gcc** 就能编译并跑断言:
+拿到仓库的人不用买板子也能验证一半代码。任何一条断言失败, `make` 就以非 0 退出(可直接进 CI)。
+
+### 6.3 上板运行
+
+```bash
+cp build/ipc_app ~/nfs_share/                # 产物拷到 NFS 共享
+# 板子上(必须先 cp 到 /tmp, 见下方坑):
+cp /mnt/nfs/ipc_app /tmp/ && chmod +x /tmp/ipc_app
+/tmp/ipc_app -p 8554 -s 1800 -m 1024 -r 8192
+```
+
+> 常用选项:`-s <秒>` 每段时长(默认 1800)、`-m <MB>` 每段**大小上限**(默认 1024,
+> 与 `-s` 谁先到算谁)、`-r <MB>` 环形容量上限(默认 8192, ⚠️ **必须大于一段**)、
+> `-no-record` 不录、`-no-raw` 不写旁路裸流侧车、`-no-osd` 不叠水印、
+> `-h265` 取 H.265 那一路(mp4v2 不支持 H.265 封装, 该模式下**录制会自动关闭**)。
+>
+> **锁定段**(重要录像不被覆盖):往录制目录里的 `.locked` 写文件名, 一行一个;
+> 被锁的分段**环形覆盖会跳过**, 清理会继续删下一个最旧的。全被锁定时会明确报错但不停录。
 
 > ⚠️ **NFS 执行坑**:直接从 `/mnt/nfs` 执行刚生成的二进制可能报
 > `No such file or directory`(NFS 属性缓存)。**先 `cp` 到 `/tmp` 再运行。**
