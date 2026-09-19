@@ -182,6 +182,35 @@ VENC 的编码缓冲有限(实测 `HI_MPI_VENC_GetStream` 后必须尽快 `Relea
 
 ---
 
+### ADR-5:回放服务 = **单线程串行 + 非阻塞客户端 + 每请求一条连接**
+
+**背景**:阶段 2 要在板子上提供"列分段 / 带 `Range` 取流 / 锁定解锁"(HTTP)。
+
+| 备选 | 为什么不选 |
+|---|---|
+| **每客户端一个线程** | 线程数不可控(每个连接一个栈);而回放是低频操作,为它引入线程池/上限管理不值 |
+| **epoll + 每客户端非阻塞状态机 + `sendfile()`** | 这是"正确"的终局形态, 但要引入"发送游标/半包状态/超时回收"一整套状态机 —— 现在(局域网 1~2 个客户端)收益不抵复杂度 |
+| **✅ 单线程串行 + 非阻塞 + `Connection: close`** | 一次只服务一个请求, 代码短到能一眼看完;非阻塞保证**任何一个客户端都卡不住服务** |
+
+**关键三条**(都是踩过坑才写下来的):
+
+1. **客户端 socket 必须非阻塞**。阻塞 `send` 会在"客户端不读数据"时**在内核里无限等** ——
+   单线程服务就此永久卡死(实测:`/proc/<tid>/syscall` 里卡在 `send(fd,…)`)。
+   非阻塞后 `send` 得到 `EAGAIN` ⇒ `infra_tcp_write_all()` `poll` 等 100 ms ⇒ 等不到就
+   **丢掉这个连接**。(B041)
+2. **停服务要主动打断在途连接**(`shutdown(cur_fd, SHUT_RDWR)`),否则 `pthread_join`
+   会一直等那个线程 —— 表现是"**`kill -TERM` 杀不掉进程**",还占着端口让新进程起不来。(B041)
+3. **请求头与 body 必须切开解析**:body 常和头在同一个 TCP 段里到达;
+   把头区之后的字节也喂给"逐行解析"会把 body 当成长度非法的头行 ⇒ 400。(B042)
+
+**代价(写在这里,不藏着)**:
+- 一个"正在下载"的客户端会占住服务(30 分钟段 ~900 MB,千兆局域网约 80 秒);
+- 每个请求一条连接(没有 keep-alive)、没有 chunked、没有 TLS、**没有鉴权** ——
+  任何能连上 8080 的人都能下载全部录像、也能改锁定清单。
+  **定位是"局域网里的开发板",不声称适合公网。**
+
+---
+
 ## 四、线程与所有权(定稿)
 
 | 对象 | 唯一所有者 | 访问者 | 通信/同步 | 停止与错误恢复 |
@@ -194,6 +223,9 @@ VENC 的编码缓冲有限(实测 `HI_MPI_VENC_GetStream` 后必须尽快 `Relea
 | **客户端会话** | `svc_net` net 线程 | 发送线程只读 RTP 会话状态 | 会话表 + 引用计数 | `TEARDOWN`/超时/`send` 失败即销毁 |
 | **RTP 会话**(每客户端每通道) | `svc_net` | 发送线程 | 每会话独立,无共享 | 会话销毁时一并释放 |
 | **MP4 文件句柄** | `svc_record` | 无 | — | 信号触发时**必须先 `MP4Close`** |
+| **锁定清单缓存**(`g_locks`) | `svc_record` | 录制线程(重读) / HTTP 线程(查与改) | **互斥锁** `g_lock_mtx`,临界区只有几百字节 | 改清单用"写 `.tmp` → `fsync` → `rename`" |
+| **分段扫描表**(`g_scan`/`g_del`) | `svc_record` 录制线程 | 无 | — | **刻意不共享**:回放列表走另一条扫描,用调用方数组 |
+| **HTTP 客户端连接** | `svc_http` http 线程 | 无 | 串行处理(一次一个) | 非阻塞 + 有界读 + 有界发送(见 ADR-5) |
 | **日志** | `infra_log` | 所有线程 | 互斥锁,极短临界区 | 写失败只降级不崩溃 |
 
 > **"唯一所有者"是硬约束**:任何对象同一时刻只能有一个线程能改它。
@@ -212,6 +244,7 @@ VENC 的编码缓冲有限(实测 `HI_MPI_VENC_GetStream` 后必须尽快 `Relea
 | 发送队列 | 8 帧 × 256 KB ≈ 2 MB | 容忍 8 帧的突发;按 4Mbps 算约 0.5 秒 | **堆预分配(启动时)** |
 | 录制队列 | 4 帧 × 256 KB ≈ 1 MB | 磁盘临时变慢时缓冲 | 堆预分配 |
 | 客户端会话表 | 8 个 | 够用;超过拒绝新连接 | 静态数组 |
+| 回放服务缓冲 | 请求 2 KB + 应答头 1 KB + JSON 16 KB + 分段表 5 KB + 取文件块 32 KB ≈ **56 KB** | JSON 要装下 64 条分段(每条约 190 字节);取文件块取 32 KB(卡上顺序读与一次 `send` 都合适) | 静态(`.bss`) |
 
 **板子内存约束**:`mem=128M`,MMZ 384M。用户态可用约 100MB,规划占用 < 5MB 很安全。
 
@@ -237,46 +270,45 @@ VENC 的编码缓冲有限(实测 `HI_MPI_VENC_GetStream` 后必须尽快 `Relea
 | `bsp_mpp` | `bsp_mpp_init()`, `bsp_mpp_get_frame()`, `bsp_mpp_release_frame()` | MPP |
 | `svc_media` | `svc_media_start()`, `svc_media_stop()` | `bsp_mpp`, `proto_nalu` |
 | `svc_net` | `svc_net_start()`, `svc_net_stop()` | `proto_rtsp`, `proto_sdp`, `infra_*` |
-| `svc_record` | `svc_record_start()`, `svc_record_stop()` | MPP, mp4v2 |
+| `svc_record` | `svc_record_start()`, `svc_record_stop()`, **`svc_record_list()` / `svc_record_set_lock()` / `svc_record_make_path()`**(回放服务用) | MPP, mp4v2, `svc_record_policy` |
+| `proto_str` | `proto_str_append()`, `proto_str_u32/u64()`, `proto_str_parse_u32/u64()`, `proto_str_eq_ci*()` | 无(协议层共用小工具) |
+| `proto_http` | `proto_http_parse()`, `proto_http_match_path()`, `proto_http_name_ok()`, `proto_http_build_head()` | `proto_str` |
+| `svc_http` | `svc_http_start()`, `svc_http_stop()`, `svc_http_port()`, `svc_http_get_stats()` | `proto_http`, `svc_record`, `infra_netio` |
 
 ---
 
-## 七、目录结构(定稿)
+## 七、目录结构(与仓库一致)
 
 ```
 ipc_camera/
-├── 项目计划.md
-├── 架构设计.md          ← 本文
-├── 编码规范.md
-├── Makefile
+├── Makefile             ← make / make test / make clean / make help
+├── README.md
+├── docs/                PROJECT_PLAN / STATUS / ARCHITECTURE / CODING_STYLE / research/
 ├── src/
-│   ├── app_main.c
-│   ├── bsp/     bsp_mpp.c/h
-│   ├── service/ svc_media.c/h  svc_net.c/h  svc_record.c/h
-│   ├── protocol/ proto_nalu.c/h  proto_rtp.c/h
-│   │             proto_sdp.c/h   proto_rtsp.c/h
-│   └── infra/   infra_queue.c/h  infra_netio.c/h  infra_poll.c/h  infra_log.c/h
-├── tools/               ← 可在 PC 上原生编译的测试工具
-│   ├── nalu_dump.c
-│   ├── rtp_test.c
-│   └── sdp_test.c
-└── tests/               ← 单元测试
-    └── test_all.c
+│   ├── app/       app_main.c
+│   ├── bsp/       bsp_mpp.c/h  bsp_osd.c/h  bsp_osd_render.c/h
+│   ├── service/   svc_media.c/h  svc_net.c/h  svc_sender.c/h  svc_osd.c/h
+│   │              svc_record.c/h  svc_record_policy.c/h  svc_record_mp4.h
+│   │              svc_http.c/h                      ← 阶段 2 回放服务
+│   ├── protocol/  proto_nalu.c/h  proto_rtp.c/h  proto_rtsp.c/h
+│   │              proto_sdp.c/h   proto_str.c/h   proto_http.c/h
+│   └── infra/     infra_queue.c/h  infra_netio.c/h  infra_poll.c/h  infra_log.c/h
+└── tools/               ← **PC 上原生编译**的测试与诊断工具
+    ├── http_test.c              rtp_test.c      sdp_test.c      rtsp_test.c
+    ├── svc_record_policy_test.c infra_queue_test.c infra_netio_test.c
+    ├── svc_net_test.c           svc_sender_test.c bsp_osd_render_test.c
+    └── (media_smoke.c / media_diag.c / nalu_dump.c / rtp_header_dump.c 需要 SDK)
 ```
 
 ---
 
 ## 八、下一步
 
-| 顺序 | 任务 | 能否 PC 单测 |
+| 顺序 | 任务 | 状态 |
 |---|---|---|
-| 1 | `proto_sdp.c` SDP 生成 | ✅ 能 |
-| 2 | `proto_rtsp.c` RTSP 解析/构造 | ✅ 能 |
-| 3 | `infra_queue.c` 环形队列 | ✅ 能 |
-| 4 | `infra_netio.c` 发送抽象 + socket 助手 | ✅ 能 |
-| 4b | `infra_poll.c` epoll 封装 | ✅ 能(需 Linux, 在 VM 上测) |
-| 4c | `infra_log.c` 分级日志 | ✅ 能 |
-| 5 | `svc_net.c` epoll 事件循环 | ⚠️ 部分 |
-| 6 | `bsp_mpp.c` + `svc_media.c` | ❌ 只能板上 |
-| 7 | `app_main.c` 集成 | ❌ |
-| 8 | VLC 联调 | ❌ |
+| 1 | M1 RTSP/RTP 服务端(UDP + TCP 交错 + 多客户端) | ✅ 完成 |
+| 2 | M2 OSD 时间水印 | ✅ 完成 |
+| 5 | M3 MP4 分段录制 + 环形覆盖 + 掉电可救 + 大小上限 + 锁定段 | ✅ 完成(验收 A4~A15) |
+| 6 | **阶段 2 回放(服务端)**:列分段 / `Range` 取流 / 锁定解锁 | ✅ 完成(验收 A17) |
+| 7 | 仓库自带构建脚本 + PC 单测入口 | ✅ 完成(A16: `make test`) |
+| 8 | **阶段 2 回放(客户端)**:Qt + FFmpeg 时间轴、拖动、锁定按钮 | ⬜ 下一步 |
