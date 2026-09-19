@@ -1383,6 +1383,14 @@ static int scan_segments(svc_record_policy_file_t *out, int cap)
     if (d == NULL) {
         return -1;
     }
+    /*
+     * ★ 必须先重读锁定清单(2026-09-19 修的 B043)。
+     *   录制线程那条路(`scan_dir()`)本来就会重读, 但**回放列表是另一条路** ——
+     *   如果一个进程刚起来、还没收过段(默认 30 分钟才收一次), 缓存就是空的,
+     *   于是列表会**把锁定的段报成 `locked:0`**:锁还在文件里, 用户看到的却是"没锁"。
+     *   读一个几百字节的小文件, 代价可以忽略。
+     */
+    load_locks();
     while ((e = readdir(d)) != NULL && n < cap) {
         if (!name_is_mp4(e->d_name)) {
             continue;                   /* `.mp4.tmp` / `.h264.tmp` / `.locked` 全被排除 */
@@ -1443,6 +1451,13 @@ static int lock_write(const char *name, int on)
         used = fread(g_lock_buf, 1, sizeof(g_lock_buf) - 1, fp);
         (void)fclose(fp);
         g_lock_buf[used] = '\0';
+    } else if (errno != ENOENT) {
+        /* ★ 清单**存在但读不出来**时**绝不能当成"空的"往下写** ——
+         *   那会把用户已有的锁定**整份覆盖掉**(锁是用户的意图, 丢不起)。
+         *   只有"文件本来就没有"(ENOENT)才算空清单。 */
+        LOG_ERROR("回放: 锁定清单打不开(%s), 拒绝覆盖: %s",
+                  strerror(errno), path);
+        return -1;
     } else {
         g_lock_buf[0] = '\0';
     }
