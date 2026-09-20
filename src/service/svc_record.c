@@ -1590,6 +1590,58 @@ int svc_record_request_rotate(char *name, size_t cap, int *age_sec)
     return 0;
 }
 
+int svc_record_dir_stats(svc_record_dir_stats_t *out)
+{
+    DIR           *d;
+    struct dirent *e;
+    struct statvfs vfs;
+
+    if (out == NULL) {
+        return -1;
+    }
+    memset(out, 0, sizeof(*out));
+    if (statvfs(g.dir, &vfs) == 0) {
+        out->disk_total = (uint64_t)vfs.f_blocks * vfs.f_frsize;
+        out->disk_free  = (uint64_t)vfs.f_bavail * vfs.f_frsize;
+    }
+    load_locks();                       /* 锁定状态要新鲜的(B043 的教训) */
+    d = opendir(g.dir);
+    if (d == NULL) {
+        return -1;
+    }
+    while ((e = readdir(d)) != NULL) {
+        uint64_t sz;
+
+        if (!name_is_mp4(e->d_name)) {
+            continue;
+        }
+        sz = file_size_of(e->d_name);
+        out->files++;
+        out->bytes += sz;
+        if (sz > out->largest) {
+            out->largest = sz;
+        }
+        if (out->smallest == 0 || sz < out->smallest) {
+            out->smallest = sz;
+        }
+        if (is_locked(e->d_name)) {
+            out->locked++;
+        }
+    }
+    closedir(d);
+    return 0;
+}
+
+/**
+ * @brief 把分段名拼成完整路径, 并**挡住**一切不是"已收尾分段"的名字
+ *
+ * @param[in]  name 分段名
+ * @param[out] out  输出
+ * @param[in]  cap  容量
+ * @return 写入字符数; <=0 = 名字不合法 / 放不下
+ *
+ * @note 头文件里写了它为什么是回放服务的最后一道门(`.tmp` / `.locked` 一律不给路径)。
+ */
 int svc_record_make_path(const char *name, char *out, size_t cap)
 {
     if (name == NULL || out == NULL || !name_is_mp4(name)) {

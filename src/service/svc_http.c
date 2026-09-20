@@ -27,12 +27,17 @@
 #include <time.h>       /* nanosleep(与 svc_media/svc_osd 同一种睡法) */
 #include <unistd.h>
 
+#include "bsp_mpp.h"
 #include "infra_log.h"
 #include "infra_netio.h"
 #include "proto_http.h"
 #include "proto_str.h"
 #include "svc_http_page.h"
+#include "svc_live.h"
+#include "svc_media.h"
+#include "svc_net.h"
 #include "svc_record.h"
+#include "svc_sender.h"
 
 /** 请求缓冲(头 + 小的 body;`proto_http` 的头区上限是 1024) */
 #define HTTP_REQ_BUF   2048
@@ -369,9 +374,266 @@ static int append_live_uri(const char *host, size_t *used)
     return 0;
 }
 
+/* ─────────── `GET /stats`:给页面数据面板的一份"体检数字"─────────── */
+
+/** 采样环长度(1 Hz × 60 = 最近一分钟;页面刚打开就能立刻画趋势) */
+#define HTTP_HIST_N 60
+
+/** 一条采样(时间片里的"速率", 不是累计值 —— 页面不用自己做差) */
+typedef struct {
+    uint16_t dt_ms;        /* 与上一条的间隔(秒 ×10) */
+    uint16_t mfps_x10;     /* 取流 fps ×10 */
+    uint32_t rec_kbps;     /* 录制码流 KB/s */
+    uint16_t lfps_x10;     /* MJPEG fps ×10 */
+    uint8_t  live_clients; /* 实时观看人数 */
+    uint8_t  drop_send;    /* 这一秒发送队列丢帧 */
+} http_sample_t;
+
+/*
+ * 采样环(只归 http 线程;页面拉 `/stats` 时才采一次 —— **不新增线程**)
+ */
+static http_sample_t g_hist[HTTP_HIST_N];
+static int           g_hist_n;                 /* 已填条数(<= HTTP_HIST_N) */
+static int           g_hist_head;              /* 下一个写入位置 */
+static uint64_t      g_hist_last_ms;           /* 上次采样时刻(单调毫秒) */
+static uint64_t      g_s0_frames, g_s0_bytes, g_s0_recbytes, g_s0_live;
+static uint64_t      g_s0_drop;
+static uint32_t      g_hist_t0;                /* 页面从"第 0 条"起算的相对秒 */
+
 /**
- * @brief 把"正在录"的那几个字段追加进 JSON
+ * @brief 现在(单调毫秒;`/stats` 的采样节奏用)
+ */
+static uint64_t stat_now_ms(void)
+{
+    struct timespec ts;
+
+    (void)clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000 + (uint64_t)(ts.tv_nsec / 1000000);
+}
+
+/**
+ * @brief 需要的话采一条:把"累计计数器"化成"这一秒的速率"存进环里
  *
+ * @note ★ **不新增线程**:谁拉 `/stats` 谁顺手采(间隔 >= 1 秒才采)。
+ *       没人看页面时就不采 —— 省 CPU, 环里自然是"上次有人看时的最近一分钟"。
+ * @note ⚠️ 【简化上限】只有**一个**采样器(串行 http 线程)⇒ 不需要锁。
+ *       升级路径: 若将来多线程服务, 这里要加互斥锁或改成录制线程定时采。
+ */
+static void stats_sample(void)
+{
+    svc_media_stats_t      ms;
+    svc_record_stats_t     rs;
+    svc_live_stats_t       ls;
+    uint64_t               now = stat_now_ms();
+    uint64_t               dt  = now - g_hist_last_ms;
+    http_sample_t         *h;
+
+    if (g_hist_last_ms != 0 && dt < 1000) {
+        return;                         /* 一秒最多一条 */
+    }
+    if (dt == 0 || dt > 60000) {
+        dt = 1000;                      /* 第一次 / 隔太久: 当 1 秒 */
+    }
+    svc_media_get_stats(&ms);
+    svc_record_get_stats(&rs);
+    svc_live_get_stats(&ls);
+    h = &g_hist[g_hist_head];
+    h->dt_ms       = (uint16_t)(dt / 100);          /* 秒 ×10 */
+    h->mfps_x10    = (uint16_t)((ms.frames - g_s0_frames) * 10000 / dt);
+    h->rec_kbps    = (uint32_t)((rs.bytes_written - g_s0_recbytes) / dt);
+    h->lfps_x10    = (uint16_t)((ls.frames - g_s0_live) * 10000 / dt);
+    h->live_clients = (uint8_t)((ls.clients < 0) ? 0 : ls.clients);
+    h->drop_send   = (uint8_t)((ms.queue_dropped - g_s0_drop) > 255 ? 255
+                               : (ms.queue_dropped - g_s0_drop));
+    g_s0_frames    = ms.frames;
+    g_s0_recbytes  = rs.bytes_written;
+    g_s0_live      = ls.frames;
+    g_s0_drop      = ms.queue_dropped;
+    g_hist_last_ms = now;
+    g_hist_head    = (g_hist_head + 1) % HTTP_HIST_N;
+    if (g_hist_n < HTTP_HIST_N) {
+        g_hist_n++;
+    }
+    g_hist_t0      = (uint32_t)(now / 1000);
+}
+
+/**
+ * @brief 把采样环吐成 JSON 数组(`[[dt10,mfps10,recKBps,lfps10,clients,drop],…]`, 旧→新)
+ */
+static int append_hist(size_t *used)
+{
+    int k;
+
+    if (proto_str_append(g.text, sizeof(g.text), used, ",\"hist\":[") != 0) {
+        return -1;
+    }
+    for (k = 0; k < g_hist_n; k++) {
+        int          idx = (g_hist_head - g_hist_n + k + HTTP_HIST_N) % HTTP_HIST_N;
+        http_sample_t *h = &g_hist[idx];
+
+        if (k > 0 && proto_str_append(g.text, sizeof(g.text), used, ",") != 0) {
+            return -1;
+        }
+        if (proto_str_append(g.text, sizeof(g.text), used, "[") != 0 ||
+            proto_str_append_u32(g.text, sizeof(g.text), used, h->dt_ms) != 0 ||
+            proto_str_append(g.text, sizeof(g.text), used, ",") != 0 ||
+            proto_str_append_u32(g.text, sizeof(g.text), used, h->mfps_x10) != 0 ||
+            proto_str_append(g.text, sizeof(g.text), used, ",") != 0 ||
+            proto_str_append_u32(g.text, sizeof(g.text), used, h->rec_kbps) != 0 ||
+            proto_str_append(g.text, sizeof(g.text), used, ",") != 0 ||
+            proto_str_append_u32(g.text, sizeof(g.text), used, h->lfps_x10) != 0 ||
+            proto_str_append(g.text, sizeof(g.text), used, ",") != 0 ||
+            proto_str_append_u32(g.text, sizeof(g.text), used, h->live_clients) != 0 ||
+            proto_str_append(g.text, sizeof(g.text), used, ",") != 0 ||
+            proto_str_append_u32(g.text, sizeof(g.text), used, h->drop_send) != 0 ||
+            proto_str_append(g.text, sizeof(g.text), used, "]") != 0) {
+            return -1;
+        }
+    }
+    return proto_str_append(g.text, sizeof(g.text), used, "]}\n");
+}
+
+/** @brief 发一段"已经拼好的 JSON"(带 `no-store`);定义在下面 */
+static int send_text_body(int cfd, const char *body, size_t len);
+
+/** @brief `/stats` 的磁盘与分段汇总那一段 JSON */
+static int append_disk_json(size_t *used)
+{
+    svc_record_dir_stats_t ds;
+
+    (void)svc_record_dir_stats(&ds);
+    if (proto_str_append(g.text, sizeof(g.text), used, ",\"disk\":{\"total\":") != 0 ||
+        proto_str_append_u64(g.text, sizeof(g.text), used, ds.disk_total) != 0 ||
+        proto_str_append(g.text, sizeof(g.text), used, ",\"free\":") != 0 ||
+        proto_str_append_u64(g.text, sizeof(g.text), used, ds.disk_free) != 0 ||
+        proto_str_append(g.text, sizeof(g.text), used, "},\"segs\":{\"files\":") != 0 ||
+        proto_str_append_u32(g.text, sizeof(g.text), used,
+                             (uint32_t)ds.files) != 0 ||
+        proto_str_append(g.text, sizeof(g.text), used, ",\"locked\":") != 0 ||
+        proto_str_append_u32(g.text, sizeof(g.text), used,
+                             (uint32_t)ds.locked) != 0 ||
+        proto_str_append(g.text, sizeof(g.text), used, ",\"bytes\":") != 0 ||
+        proto_str_append_u64(g.text, sizeof(g.text), used, ds.bytes) != 0 ||
+        proto_str_append(g.text, sizeof(g.text), used, ",\"min\":") != 0 ||
+        proto_str_append_u64(g.text, sizeof(g.text), used, ds.smallest) != 0 ||
+        proto_str_append(g.text, sizeof(g.text), used, ",\"max\":") != 0 ||
+        proto_str_append_u64(g.text, sizeof(g.text), used, ds.largest) != 0) {
+        return -1;
+    }
+    return proto_str_append(g.text, sizeof(g.text), used, "}");
+}
+
+/** @brief `/stats` 的 RTSP 客户端那一段 JSON */
+static int append_rtsp_json(size_t *used)
+{
+    svc_sender_stats_t ss;
+    svc_net_stats_t    ns;
+
+    svc_sender_get_stats(&ss);
+    svc_net_get_stats(&ns);
+    if (proto_str_append(g.text, sizeof(g.text), used, ",\"rtsp\":{\"clients\":") != 0 ||
+        proto_str_append_u32(g.text, sizeof(g.text), used,
+                             (uint32_t)svc_sender_client_count()) != 0 ||
+        proto_str_append(g.text, sizeof(g.text), used, ",\"conns\":") != 0 ||
+        proto_str_append_u64(g.text, sizeof(g.text), used, ns.conns_accepted) != 0 ||
+        proto_str_append(g.text, sizeof(g.text), used, ",\"reqs\":") != 0 ||
+        proto_str_append_u64(g.text, sizeof(g.text), used, ns.requests) != 0 ||
+        proto_str_append(g.text, sizeof(g.text), used, ",\"wait_idr\":") != 0 ||
+        proto_str_append_u64(g.text, sizeof(g.text), used, ss.waiting_idr) != 0 ||
+        proto_str_append(g.text, sizeof(g.text), used, ",\"sent_kb\":") != 0 ||
+        proto_str_append_u64(g.text, sizeof(g.text), used, ss.bytes_sent / 1024) != 0 ||
+        proto_str_append(g.text, sizeof(g.text), used, ",\"age_ms\":") != 0 ||
+        proto_str_append_u32(g.text, sizeof(g.text), used,
+                             (uint32_t)(ss.age_last_us / 1000)) != 0 ||
+        proto_str_append(g.text, sizeof(g.text), used, "}") != 0) {
+        return -1;
+    }
+    return 0;
+}
+
+/** @brief `/stats` 的录制与回放自报数那一段 JSON */
+static int append_rec_json(size_t *used)
+{
+    svc_record_status_t st;
+    svc_record_stats_t  rs;
+
+    svc_record_get_status(&st);
+    svc_record_get_stats(&rs);
+    if (proto_str_append(g.text, sizeof(g.text), used, ",\"rec\":{\"recording\":") != 0 ||
+        proto_str_append(g.text, sizeof(g.text), used,
+                         st.recording ? "1" : "0") != 0 ||
+        proto_str_append(g.text, sizeof(g.text), used, ",\"frames\":") != 0 ||
+        proto_str_append_u64(g.text, sizeof(g.text), used, rs.frames_written) != 0 ||
+        proto_str_append(g.text, sizeof(g.text), used, ",\"segments\":") != 0 ||
+        proto_str_append_u64(g.text, sizeof(g.text), used, rs.segments) != 0 ||
+        proto_str_append(g.text, sizeof(g.text), used, ",\"deleted\":") != 0 ||
+        proto_str_append_u64(g.text, sizeof(g.text), used, rs.deleted) != 0 ||
+        proto_str_append(g.text, sizeof(g.text), used, ",\"write_errors\":") != 0 ||
+        proto_str_append_u64(g.text, sizeof(g.text), used, rs.write_errors) != 0 ||
+        proto_str_append(g.text, sizeof(g.text), used, ",\"cur_bytes\":") != 0 ||
+        proto_str_append_u64(g.text, sizeof(g.text), used, st.bytes) != 0 ||
+        proto_str_append(g.text, sizeof(g.text), used, ",\"cur_frames\":") != 0 ||
+        proto_str_append_u64(g.text, sizeof(g.text), used, st.frames) != 0 ||
+        proto_str_append(g.text, sizeof(g.text), used, ",\"cur_started\":") != 0 ||
+        proto_str_append_u64(g.text, sizeof(g.text), used, st.started_at) != 0 ||
+        proto_str_append(g.text, sizeof(g.text), used, "},\"http\":{\"files\":") != 0 ||
+        proto_str_append_u64(g.text, sizeof(g.text), used, g.stats.files) != 0 ||
+        proto_str_append(g.text, sizeof(g.text), used, ",\"partials\":") != 0 ||
+        proto_str_append_u64(g.text, sizeof(g.text), used, g.stats.partials) != 0 ||
+        proto_str_append(g.text, sizeof(g.text), used, ",\"bytes_sent\":") != 0 ||
+        proto_str_append_u64(g.text, sizeof(g.text), used, g.stats.bytes_sent) != 0 ||
+        proto_str_append(g.text, sizeof(g.text), used, "}") != 0) {
+        return -1;
+    }
+    return 0;
+}
+
+/**
+ * @brief `GET /stats` —— 页面数据面板要的全部数字(一次拉完)
+ *
+ * @param[in] cfd 连接
+ * @return 0 成功; -1 失败
+ *
+ * @note 为什么要有这个接口: 页面上那些"数据图"需要**速率**(fps/码率/丢帧),
+ *       而 `app_main` 的汇报行只打到串口日志里。这里把**同一批**计数器直接给页面,
+ *       页面自己算趋势 ⇒ 用户不用去 `tail` 日志。
+ * @note ⚠️ 依赖:`svc_http` 因此**直接读**了 media/sender/net/record/live 五个模块的
+ *       统计快照(同层依赖, 都是"只读快照"这种无副作用调用; 见 ARCHITECTURE 的模块表)。
+ *       代价是耦合变多; 收益是**不用为此新增线程/全局总线**。升级路径: 若嫌耦合,
+ *       改成由 `app_main` 定时把一份 `stats_snapshot_t` 交给 svc_http。
+ */
+static int handle_stats(int cfd)
+{
+    size_t used = 0;
+
+    stats_sample();
+    if (proto_str_append(g.text, sizeof(g.text), &used, "{\"hist_t0\":") != 0 ||
+        proto_str_append_u32(g.text, sizeof(g.text), &used, g_hist_t0) != 0 ||
+        append_disk_json(&used) != 0 ||
+        append_rtsp_json(&used) != 0 ||
+        append_rec_json(&used) != 0 ||
+        append_hist(&used) != 0) {
+        return send_error(cfd, 500, NULL);
+    }
+    return send_text_body(cfd, g.text, used);
+}
+
+/** @brief 把"已经拼好的 JSON"发出去(带 `no-store`) */
+static int send_text_body(int cfd, const char *body, size_t len)
+{
+    if (send_head_only(cfd, 200, "application/json; charset=utf-8",
+                       (uint64_t)len, NULL, HTTP_HDR_NO_STORE) != 0) {
+        return -1;
+    }
+    if (len > 0 && infra_tcp_write_all(cfd, body, len) != 0) {
+        return -1;
+    }
+    g.stats.bytes_sent += len;
+    return 0;
+}
+
+/**
+ * @brief 把"正在录"的那几个字段追加进 JSON *
  * @param[in,out] used 已用长度
  * @param[in]     st   状态
  * @return 0 成功; -1 放不下
@@ -963,6 +1225,10 @@ static int dispatch(int cfd, const proto_http_request_t *req,
     }
     if (strcmp(path, "/status") == 0) {
         return handle_status(cfd, req);
+    }
+    if (strcmp(path, "/stats") == 0) {
+        return (req->method == PROTO_HTTP_GET) ? handle_stats(cfd)
+                                              : send_error(cfd, 405, NULL);
     }
     if (strcmp(path, "/recent.mp4") == 0 || strcmp(path, "/recent") == 0) {
         return (req->method == PROTO_HTTP_GET || req->method == PROTO_HTTP_HEAD)

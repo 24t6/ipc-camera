@@ -301,6 +301,31 @@ typedef struct {
 void svc_record_get_status(svc_record_status_t *out);
 
 /**
+ * @brief 录制目录的**汇总统计**(给回放页面的"数据面板"用)。
+ *
+ * @note 与 `svc_record_list()` 的区别:那个只给**最新一页**(有容量上限),
+ *       这个**扫全目录**只累计"几个数"(不存文件名), 所以能给出真实的总量与分布。
+ *       代价: 每个文件一次 `stat`(几百个文件 ⇒ 毫秒级), 页面每几秒拉一次完全够用。
+ */
+typedef struct {
+    int      files;         /**< `.mp4` 个数 */
+    int      locked;        /**< 其中被锁定的个数 */
+    uint64_t bytes;         /**< 所有分段合计字节 */
+    uint64_t smallest;      /**< 最小段字节(空目录 = 0) */
+    uint64_t largest;       /**< 最大段字节 */
+    uint64_t disk_total;    /**< 录制分区总容量(字节;取不到 = 0) */
+    uint64_t disk_free;     /**< 录制分区剩余(字节;取不到 = 0) */
+} svc_record_dir_stats_t;
+
+/**
+ * @brief 扫一遍录制目录, 填上面那个汇总(**任何线程可调**)。
+ *
+ * @param[out] out 输出
+ * @return 0 成功; -1 目录打不开
+ */
+int svc_record_dir_stats(svc_record_dir_stats_t *out);
+
+/**
  * 请求"尽快收尾当前段"时的**最短段龄**(秒)。
  *
  * @note 为什么需要它:回放服务的 `/recent.mp4` 就是靠"**把当前这段立刻收尾**"来让
