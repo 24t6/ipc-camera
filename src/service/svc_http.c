@@ -523,6 +523,25 @@ static int append_disk_json(size_t *used)
     return proto_str_append(g.text, sizeof(g.text), used, "}");
 }
 
+/**
+ * @brief 帧龄(毫秒)—— **没有客户端时必须报 0, 不能把"没测过"当成一个巨大的数**
+ *
+ * @param[in] ss 发送侧统计
+ * @return 帧龄毫秒;0 = 没有有效采样(页面显示成 `—`)
+ *
+ * @note ★ 2026-09-20 修:用户截图上"帧龄(发送侧)"显示 **4294967173 ms**
+ *       (= 2³² − 123)。根因:`age_last_us` 只在**真的给客户端发过帧**时才更新,
+ *       没有客户端时它是"未初始化/哨兵值"(负数), 除以 1000 再转 `uint32_t` 就绕成那个天文数字。
+ *       ⇒ **判据要区分"没测过"和"测出来是 0"**(和 B038 的"读到空 vs 真的是空"同源)。
+ */
+static uint32_t age_ms_of(const svc_sender_stats_t *ss)
+{
+    if (ss->age_samples == 0 || ss->age_last_us > 10ULL * 1000 * 1000) {
+        return 0;                       /* 没采样 / 明显是哨兵值 */
+    }
+    return (uint32_t)(ss->age_last_us / 1000);
+}
+
 /** @brief `/stats` 的 RTSP 客户端那一段 JSON */
 static int append_rtsp_json(size_t *used)
 {
@@ -543,8 +562,9 @@ static int append_rtsp_json(size_t *used)
         proto_str_append(g.text, sizeof(g.text), used, ",\"sent_kb\":") != 0 ||
         proto_str_append_u64(g.text, sizeof(g.text), used, ss.bytes_sent / 1024) != 0 ||
         proto_str_append(g.text, sizeof(g.text), used, ",\"age_ms\":") != 0 ||
-        proto_str_append_u32(g.text, sizeof(g.text), used,
-                             (uint32_t)(ss.age_last_us / 1000)) != 0 ||
+        proto_str_append_u32(g.text, sizeof(g.text), used, age_ms_of(&ss)) != 0 ||
+        proto_str_append(g.text, sizeof(g.text), used, ",\"age_n\":") != 0 ||
+        proto_str_append_u64(g.text, sizeof(g.text), used, ss.age_samples) != 0 ||
         proto_str_append(g.text, sizeof(g.text), used, "}") != 0) {
         return -1;
     }

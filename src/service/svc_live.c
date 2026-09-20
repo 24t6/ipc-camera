@@ -517,8 +517,17 @@ static void *live_thread(void *arg)
         }
         drop_dead_clients(p, nfds);
         if (g.clients > 0 && now_ms() >= next_frame) {
-            next_frame = now_ms() + interval;
             broadcast_frame();
+            /*
+             * ★ 节拍用"**累加**"而不是"从现在起再等一个周期": 后者会因为一次晚醒
+             *   (poll 多等了几毫秒 / 那一下编码器还没出帧)白白丢掉一整个周期 ——
+             *   实测目标 15fps 只跑出 14.4fps 就是这个原因。
+             *   落后超过一个周期就重新对齐, 免得追帧追出连续突发。
+             */
+            next_frame += interval;
+            if (next_frame < now_ms() - interval) {
+                next_frame = now_ms() + interval;
+            }
         }
     }
     for (i = 0; i < SVC_LIVE_MAX_CLIENTS; i++) {
