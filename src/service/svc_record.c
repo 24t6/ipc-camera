@@ -155,6 +155,66 @@ static char g_lock_buf[SVC_RECORD_LOCK_BUF];
  */
 static pthread_mutex_t g_lock_mtx = PTHREAD_MUTEX_INITIALIZER;
 
+/*
+ * "立刻收尾当前段"请求(回放服务的 `/recent.mp4` 用, 2026-09-20 加)
+ *
+ * 为什么需要它:`/recent.mp4` 要的是"**刚录的画面马上能播**", 而正在写的
+ *   `<stamp>.mp4.tmp` 没有 moov(播不了)。最小的正确做法不是自己重封一段,
+ *   而是**让录制线程把当前这段立刻收尾** —— 它本来就是"下一个 IDR 处关旧段、
+ *   用这一帧开新段", 一帧不丢, 收尾后立刻就是一个正常可播的 `.mp4`。
+ *
+ * ⚠️ 与 `g.want_close` 的区别:那个变量**只有录制线程读写**(它自己判断段长/段大小);
+ *    这个标志是**HTTP 线程写、录制线程读**的 ⇒ 必须用锁, 不能靠"恰好没别人碰"。
+ * ⚠️ 语义是"**一个待处理请求**", 不是队列:连点多次 = 切一次(见头文件【简化上限】)。
+ */
+static pthread_mutex_t g_req_mtx = PTHREAD_MUTEX_INITIALIZER;
+static int             g_rotate_req;
+
+/**
+ * @brief 有没有人请求"立刻收尾当前段"(只看, 不清)
+ *
+ * @return 1 = 有请求; 0 = 没有
+ *
+ * @note ⚠️ **只在录制线程调用**(看的时候不加锁, 故意容忍"刚好在这一瞬间变化"):
+ *       真正的取值/清零用 `take_rotate_request()`, 那个是原子的。
+ *       为什么允许这样:漏看一次只是"晚一帧切", 下一个 IDR 就会再命中, 没有正确性风险。
+ */
+static int rotate_requested(void)
+{
+    return g_rotate_req;
+}
+
+/**
+ * @brief 取用并清零"立刻收尾当前段"的请求
+ *
+ * @return 1 = 这次取到了请求(调用方应当去切段); 0 = 没有
+ *
+ * @note ⚠️ **只在录制线程调用**。★ **必须"真能切的时候"才取用** ——
+ *       如果在一帧 P 帧上就把标志清掉, 那个请求就**白丢了**(下一次 IDR 不再切),
+ *       用户会看到"点了没反应"。所以调用点都在 `is_key && g.mp4 != NULL` 里面。
+ */
+static int take_rotate_request(void)
+{
+    int v;
+
+    (void)pthread_mutex_lock(&g_req_mtx);
+    v = g_rotate_req;
+    g_rotate_req = 0;
+    (void)pthread_mutex_unlock(&g_req_mtx);
+    return v;
+}
+
+/**
+ * @brief 丢掉还没被处理的"立刻收尾"请求
+ *
+ * @note 开新段时调用:一个切段请求的**有效期就是它当时那一段** ——
+ *       否则它会在新段刚开、第一个 IDR 上把新段立刻切掉(切出一个 1 帧的碎段)。
+ */
+static void drop_rotate_request(void)
+{
+    (void)take_rotate_request();
+}
+
 /* ─────────── 文件名/路径小工具 ─────────── */
 
 /**
@@ -710,6 +770,7 @@ static int open_segment(void)
     g.bytes_in_seg  = 0;
     g.seg_started_at = (uint64_t)time(NULL);      /* 回放页面要显示"这段从几点开始录" */
     g.want_close    = 0;
+    drop_rotate_request();      /* 新段开始: 上一段的切段请求就此作废 */
     LOG_INFO("录制: 开始新分段 %s(%dx%d, 旁路裸流 %s)",
              g.cur_name, g.width, g.height, (g.raw != NULL) ? "开" : "关");
     return 0;
@@ -957,6 +1018,12 @@ static int seg_should_close(void)
  * @note 代价:段长从"恰好 segment_frames 帧"变成
  *       **segment_frames ~ segment_frames + GOP-1 帧**(30fps/GOP=30 时约
  *       30.0~31.0 秒)。"每段不短于设定值"是更强的语义, 这是有意的取舍。
+ * @note ★ 切段的**触发条件有两个**:① 段长/段大小到(`g.want_close`);
+ *       ② **回放服务的"看最新"请求**(`rotate_requested()`, 见
+ *       `svc_record_request_rotate()`)—— 两条都走同一个 `close_segment()`,
+ *       所以"边界对齐 IDR、一帧不丢"这条性质对两条路**同时成立**。
+ *       请求只在 `is_key && g.mp4 != NULL` 时取用(取用即清零):P 帧上清掉就等于
+ *       把用户的请求丢了(点一下没反应), 而"开新段"时会主动作废请求。
  */
 static void handle_slot(size_t len)
 {
@@ -974,7 +1041,8 @@ static void handle_slot(size_t len)
     data   = svc_media_slot_data(g_slot);
     is_key = proto_nalu_has_idr(data, h->len, 0 /* 只支持 H.264 */);
 
-    if (g.mp4 != NULL && g.want_close && is_key) {
+    if (g.mp4 != NULL && is_key && (g.want_close || rotate_requested())) {
+        (void)take_rotate_request();    /* 两条路都要清掉待处理请求, 免得误切下一段 */
         close_segment();                /* ★ 边界落在这个 IDR 上 */
     }
     if (g.mp4 == NULL) {
@@ -1458,6 +1526,41 @@ void svc_record_get_status(svc_record_status_t *out)
     out->frames     = (uint64_t)g.frames_in_seg;
     out->raw_bytes  = g.stats.raw_bytes;
     out->started_at = g.seg_started_at;
+}
+
+/**
+ * @brief 请求"尽快收尾当前段"(回放服务的 `/recent.mp4`, 见头文件的详细说明)
+ */
+int svc_record_request_rotate(char *name, size_t cap, int *age_sec)
+{
+    svc_record_status_t st;
+    int                 age = -1;
+
+    svc_record_get_status(&st);
+    if (name != NULL && cap > 0) {
+        snprintf(name, cap, "%s", st.name);
+    }
+    if (!st.recording) {
+        return -1;                      /* 没在录: 没有"当前段"可切 */
+    }
+    if (st.started_at > 0) {
+        time_t now = time(NULL);
+
+        age = (now >= (time_t)st.started_at)
+                  ? (int)(now - (time_t)st.started_at) : 0;
+    }
+    if (age_sec != NULL) {
+        *age_sec = age;
+    }
+    if (age >= 0 && age < SVC_RECORD_ROTATE_MIN_SEC) {
+        return 1;                       /* 段太新: 不切(免得切出一串碎段) */
+    }
+    (void)pthread_mutex_lock(&g_req_mtx);
+    g_rotate_req = 1;
+    (void)pthread_mutex_unlock(&g_req_mtx);
+    LOG_INFO("录制: 收到'立刻收尾本段'请求(段 %s 已录 %d 秒), 将在下一个 IDR 处切",
+             st.name, age);
+    return 0;
 }
 
 int svc_record_make_path(const char *name, char *out, size_t cap)

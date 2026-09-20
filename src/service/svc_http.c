@@ -54,6 +54,18 @@
 /** 声明了 Content-Length 之后, 最多再等多久那个 body(毫秒) */
 #define HTTP_BODY_WAIT_MS 500
 
+/**
+ * `GET /recent.mp4` 最多等录制线程多久把当前段收尾(毫秒)。
+ *
+ * @note 5 秒的来历:请求发出后录制线程会在**下一个 IDR** 处切(30fps/GOP=30 ⇒ ≤1 秒),
+ *       再加上 `MP4Close` 写 moov 的时间(实测百毫秒级)。5 秒是"正常情况 5 倍余量、
+ *       异常情况也不会把服务线程占太久"的折中。
+ */
+#define HTTP_ROTATE_WAIT_MS 5000
+
+/** "看最新"轮询等待时每次睡多久(毫秒) */
+#define HTTP_ROTATE_POLL_MS 50
+
 /*
  * 两个应答头常量(2026-09-20 补):
  *   · 页面/列表/状态是**动态内容** ⇒ `no-store`, 每次都要新鲜的。
@@ -487,10 +499,14 @@ static int send_file_body(int cfd, int fd, uint64_t first, uint64_t len)
  * @param[in] first  区间起点(206 时有效)
  * @param[in] last   区间终点(含)
  * @param[in] total  文件总长
+ * @param[in] hdrs   额外应答头(**整串**, 已带 `\r\n`);NULL = 用默认的 `HTTP_HDR_FILE`
  * @return 0 成功; -1 失败
+ *
+ * @note `hdrs` 这一维是 `/recent.mp4` 加的:它要把"**这次给你的是哪一段**"告诉客户端
+ *       (`X-Recent-Clip: <名字>`), 否则用户根本不知道点一下拿到的是哪段录像。
  */
 static int send_file_head(int cfd, int status, uint64_t first, uint64_t last,
-                          uint64_t total)
+                          uint64_t total, const char *hdrs)
 {
     char   cr[80];
     size_t used = 0;
@@ -507,7 +523,8 @@ static int send_file_head(int cfd, int status, uint64_t first, uint64_t last,
         }
     }
     return send_head_only(cfd, status, "video/mp4", len,
-                          (status == 206) ? cr : NULL, HTTP_HDR_FILE);
+                          (status == 206) ? cr : NULL,
+                          (hdrs != NULL) ? hdrs : HTTP_HDR_FILE);
 }
 
 /**
@@ -516,9 +533,11 @@ static int send_file_head(int cfd, int status, uint64_t first, uint64_t last,
  * @param[in] cfd  连接
  * @param[in] name 分段名
  * @param[in] req  请求(取方法、Range)
+ * @param[in] hdrs 额外应答头(NULL = 默认);`/recent.mp4` 用它报"这次是哪一段"
  * @return 0 成功; -1 失败
  */
-static int handle_file(int cfd, const char *name, const proto_http_request_t *req)
+static int handle_file(int cfd, const char *name, const proto_http_request_t *req,
+                       const char *hdrs)
 {
     char        path[SVC_RECORD_PATH_MAX];
     struct stat st;
@@ -553,7 +572,7 @@ static int handle_file(int cfd, const char *name, const proto_http_request_t *re
         g.stats.partials++;
     }
     g.stats.files++;
-    if (send_file_head(cfd, status, first, last, total) != 0) {
+    if (send_file_head(cfd, status, first, last, total, hdrs) != 0) {
         (void)close(fd);
         return -1;
     }
@@ -567,6 +586,119 @@ static int handle_file(int cfd, const char *name, const proto_http_request_t *re
     }
     (void)close(fd);
     return 0;
+}
+
+/**
+ * @brief 取"**已经收尾的最新那一段**"的名字
+ *
+ * @param[out] out 输出(形如 `<stamp>.mp4`)
+ * @param[in]  cap 容量
+ * @return 0 成功; -1 = 一段都没有(或目录打不开)
+ */
+static int newest_closed(char *out, size_t cap)
+{
+    svc_record_policy_file_t one[1];
+
+    if (svc_record_list(one, 1, NULL, NULL) != 1) {
+        return -1;
+    }
+    snprintf(out, cap, "%s", one[0].name);
+    return 0;
+}
+
+/**
+ * @brief 等某个分段"收尾完成" —— 也就是 `<dir>/<name>` 真的出现
+ *
+ * @param[in] name 分段名(收尾前它是 `<name>.tmp`)
+ * @return 0 = 已经收尾; -1 = 等超时(或名字非法)
+ *
+ * @note 为什么用"文件出现"当判据:录制线程收尾的顺序是
+ *       `MP4Close`(写 moov)→ `rename(<name>.mp4.tmp → <name>.mp4)`。所以
+ *       **`<name>.mp4` 存在** 就等于"这个文件已经有 moov 了" —— 正是我们能发给播放器的条件。
+ * @note ⚠️ 【简化上限】这里是**轮询 + 睡 50ms**(最多 `HTTP_ROTATE_WAIT_MS`)。
+ *       更讲究的做法是让录制线程收尾后 `pthread_cond_signal`, 由这里等条件变量。
+ *       现在这样够用:一次"看最新"只轮询几十次, 且这条路径本来就是"用户点了才走一次"。
+ */
+static int wait_closed(const char *name)
+{
+    char        path[SVC_RECORD_PATH_MAX];
+    struct stat st;
+    int         waited = 0;
+
+    while (waited < HTTP_ROTATE_WAIT_MS) {
+        if (svc_record_make_path(name, path, sizeof(path)) > 0 &&
+            stat(path, &st) == 0 && S_ISREG(st.st_mode)) {
+            return 0;
+        }
+        usleep(HTTP_ROTATE_POLL_MS * 1000);
+        waited += HTTP_ROTATE_POLL_MS;
+    }
+    return -1;
+}
+
+/**
+ * @brief `GET|HEAD /recent.mp4` —— "**刚录的这段**"立刻能看(2026-09-20 新增)
+ *
+ * @param[in] cfd 连接
+ * @param[in] req 请求(取方法、Range)
+ * @return 0 成功; -1 失败
+ *
+ * @details
+ * ─────────────────────────────────────────────────────────────────
+ *  它解决什么问题
+ * ─────────────────────────────────────────────────────────────────
+ *  正在写的那一段是 `<stamp>.mp4.tmp`, **没有 moov(索引)⇒ 任何播放器都打不开**,
+ *  所以它不在回放列表里。代价就是"最近这段画面看不了", 而缺口大小 = 段长
+ *  (默认 30 分钟, 板上现设 300 秒)。用户的原话是:"后面的时间去哪里了呢"。
+ *
+ * ─────────────────────────────────────────────────────────────────
+ *  怎么做(以及为什么**不**自己重封一段)
+ * ─────────────────────────────────────────────────────────────────
+ *  最小的正确做法是**借用已有的切段路径**:请录制线程在**下一个 IDR** 处把当前段收尾
+ *  (它本来就是这个逻辑, 一帧不丢), 于是这一秒之后 `<stamp>.mp4` 就出现了 ——
+ *  一个完全正常、能播、能拖进度条的分段(内容一直到最后 1 秒)。
+ *
+ *  ⚠️ 被否掉的方案:把旁路裸流侧车 `<stamp>.h264.tmp` 的**尾部 N 秒**重封成小 MP4。
+ *     三个问题:① 得**估算**"N 秒大概是多少字节"(码率浮动 ⇒ 估不准);
+ *     ② 要在**另一个线程**里动 mp4v2(库的全局状态 + 录制线程正在用同一个库);
+ *     ③ 重封期间录制队列会被挤满而丢帧(与 A12 同一个代价)。
+ *     而"让录制线程切一段"这三条全都天然没有 —— 复用它才是对的(AGENTS.md §7.0)。
+ *
+ *  ⚠️ **代价(如实说)**:① 每请求一次就**多一个分段边界**(所以有
+ *     `SVC_RECORD_ROTATE_MIN_SEC` = 20 秒的"段太新就不切"保护, 免得被连点切出碎段);
+ *     ② 这个请求会**占住服务线程最多 5 秒**(串行模型, 见头文件)。
+ */
+static int handle_recent(int cfd, const proto_http_request_t *req)
+{
+    char name[PROTO_HTTP_NAME_MAX];
+    char hdrs[160];
+    int  age = -1;
+    int  rc;
+
+    rc = svc_record_request_rotate(name, sizeof(name), &age);
+    if (rc < 0) {
+        return send_error(cfd, 503, NULL);      /* 没在录: 没有"最近的段"可给 */
+    }
+    if (rc == 0) {
+        g.stats.rotates++;
+        LOG_INFO("回放: /recent.mp4 请求切段(段 %s 已录 %d 秒)", name, age);
+        if (wait_closed(name) != 0) {
+            /* 没等到(例如刚巧自然切段、请求被作废): 退而发"已有的最新段" */
+            LOG_WARN("回放: 等 %s 收尾超时, 退而发已有的最新段", name);
+            if (newest_closed(name, sizeof(name)) != 0) {
+                return send_error(cfd, 503, NULL);
+            }
+        }
+    } else if (newest_closed(name, sizeof(name)) != 0) {
+        return send_error(cfd, 503, NULL);      /* 连一段都没收尾过 */
+    }
+    if (snprintf(hdrs, sizeof(hdrs), HTTP_HDR_FILE "X-Recent-Clip: %s\r\n",
+                 name) >= (int)sizeof(hdrs)) {
+        return send_error(cfd, 500, NULL);
+    }
+    LOG_INFO("回放: /recent.mp4 → 发 %s(段龄 %d 秒, %s)", name, age,
+             (rc == 0) ? "刚请求切段" : "段太新, 用已有的最新段");
+    return handle_file(cfd, name, req, hdrs);
 }
 
 /**
@@ -745,6 +877,8 @@ static const char HTTP_HELP[] =
     "  GET  /                        回放页面(浏览器直接当客户端用)\n"
     "  GET  /help                    本帮助(纯文本)\n"
     "  GET  /status                  正在录的那一段(JSON:名字/字节/已录时长)\n"
+    "  GET  /recent.mp4              \"刚录的这段\"马上能看:请录制线程把当前段收尾后发出\n"
+    "                                (代价:多一个分段边界;段龄 < 20 秒时直接发上一段)\n"
     "  GET  /playlist.m3u            整段回放列表(给 VLC / mpv, 旧→新)\n"
     "  GET  /recordings              列出现有分段(JSON, 新→旧)\n"
     "        ?limit=N&before=<名字>   分页:只看某一段之前的 N 条(游标翻页)\n"
@@ -790,6 +924,10 @@ static int dispatch(int cfd, const proto_http_request_t *req,
     if (strcmp(path, "/status") == 0) {
         return handle_status(cfd, req);
     }
+    if (strcmp(path, "/recent.mp4") == 0 || strcmp(path, "/recent") == 0) {
+        return (req->method == PROTO_HTTP_GET || req->method == PROTO_HTTP_HEAD)
+                   ? handle_recent(cfd, req) : send_error(cfd, 405, NULL);
+    }
     kind = proto_http_match_path(path, name, sizeof(name));
     if (kind == PROTO_HTTP_PATH_LIST) {
         return (req->method == PROTO_HTTP_GET) ? handle_list(cfd, req)
@@ -797,7 +935,7 @@ static int dispatch(int cfd, const proto_http_request_t *req,
     }
     if (kind == PROTO_HTTP_PATH_SEGMENT) {
         return (req->method == PROTO_HTTP_GET || req->method == PROTO_HTTP_HEAD)
-                   ? handle_file(cfd, name, req) : send_error(cfd, 405, NULL);
+                   ? handle_file(cfd, name, req, NULL) : send_error(cfd, 405, NULL);
     }
     if (kind == PROTO_HTTP_PATH_LOCK) {
         return (req->method == PROTO_HTTP_PUT)
