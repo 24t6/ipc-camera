@@ -48,9 +48,10 @@
 /** 分片边界字符串(客户端按它切帧) */
 #define LIVE_BOUNDARY "ipcframe"
 
-/** 默认质量与帧率(实测 640x360/q80 ⇒ ~16KB/帧, 10fps ⇒ ~1.3Mbps) */
+/** 默认质量与帧率(实测 640x360/q80 ⇒ ~19KB/帧;
+ * 15fps ⇒ ~2.2Mbps —— 实测编码器在 DstFrameRate=15 时约出 14~15 帧/秒) */
 #define LIVE_DEFAULT_QFACTOR 80
-#define LIVE_DEFAULT_FPS     10
+#define LIVE_DEFAULT_FPS     15
 
 /** 一个客户端槽(不缓存待发数据: 写不完这一片就丢连接) */
 typedef struct {

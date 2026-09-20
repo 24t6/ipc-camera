@@ -150,6 +150,8 @@ typedef struct {
     int         rec_seg_mb;  /**< 每段**大小上限**(MB);0 = 用默认(1024 MB) */
     uint16_t    http_port;   /**< 回放服务端口;0 = 用默认(8080) */
     uint16_t    live_port;   /**< 实时(MJPEG)服务端口;0 = 用默认(8081) */
+    int         live_fps;    /**< 实时画面目标帧率;0 = 用默认(15) */
+    int         live_q;      /**< 实时画面 JPEG 质量 1~99;0 = 用默认(80) */
     int         verbose;
 } app_opts_t;
 
@@ -173,6 +175,8 @@ typedef struct {
 #define OPT_NO_RAW     0x104
 #define OPT_NO_HTTP    0x105
 #define OPT_NO_LIVE    0x106
+#define OPT_LIVE_FPS   0x107
+#define OPT_LIVE_Q     0x108
 
 /** 长选项表(`--名字` 与 `-名字` 两种写法都认, 见 `normalize_long_opts()`) */
 static const struct option LONG_OPTS[] = {
@@ -183,6 +187,8 @@ static const struct option LONG_OPTS[] = {
     { "segment-mb", required_argument, NULL, 'm' },
     { "http",       required_argument, NULL, 'H' },
     { "live",       required_argument, NULL, 'L' },
+    { "live-fps",   required_argument, NULL, OPT_LIVE_FPS },
+    { "live-q",     required_argument, NULL, OPT_LIVE_Q },
     { "h265",       no_argument,       NULL, OPT_H265 },
     { "no-osd",     no_argument,       NULL, OPT_NO_OSD },
     { "no-record",  no_argument,       NULL, OPT_NO_RECORD },
@@ -271,6 +277,8 @@ static void usage(const char *prog)
            "  -H <端口>   回放服务的 HTTP 端口(默认 %d)\n"
            "  -no-live    不起实时画面(MJPEG)服务(默认起)\n"
            "  -L <端口>   实时画面(MJPEG)端口(默认 %d)\n"
+           "  -live-fps <n> 实时画面目标帧率(默认 15;实测编码器约出 14~15 帧/秒)\n"
+           "  -live-q <n>  实时画面 JPEG 质量 1~99(默认 80)\n"
            "  -r <MB>     录制环形容量上限(默认 %d MB;0=不限)\n"
            "  -s <秒数>   每段多少秒后切新文件(默认 1800 = 30 分钟)\n"
            "  -m <MB>     每段多少 MB 后切新文件(默认 %d MB;与 -s 谁先到算谁;\n"
@@ -305,6 +313,8 @@ static int parse_args(int argc, char **argv, app_opts_t *o)
     o->rec_seg_mb  = 0;
     o->http_port   = SVC_HTTP_DEFAULT_PORT;
     o->live_port   = SVC_LIVE_DEFAULT_PORT;
+    o->live_fps    = 0;                 /* 0 = svc_live 用默认(15) */
+    o->live_q      = 0;                 /* 0 = svc_live 用默认(80) */
     o->verbose     = 0;
 
     /* ★ 先把 `-no-record` 这类**单横线长选项**改写成 `--` 双横线(B045),
@@ -326,6 +336,8 @@ static int parse_args(int argc, char **argv, app_opts_t *o)
         case OPT_NO_RAW:    o->no_raw    = 1;             break;
         case OPT_NO_HTTP:   o->no_http   = 1;             break;
         case OPT_NO_LIVE:   o->no_live   = 1;             break;
+        case OPT_LIVE_FPS:  o->live_fps  = atoi(optarg);  break;
+        case OPT_LIVE_Q:    o->live_q    = atoi(optarg);  break;
         case 'v': o->verbose    = 1;                      break;
         case 'h': return 2;
         default:  return 1;
@@ -531,12 +543,16 @@ static int start_live(const app_opts_t *o, int *started)
     memset(&cfg, 0, sizeof(cfg));
     cfg.bind_ip = o->bind_ip;
     cfg.port    = o->live_port;
+    cfg.fps     = o->live_fps;
+    cfg.qfactor = o->live_q;
     if (svc_live_start(&cfg) != 0) {
         return -1;
     }
     *started |= 64;
-    printf("实时画面  : http://<板子IP>:%u/live.mjpg(浏览器 <img> 直接看)\n",
-           (unsigned)svc_live_port());
+    printf("实时画面  : http://<板子IP>:%u/live.mjpg(浏览器 <img> 直接看; "
+           "%d fps, q=%d)\n",
+           (unsigned)svc_live_port(),
+           (o->live_fps > 0) ? o->live_fps : 15, (o->live_q > 0) ? o->live_q : 80);
     return 0;
 }
 
