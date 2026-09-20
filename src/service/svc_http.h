@@ -69,6 +69,10 @@
 typedef struct {
     const char *bind_ip;    /**< 绑定地址, 如 "0.0.0.0" */
     uint16_t    port;       /**< 端口; 0 = 用 `SVC_HTTP_DEFAULT_PORT` */
+    uint16_t    live_port;  /**< **实时(MJPEG)服务的端口**;0 = 没有实时服务。
+                             *   只用来在 `/status` 与回放页面里报出实时画面的 URL
+                             *   (页面要显示 `<img src=...>`) —— 回放服务本身**不碰**
+                             *   那个端口, 两个服务各跑各的线程。 */
 } svc_http_cfg_t;
 
 /** HTTP 服务统计(用于日志与验收) */

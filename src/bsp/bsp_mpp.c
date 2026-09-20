@@ -88,6 +88,14 @@
 #define BSP_VENC_CHN_H264   1       /* 720p —— 本项目默认走这一路 */
 #define BSP_VPSS_CHN_H265   0       /* VPSS 里对应 chn0 的那一路 */
 #define BSP_VPSS_CHN_H264   1
+/*
+ * MJPEG 用的两路通道号(2026-09-20)
+ *   · `BSP_VENC_CHN_MJPEG` = 第三路编码器(0/1 已被 H.265/H.264 占)
+ *   · `BSP_VPSS_CHN_MJPEG` = 专门给小图 scaler 的那一路 VPSS(优先方案)
+ * 实测(A22): 这两路可以按需建/拆, 也可以"同一个 VPSS 通道双绑"(回退方案)。
+ */
+#define BSP_VENC_CHN_MJPEG  2
+#define BSP_VPSS_CHN_MJPEG  2
 
 /*
  * ⚠️⚠️ B027: **只允许启动"我们真正会取"的那一路编码通道。**
@@ -284,6 +292,36 @@ static void fill_frame_packs(bsp_mpp_frame_t *frame)
     g.stats.packs += g.stream.u32PackCount;
 }
 
+/**
+ * @brief 等不到帧时/状态可能过期时,**重新查一次**通道状态
+ *
+ * @param[in,out] st 状态(原地刷新)
+ * @return 1 = 现在确实有整帧可取; 0 = 还是没有(当"这一刻没帧"处理)
+ *
+ * @note ★★ 修 B047(2026-09-20 实验里抓到):**轮询等到的状态必须重新查一遍**。
+ *       `wait_for_packs()` 是"轮询到 `u32CurPacks > 0` 就返回", 而调用方手里那个快照
+ *       是**轮询之前**的 —— 于是 `u32CurPacks == 0` 却继续往下走, 把 `u32PackCount = 0`
+ *       传给 `GetStream`, 驱动直接报 `0xa0088003`(**ILLEGAL_PARAM**): 一帧白丢,
+ *       而且丢的是**已经编码好、躺在缓冲里**的那一帧。
+ *       板上现象(实测): 主路第一次取流就报
+ *         `码流缓冲已满(leftStreamFrames=0)` + `GetStream 失败 … (curPacks=0 leftFrames=0)`
+ *       然后整条基线 0 帧 —— **这两个数字自相矛盾**(缓冲满却是 0 个 pack)正是泄漏点。
+ *       正常跑的时候这个竞态窗口只有几毫秒, 所以一直没暴露。
+ * @note 错误码名字是用一个交叉编译的小探针在板上打印出来的(不是猜的):
+ *       `ILLEGAL_PARAM = 0xa0088003`,`BUF_EMPTY = 0xa008800e` —— 两者只差一位,
+ *       我第一次就猜错了(`work/diag_fps_and_err.py`)。
+ */
+static int refresh_packs(VENC_CHN_STATUS_S *st)
+{
+    if (st->u32CurPacks == 0) {
+        if (HI_MPI_VENC_QueryStatus(g.chn, st) != HI_SUCCESS
+            || st->u32CurPacks == 0) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
 int bsp_mpp_get_frame(bsp_mpp_frame_t *frame, int timeout_ms)
 {
     VENC_CHN_STATUS_S st;
@@ -313,6 +351,10 @@ int bsp_mpp_get_frame(bsp_mpp_frame_t *frame, int timeout_ms)
      */
     if (st.u32CurPacks == 0 && !wait_for_packs(timeout_ms)) {
         /* "当前没帧"**不是错误** —— 只是这一刻还没编码完 */
+        g.stats.timeouts++;
+        return 1;
+    }
+    if (!refresh_packs(&st)) {      /* ★ B047: 轮询之后必须刷新快照 */
         g.stats.timeouts++;
         return 1;
     }
@@ -657,6 +699,8 @@ void bsp_mpp_deinit(void)
     /* 停止 VPSS 时, 只有"本次启用过的那一路"该报 enable */
     HI_BOOL abChnEnable[2];
 
+    bsp_mpp_mjpeg_close();          /* MJPEG 通道(若开着)必须先拆掉 */
+
     abChnEnable[0] = g.is_h265 ? HI_TRUE : HI_FALSE;
     abChnEnable[1] = g.is_h265 ? HI_FALSE : HI_TRUE;
 
@@ -679,4 +723,243 @@ void bsp_mpp_deinit(void)
     SAMPLE_COMM_VI_StopVi(&g.vi_cfg);
     SAMPLE_COMM_SYS_Exit();
     LOG_INFO("MPP 通路已释放");
+}
+
+/* ─────────── ⑤ MJPEG:按需启停的一路 JPEG 编码(2026-09-20) ─────────── */
+
+/*
+ * MJPEG 的 pack 数组
+ *   容量依据 : 一帧 JPEG 只有 1 个 pack;给 8 个是余量(与主路的 64 个分开, 不能共用)
+ *   内存区域 : **文件级静态**(8 × sizeof(VENC_PACK_S))
+ *   唯一所有者: bsp_mpp 模块自己
+ *   释放时机 : 进程生命周期内常驻
+ */
+static VENC_PACK_S g_mjpeg_packs[8];
+
+static struct {
+    int mjpeg_open;                 /* 1 = MJPEG 通道已建好并绑上 */
+    int mjpeg_vpss_chn;             /* 绑的是哪一路 VPSS(-1 = 没绑) */
+    int mjpeg_used_chn2;            /* 1 = 我们启用了 VPSS chn2, 关的时候要停用 */
+    int mjpeg_w;                    /* 实际编码尺寸 */
+    int mjpeg_h;
+    uint64_t mjpeg_frames;          /* 累计取到的 JPEG 帧数 */
+    uint64_t mjpeg_bytes;           /* 累计 JPEG 字节数 */
+    uint64_t mjpeg_errors;
+} mj = { .mjpeg_vpss_chn = -1 };    /* ⚠️ 静态初值是 0, 必须显式给 -1(0 是合法通道号) */
+
+/**
+ * @brief 启用 VPSS 的 chn2(小图那一路)
+ *
+ * @param[in] w 宽
+ * @param[in] h 高
+ * @return 0 成功; -1 失败
+ *
+ * @note 照抄 `init_vpss()` 里那两路的填法, 只改尺寸;`u32Depth = 0` = 不用用户队列
+ *       (绑定模式由 VENC 直接取)。
+ */
+static int mjpeg_vpss_chn2_on(int w, int h)
+{
+    VPSS_CHN_ATTR_S attr;
+    HI_S32          ret;
+
+    memset(&attr, 0, sizeof(attr));
+    attr.enChnMode      = VPSS_CHN_MODE_USER;
+    attr.enCompressMode = COMPRESS_MODE_NONE;
+    attr.enDynamicRange = DYNAMIC_RANGE_SDR8;
+    attr.enPixelFormat  = SAMPLE_PIXEL_FORMAT;
+    attr.enVideoFormat  = VIDEO_FORMAT_LINEAR;
+    attr.stFrameRate.s32SrcFrameRate = -1;
+    attr.stFrameRate.s32DstFrameRate = -1;
+    attr.u32Width  = (HI_U32)w;
+    attr.u32Height = (HI_U32)h;
+    attr.u32Depth  = 0;
+    ret = HI_MPI_VPSS_SetChnAttr(BSP_VPSS_GRP, BSP_VPSS_CHN_MJPEG, &attr);
+    if (ret != HI_SUCCESS) {
+        LOG_WARN("VPSS SetChnAttr(chn%d) 失败: %#x —— 退回『同通道双绑』",
+                 BSP_VPSS_CHN_MJPEG, ret);
+        return -1;
+    }
+    ret = HI_MPI_VPSS_EnableChn(BSP_VPSS_GRP, BSP_VPSS_CHN_MJPEG);
+    if (ret != HI_SUCCESS) {
+        LOG_WARN("VPSS EnableChn(chn%d) 失败: %#x —— 退回『同通道双绑』",
+                 BSP_VPSS_CHN_MJPEG, ret);
+        return -1;
+    }
+    return 0;
+}
+
+/**
+ * @brief 建 MJPEG 通道并绑到指定 VPSS 通道(字段填法照抄厂商 `case PT_MJPEG`)
+ *
+ * @param[in] vpss_chn 绑哪一路 VPSS
+ * @param[in] w        输入/编码宽(**必须 ≥ 源的实际尺寸**, 否则驱动报 ILLEGAL_PARAM)
+ * @param[in] h        输入/编码高
+ * @param[in] qfactor  质量 1~99
+ * @param[in] fps      目标帧率
+ * @return 0 成功; -1 失败
+ */
+static int mjpeg_chn_create(int vpss_chn, int w, int h, int qfactor, int fps)
+{
+    VENC_CHN_ATTR_S    attr;
+    VENC_MJPEG_FIXQP_S q;
+    HI_S32             ret;
+
+    memset(&attr, 0, sizeof(attr));
+    memset(&q, 0, sizeof(q));
+    attr.stVencAttr.enType          = PT_MJPEG;
+    attr.stVencAttr.u32MaxPicWidth  = (HI_U32)w;
+    attr.stVencAttr.u32MaxPicHeight = (HI_U32)h;
+    attr.stVencAttr.u32PicWidth     = (HI_U32)w;
+    attr.stVencAttr.u32PicHeight    = (HI_U32)h;
+    attr.stVencAttr.u32BufSize      = (HI_U32)(w * h * 2);
+    attr.stVencAttr.bByFrame        = HI_TRUE;
+    attr.stVencAttr.u32Profile      = 0;
+    attr.stRcAttr.enRcMode = VENC_RC_MODE_MJPEGFIXQP;
+    q.u32Qfactor       = (HI_U32)qfactor;
+    q.u32SrcFrameRate  = 30;
+    q.fr32DstFrameRate = (HI_S32)fps;
+    memcpy(&attr.stRcAttr.stMjpegFixQp, &q, sizeof(q));
+    attr.stGopAttr.enGopMode = VENC_GOPMODE_NORMALP;
+    attr.stGopAttr.stNormalP.s32IPQpDelta = 0;
+
+    ret = HI_MPI_VENC_CreateChn(BSP_VENC_CHN_MJPEG, &attr);
+    if (ret != HI_SUCCESS) {
+        LOG_ERROR("VENC CreateChn(MJPEG chn%d, %dx%d) 失败: %#x",
+                  BSP_VENC_CHN_MJPEG, w, h, ret);
+        return -1;
+    }
+    ret = SAMPLE_COMM_VPSS_Bind_VENC(BSP_VPSS_GRP, vpss_chn, BSP_VENC_CHN_MJPEG);
+    if (ret != HI_SUCCESS) {
+        LOG_ERROR("VPSS(grp%d-chn%d) 绑 MJPEG chn%d 失败: %#x",
+                  BSP_VPSS_GRP, vpss_chn, BSP_VENC_CHN_MJPEG, ret);
+        (void)HI_MPI_VENC_DestroyChn(BSP_VENC_CHN_MJPEG);
+        return -1;
+    }
+    return 0;
+}
+
+int bsp_mpp_mjpeg_open(int qfactor, int fps)
+{
+    VENC_RECV_PIC_PARAM_S p;
+    int                   w = BSP_MPP_MJPEG_WIDTH;
+    int                   h = BSP_MPP_MJPEG_HEIGHT;
+
+    if (mj.mjpeg_open) {
+        return 0;                       /* 幂等: 已经有客户端开着了 */
+    }
+    if (!g.inited) {
+        return -1;
+    }
+    mj.mjpeg_vpss_chn  = -1;            /* 每次开之前重置(静态初值 0 是合法通道号) */
+    mj.mjpeg_used_chn2 = 0;
+    /* 路径 ①: 另加一路 VPSS chn2(小图, 省带宽) */
+    if (mjpeg_vpss_chn2_on(w, h) == 0) {
+        if (mjpeg_chn_create(BSP_VPSS_CHN_MJPEG, w, h, qfactor, fps) == 0) {
+            mj.mjpeg_used_chn2  = 1;
+            mj.mjpeg_vpss_chn   = BSP_VPSS_CHN_MJPEG;
+        } else {
+            (void)HI_MPI_VPSS_DisableChn(BSP_VPSS_GRP, BSP_VPSS_CHN_MJPEG);
+        }
+    }
+    /* 路径 ②(回退): 同一个 VPSS 通道**双绑**(实测可用, 只是图大、带宽高)。
+     * ⚠️ 尺寸必须 ≥ 源的实际尺寸, 否则驱动报 ILLEGAL_PARAM(踩过: 一开始给 640x360
+     *    去接 720p 的源, 直接 `0xa0088003`)。 */
+    if (mj.mjpeg_vpss_chn < 0) {
+        bsp_mpp_get_encoder_size(&w, &h);
+        if (mjpeg_chn_create(g.vpss_chn, w, h, qfactor, fps) != 0) {
+            return -1;
+        }
+        mj.mjpeg_vpss_chn = g.vpss_chn;
+    }
+    memset(&p, 0, sizeof(p));
+    p.s32RecvPicNum = -1;               /* -1 = 一直收(照抄厂商) */
+    if (HI_MPI_VENC_StartRecvFrame(BSP_VENC_CHN_MJPEG, &p) != HI_SUCCESS) {
+        LOG_ERROR("MJPEG StartRecvFrame 失败");
+        bsp_mpp_mjpeg_close();
+        return -1;
+    }
+    mj.mjpeg_open = 1;
+    mj.mjpeg_w    = w;
+    mj.mjpeg_h    = h;
+    LOG_INFO("MJPEG 通道就绪(chn%d, %dx%d, q=%d, %d fps, VPSS chn%d%s)",
+             BSP_VENC_CHN_MJPEG, w, h, qfactor, fps, mj.mjpeg_vpss_chn,
+             mj.mjpeg_used_chn2 ? "" : ", 双绑主通道");
+    return 0;
+}
+
+void bsp_mpp_mjpeg_close(void)
+{
+    MPP_CHN_S src;
+    MPP_CHN_S dst;
+
+    if (!mj.mjpeg_open && mj.mjpeg_vpss_chn < 0) {
+        return;                         /* 幂等 */
+    }
+    if (mj.mjpeg_vpss_chn >= 0) {
+        src.enModId  = HI_ID_VPSS;
+        src.s32DevId = 0;
+        src.s32ChnId = mj.mjpeg_vpss_chn;
+        dst.enModId  = HI_ID_VENC;
+        dst.s32DevId = 0;
+        dst.s32ChnId = BSP_VENC_CHN_MJPEG;
+        (void)HI_MPI_SYS_UnBind(&src, &dst);
+        (void)HI_MPI_VENC_StopRecvFrame(BSP_VENC_CHN_MJPEG);
+        (void)HI_MPI_VENC_DestroyChn(BSP_VENC_CHN_MJPEG);
+        mj.mjpeg_vpss_chn = -1;
+    }
+    if (mj.mjpeg_used_chn2) {
+        (void)HI_MPI_VPSS_DisableChn(BSP_VPSS_GRP, BSP_VPSS_CHN_MJPEG);
+        mj.mjpeg_used_chn2 = 0;
+    }
+    if (mj.mjpeg_open) {
+        mj.mjpeg_open = 0;
+        LOG_INFO("MJPEG 通道已关(没人看实时画面了, MPP 回到『只有主路』的状态)");
+    }
+}
+
+int bsp_mpp_mjpeg_is_open(void)
+{
+    return mj.mjpeg_open;
+}
+
+int bsp_mpp_mjpeg_get_frame(uint8_t *buf, size_t cap, size_t *out_len,
+                            int timeout_ms)
+{
+    VENC_CHN_STATUS_S st;
+    VENC_STREAM_S     s;
+    size_t            used = 0;
+    HI_U32            i;
+    HI_S32            ret;
+
+    if (!mj.mjpeg_open || buf == NULL || out_len == NULL) {
+        return -1;
+    }
+    *out_len = 0;
+    (void)HI_MPI_VENC_QueryStatus(BSP_VENC_CHN_MJPEG, &st);
+    if (st.u32CurPacks == 0) {
+        return 0;                       /* 还没编好 */
+    }
+    memset(&s, 0, sizeof(s));
+    s.u32PackCount = st.u32CurPacks;
+    s.pstPack      = g_mjpeg_packs;
+    ret = HI_MPI_VENC_GetStream(BSP_VENC_CHN_MJPEG, &s, timeout_ms);
+    if (ret != HI_SUCCESS) {
+        mj.mjpeg_errors++;
+        return -2;
+    }
+    for (i = 0; i < s.u32PackCount && i < 8; i++) {
+        size_t n = (size_t)s.pstPack[i].u32Len;
+
+        if (used + n > cap) {
+            n = cap - used;             /* 截断: JPEG 截断也解不出图, 但要避免溢出 */
+            mj.mjpeg_errors++;
+        }
+        memcpy(buf + used, s.pstPack[i].pu8Addr + s.pstPack[i].u32Offset, n);
+        used += n;
+    }
+    (void)HI_MPI_VENC_ReleaseStream(BSP_VENC_CHN_MJPEG, &s);
+    *out_len = used;
+    mj.mjpeg_frames++;
+    mj.mjpeg_bytes += used;
+    return 1;
 }

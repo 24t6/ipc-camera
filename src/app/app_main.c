@@ -84,6 +84,7 @@
 #include "infra_queue.h"
 #include "proto_sdp.h"
 #include "svc_http.h"
+#include "svc_live.h"
 #include "svc_media.h"
 #include "svc_net.h"
 #include "svc_osd.h"
@@ -143,10 +144,12 @@ typedef struct {
     int         no_record;   /**< 1 = 不录 MP4(默认录到 /mnt/sdcard) */
     int         no_raw;      /**< 1 = 不写旁路裸流侧车(默认写;掉电后可救前一段) */
     int         no_http;     /**< 1 = 不起回放服务(默认起) */
+    int         no_live;     /**< 1 = 不起实时(MJPEG)服务(默认起) */
     int         rec_mb;      /**< 环形容量上限(MB);0 = 不限 */
     int         rec_seg;     /**< 每段**秒数**;0 = 用默认(1800 秒 = 30 分钟) */
     int         rec_seg_mb;  /**< 每段**大小上限**(MB);0 = 用默认(1024 MB) */
     uint16_t    http_port;   /**< 回放服务端口;0 = 用默认(8080) */
+    uint16_t    live_port;   /**< 实时(MJPEG)服务端口;0 = 用默认(8081) */
     int         verbose;
 } app_opts_t;
 
@@ -169,6 +172,7 @@ typedef struct {
 #define OPT_NO_RECORD  0x103
 #define OPT_NO_RAW     0x104
 #define OPT_NO_HTTP    0x105
+#define OPT_NO_LIVE    0x106
 
 /** 长选项表(`--名字` 与 `-名字` 两种写法都认, 见 `normalize_long_opts()`) */
 static const struct option LONG_OPTS[] = {
@@ -178,11 +182,13 @@ static const struct option LONG_OPTS[] = {
     { "segment",    required_argument, NULL, 's' },
     { "segment-mb", required_argument, NULL, 'm' },
     { "http",       required_argument, NULL, 'H' },
+    { "live",       required_argument, NULL, 'L' },
     { "h265",       no_argument,       NULL, OPT_H265 },
     { "no-osd",     no_argument,       NULL, OPT_NO_OSD },
     { "no-record",  no_argument,       NULL, OPT_NO_RECORD },
     { "no-raw",     no_argument,       NULL, OPT_NO_RAW },
     { "no-http",    no_argument,       NULL, OPT_NO_HTTP },
+    { "no-live",    no_argument,       NULL, OPT_NO_LIVE },
     { "verbose",    no_argument,       NULL, 'v' },
     { "help",       no_argument,       NULL, 'h' },
     { NULL,         0,                 NULL, 0 }
@@ -263,14 +269,16 @@ static void usage(const char *prog)
            "  -no-raw     不写旁路裸流侧车(默认写:掉电/强杀后能把前一段救回来)\n"
            "  -no-http    不起回放服务(默认起)\n"
            "  -H <端口>   回放服务的 HTTP 端口(默认 %d)\n"
+           "  -no-live    不起实时画面(MJPEG)服务(默认起)\n"
+           "  -L <端口>   实时画面(MJPEG)端口(默认 %d)\n"
            "  -r <MB>     录制环形容量上限(默认 %d MB;0=不限)\n"
            "  -s <秒数>   每段多少秒后切新文件(默认 1800 = 30 分钟)\n"
            "  -m <MB>     每段多少 MB 后切新文件(默认 %d MB;与 -s 谁先到算谁;\n"
            "              0=用默认。⚠️ 这一维不能关 —— vfat 单文件上限 4 GiB)\n"
            "  -v          打开 DEBUG 日志\n"
            "  -h          显示本帮助\n",
-           prog, APP_DEFAULT_PORT, SVC_HTTP_DEFAULT_PORT, APP_REC_LIMIT_MB,
-           SVC_RECORD_DEFAULT_SEGMENT_MB);
+           prog, APP_DEFAULT_PORT, SVC_HTTP_DEFAULT_PORT, SVC_LIVE_DEFAULT_PORT,
+           APP_REC_LIMIT_MB, SVC_RECORD_DEFAULT_SEGMENT_MB);
 }
 
 /**
@@ -291,17 +299,19 @@ static int parse_args(int argc, char **argv, app_opts_t *o)
     o->no_record   = 0;
     o->no_raw      = 0;
     o->no_http     = 0;
+    o->no_live     = 0;
     o->rec_mb      = APP_REC_LIMIT_MB;
     o->rec_seg     = 0;
     o->rec_seg_mb  = 0;
     o->http_port   = SVC_HTTP_DEFAULT_PORT;
+    o->live_port   = SVC_LIVE_DEFAULT_PORT;
     o->verbose     = 0;
 
     /* ★ 先把 `-no-record` 这类**单横线长选项**改写成 `--` 双横线(B045),
      *   否则下面的 getopt_long() 会把它们拆成选项簇, 一个都不生效。 */
     (void)normalize_long_opts(argc, argv);
 
-    while ((opt = getopt_long(argc, argv, "p:b:r:s:m:H:hv", LONG_OPTS, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "p:b:r:s:m:H:L:hv", LONG_OPTS, NULL)) != -1) {
         switch (opt) {
         case 'p': o->port       = (uint16_t)atoi(optarg); break;
         case 'b': o->bind_ip    = optarg;                 break;
@@ -309,11 +319,13 @@ static int parse_args(int argc, char **argv, app_opts_t *o)
         case 's': o->rec_seg    = atoi(optarg);           break;
         case 'm': o->rec_seg_mb = atoi(optarg);           break;
         case 'H': o->http_port  = (uint16_t)atoi(optarg); break;
+        case 'L': o->live_port  = (uint16_t)atoi(optarg); break;
         case OPT_H265:      o->is_h265   = 1;             break;
         case OPT_NO_OSD:    o->no_osd    = 1;             break;
         case OPT_NO_RECORD: o->no_record = 1;             break;
         case OPT_NO_RAW:    o->no_raw    = 1;             break;
         case OPT_NO_HTTP:   o->no_http   = 1;             break;
+        case OPT_NO_LIVE:   o->no_live   = 1;             break;
         case 'v': o->verbose    = 1;                      break;
         case 'h': return 2;
         default:  return 1;
@@ -336,6 +348,7 @@ static void report(int secs)
     svc_osd_stats_t    os;
     svc_record_stats_t rs;
     svc_http_stats_t   hs;
+    svc_live_stats_t   ls;
 
     svc_media_get_stats(&ms);
     svc_sender_get_stats(&ss);
@@ -343,13 +356,14 @@ static void report(int secs)
     svc_osd_get_stats(&os);
     svc_record_get_stats(&rs);
     svc_http_get_stats(&hs);
+    svc_live_get_stats(&ls);
 
     printf("[%4ds] 取流 %llu 帧 | 发送 %llu 帧/%llu 包 | 客户端 %d 在发(%llu 等IDR)"
            " | RTSP %llu 连接/%llu 请求 | 丢 %llu | 错误 %llu"
            " | ★帧龄 现/最小/最大 %.0f/%.0f/%.0f ms 漂移 %.0f ms"
            " | OSD %llu 次/错 %llu"
            " | 录制 %llu 段/%llu 帧 删 %llu 丢 %llu 错 %llu"
-           " | 回放 %llu 请求/%llu 是206/切段 %llu\n",
+           " | 回放 %llu 请求/%llu 是206/切段 %llu | 实时 %llu 帧/%d 客户端\n",
            secs,
            (unsigned long long)ms.frames,
            (unsigned long long)ss.frames_sent,
@@ -371,7 +385,9 @@ static void report(int secs)
            (unsigned long long)rs.write_errors,
            (unsigned long long)hs.requests,
            (unsigned long long)hs.partials,
-           (unsigned long long)hs.rotates);
+           (unsigned long long)hs.rotates,
+           (unsigned long long)ls.frames,
+           ls.clients);
     fflush(stdout);
 }
 
@@ -443,6 +459,13 @@ static int build_sdp(const app_opts_t *o, char *out, size_t cap)
  */
 static void shutdown_chain(int started)
 {
+    /*
+     * ★ **实时画面第一个停**(2026-09-20 加):它是**唯一会碰 MPP 编码通道的旁观者** ——
+     *   它退出时会把自己按需开的 MJPEG 通道拆掉。必须排在 `svc_media_stop()`
+     *   (它会让 MPP 释放)之前, 否则就是"MPP 都拆了, 还有人拿着通道号操作"。
+     */
+    if (started & 64)
+        svc_live_stop();
     /* ★ 回放服务最先停:它是"纯读卡"的旁观者, 先让它收手, 免得录制收尾时
      *   还有人正在读卡(卡上的 I/O 是共享的, 越早安静越好)。 */
     if (started & 32)
@@ -477,12 +500,43 @@ static int start_http(const app_opts_t *o, int *started)
     memset(&cfg, 0, sizeof(cfg));
     cfg.bind_ip = o->bind_ip;
     cfg.port    = o->http_port;
+    /* 把实时(MJPEG)服务的端口告诉回放服务 —— 它只用来在 `/status` 与页面里
+     * 报出实时画面的 URL;**两个服务各跑各的线程**, 回放服务不碰那个端口。 */
+    cfg.live_port = o->no_live ? 0 : o->live_port;
     if (svc_http_start(&cfg) != 0) {
         return -1;
     }
     *started |= 32;
     printf("回放服务  : http://<板子IP>:%u/recordings(列分段 / Range 取流 / 锁定)\n",
            (unsigned)svc_http_port());
+    return 0;
+}
+
+/**
+ * @brief 起实时画面(MJPEG)服务
+ *
+ * @param[in]  o       命令行选项(端口 / 是否关闭)
+ * @param[out] started 位掩码,成功则置上 bit6
+ * @return 0 成功; 负值失败
+ *
+ * @note ⚠️ **MJPEG 编码通道不在这里开** —— 等第一个客户端连上才按需开
+ *       (见 `svc_live.h` 的文件头与 A22 的实测)。所以这个函数可以在
+ *       `bsp_mpp_init()` 之前调用, 也不会在"没人看"的时候占用编码器。
+ * @note 失败**不致命**: 看不了实时画面不该让推流/录制/回放起不来。
+ */
+static int start_live(const app_opts_t *o, int *started)
+{
+    svc_live_cfg_t cfg;
+
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.bind_ip = o->bind_ip;
+    cfg.port    = o->live_port;
+    if (svc_live_start(&cfg) != 0) {
+        return -1;
+    }
+    *started |= 64;
+    printf("实时画面  : http://<板子IP>:%u/live.mjpg(浏览器 <img> 直接看)\n",
+           (unsigned)svc_live_port());
     return 0;
 }
 
@@ -640,6 +694,19 @@ static infra_queue_t *start_chain(const app_opts_t *o, int *started)
                (unsigned)o->http_port);
     }
 
+    /*
+     * ③.7 实时画面(MJPEG)。
+     *   位置: 在回放服务之后(**它要在 /status 与页面里报实时画面的 URL**)。
+     *   ⚠️ MJPEG 通道**这时不开** —— 第一个客户端连上才按需开(见 svc_live.h)。
+     *   失败**不致命**: 看不了实时画面不该让其它三个服务起不来。
+     */
+    if (o->no_live) {
+        printf("实时画面  : 已按 -no-live 关闭\n");
+    } else if (start_live(o, started) != 0) {
+        printf("⚠️  实时画面服务启动失败(端口 %u 被占?其它服务照常)\n",
+               (unsigned)o->live_port);
+    }
+
     /* ④ 最后起取流(生产者) */
     printf("\n正在初始化 MPP 通路(约 5~10 秒, 请稍等)…\n");
     if (svc_media_start(queue, g_record_queue, o->is_h265) != 0) {
@@ -668,11 +735,15 @@ static infra_queue_t *start_chain(const app_opts_t *o, int *started)
     printf("     ffplay -rtsp_transport udp rtsp://<板子IP>:%u/live\n",
            (unsigned)svc_net_port());
     if ((*started & 32) != 0) {
-        printf("     回放列表: curl http://<板子IP>:%u/recordings\n\n",
+        printf("     回放列表: curl http://<板子IP>:%u/recordings\n",
                (unsigned)svc_http_port());
-    } else {
-        printf("\n");
     }
+    if ((*started & 64) != 0) {
+        printf("     实时画面: 浏览器打开 http://<板子IP>:%u/ (或直接看 "
+               "http://<板子IP>:%u/live.mjpg)\n",
+               (unsigned)svc_http_port(), (unsigned)svc_live_port());
+    }
+    printf("\n");
     return queue;
 }
 

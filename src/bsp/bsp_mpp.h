@@ -192,4 +192,57 @@ typedef struct {
 /** @brief 取统计快照。 */
 void bsp_mpp_get_stats(bsp_mpp_stats_t *out);
 
+/* ─────────────── MJPEG(实时画面进浏览器, 2026-09-20) ─────────────── */
+
+/** MJPEG 的输出尺寸(小图: 实测 640x360 每帧 ~16KB, 720p 要 ~54KB —— 见 A22) */
+#define BSP_MPP_MJPEG_WIDTH  640
+#define BSP_MPP_MJPEG_HEIGHT 360
+
+/**
+ * @brief 按需**开启** MJPEG 编码通道(有客户端要看实时画面时才调)。
+ *
+ * @param[in] qfactor 质量(1~99; 实测 80 时 640x360 约 16 KB/帧)
+ * @param[in] fps     目标帧率(**让编码器降帧**, 别"编 30 帧只取 10 帧")
+ * @return 0 成功(已经开着也返回 0); -1 失败
+ *
+ * @note ★ **为什么必须"按需"**:没人取流的编码通道会塞满自己的码流缓冲, 而 B027 的
+ *       实测后果是**整条流水线被拖死**(主路固定停在 205 帧)。
+ *       ⚠️ 但**不能把 B027 的结论直接搬过来**:2026-09-20 的孤立实验(A22)测到
+ *       MJPEG 通道"开着收流但 6 秒没人取"时**主路一点没掉**(30.2 fps)——
+ *       看起来 MJPEG(每帧独立)是"缓冲满就丢帧", 不像 H.264 那样反压 VPSS。
+ *       **设计仍然不依赖这个结论**:没人看就整条拆掉, 让 MPP 回到"只有主路"
+ *       这个被反复验证过的状态(B045 的教训: 别把没验过的行为当依据)。
+ * @note 实现里**先试"另加一路 VPSS chn2(小图)"**, 失败再退回
+ *       "**同一个 VPSS 通道双绑**(chn1, 1280x720)" —— 两条路都在 A22 里实测可用。
+ * @note ⚠️ 只能在 `bsp_mpp_init()` 之后调用(要 VPSS 已经跑起来)。
+ */
+int bsp_mpp_mjpeg_open(int qfactor, int fps);
+
+/**
+ * @brief 关掉 MJPEG 通道(最后一个客户端走的时候调;幂等)。
+ *
+ * @note 顺序: 解绑 → 停收流 → 销毁通道 →(若启用了 VPSS chn2)停用该通道。
+ */
+void bsp_mpp_mjpeg_close(void);
+
+/** @brief MJPEG 通道现在是开着的吗。@return 1 = 开 */
+int bsp_mpp_mjpeg_is_open(void);
+
+/**
+ * @brief 取一帧 JPEG(取完立刻释放 MPP 缓冲, 数据**拷进调用方缓冲**)。
+ *
+ * @param[out] buf        输出缓冲
+ * @param[in]  cap        容量
+ * @param[out] out_len    实际字节数
+ * @param[in]  timeout_ms 等多久(0 = 不阻塞, 立刻返回)
+ * @return **1** 取到一帧; **0** 这一刻还没编好(不是错误); **负值** 出错
+ *
+ * @note ★ **必须拷贝**:`HI_MPI_VENC_ReleaseStream` 之后那块缓冲随时会被编码器复用,
+ *       释放后再读就是野指针(而且不会立刻崩, 会写出花屏/随机数据 —— 最难查的那种)。
+ * @note 调用线程: **MJPEG 服务线程**(`svc_live`)。本函数内部用的是文件级静态 pack
+ *       数组 ⇒ **不允许多个线程同时调**。
+ */
+int bsp_mpp_mjpeg_get_frame(uint8_t *buf, size_t cap, size_t *out_len,
+                            int timeout_ms);
+
 #endif /* __BSP_MPP_H__ */

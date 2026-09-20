@@ -101,6 +101,7 @@ static struct {
     int              thread_valid;
     int              listen_fd;
     uint16_t         port;                  /* 实际端口 */
+    uint16_t         live_port;             /* 实时(MJPEG)服务的端口(0 = 没有) */
     char             bind_ip[32];
     volatile int     cur_fd;                /* 正在服务的客户端(-1 = 没有);
                                              * 停服务时 `shutdown()` 它, 打断卡住的 send */
@@ -340,6 +341,7 @@ static int handle_list(int cfd, const proto_http_request_t *req)
 static int append_live_uri(const char *host, size_t *used)
 {
     char   host_only[PROTO_HTTP_HOST_MAX];
+    char   port[8];
     size_t hn = 0;
 
     while (host[hn] != '\0' && host[hn] != ':' && hn + 1 < sizeof(host_only)) {
@@ -351,6 +353,18 @@ static int append_live_uri(const char *host, size_t *used)
         proto_str_append(g.text, sizeof(g.text), used, host_only) != 0 ||
         proto_str_append(g.text, sizeof(g.text), used, ":8554/live\"") != 0) {
         return -1;
+    }
+    /* 实时画面(MJPEG)的 URL —— 页面用它显示 <img src=...>(2026-09-20) */
+    if (g.live_port != 0) {
+        (void)snprintf(port, sizeof(port), "%u", (unsigned)g.live_port);
+        if (proto_str_append(g.text, sizeof(g.text), used, ",\"live_mjpg\":\"http://")
+            != 0 ||
+            proto_str_append(g.text, sizeof(g.text), used, host_only) != 0 ||
+            proto_str_append(g.text, sizeof(g.text), used, ":") != 0 ||
+            proto_str_append(g.text, sizeof(g.text), used, port) != 0 ||
+            proto_str_append(g.text, sizeof(g.text), used, "/live.mjpg\"") != 0) {
+            return -1;
+        }
     }
     return 0;
 }
@@ -1104,6 +1118,7 @@ int svc_http_start(const svc_http_cfg_t *cfg)
     snprintf(g.bind_ip, sizeof(g.bind_ip), "%s",
              (cfg != NULL && cfg->bind_ip != NULL) ? cfg->bind_ip : "0.0.0.0");
     g.port = (cfg != NULL && cfg->port != 0) ? cfg->port : SVC_HTTP_DEFAULT_PORT;
+    g.live_port = (cfg != NULL) ? cfg->live_port : 0;
     g.stop_requested = 0;
     g.cur_fd         = -1;
 
