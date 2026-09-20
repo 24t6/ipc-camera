@@ -9,6 +9,7 @@
  *   ④ 响应头:200 / 206 / 416 / 204 的关键字段;**一定带 Content-Length**;
  *      64 位长度(>4 GiB 的边界)不能被截断
  *   ⑤ 共用的 proto_str_u64 / parse_u64 也在这里盯一眼(HTTP 的 Content-Range 靠它)
+ *   ⑥ 查询串解析:分页用,值太长必须报错而不是静默截断
  *
  * 编译(主机, 由 Makefile 的 `make test` 驱动):
  *   gcc -Wall -Wextra -O2 -std=c11 -D_DEFAULT_SOURCE -Isrc/protocol \
@@ -353,6 +354,46 @@ static void test_u64(void)
     }
 }
 
+/* ─────────────── ⑥ 查询串(?limit=&before=) ─────────────── */
+
+/**
+ * @brief 查询串解析 —— B044 的分页(`/recordings?limit=20&before=xxx.mp4`)靠它
+ */
+static void test_query(void)
+{
+    char v[64];
+
+    printf("\n[6] 查询串解析\n");
+
+    g_fails += check("?limit=20 → 取到 \"20\"",
+                     proto_http_query("/recordings?limit=20", "limit", v,
+                                      sizeof(v)) == 1 && strcmp(v, "20") == 0);
+    g_fails += check("多参数:第二个键也取得到(值里有 '.')",
+                     proto_http_query("/r?limit=20&before=2026-09-20-14-45-35.mp4",
+                                      "before", v, sizeof(v)) == 1 &&
+                     strcmp(v, "2026-09-20-14-45-35.mp4") == 0);
+    g_fails += check("没有查询串 → 0",
+                     proto_http_query("/recordings", "limit", v, sizeof(v)) == 0);
+    g_fails += check("有查询串但没这个键 → 0",
+                     proto_http_query("/recordings?x=1", "limit", v,
+                                      sizeof(v)) == 0);
+    g_fails += check("键名只是前缀不算命中(lim ≠ limit)",
+                     proto_http_query("/recordings?lim=9", "limit", v,
+                                      sizeof(v)) == 0);
+    g_fails += check("键名后面不是 '=' 也不算(limitx=9)",
+                     proto_http_query("/recordings?limitx=9", "limit", v,
+                                      sizeof(v)) == 0);
+    g_fails += check("空值也命中(长度为 0, 不当成没这个键)",
+                     proto_http_query("/recordings?before=", "before", v,
+                                      sizeof(v)) == 1 && v[0] == '\0');
+    g_fails += check("★ 值放不下 → -1(明确失败, 不静默截断)",
+                     proto_http_query("/recordings?limit=123456789", "limit", v, 4)
+                     == -1);
+    g_fails += check("路径不被当成查询串(? 之前的部分不参与)",
+                     proto_http_query("/recordings?limit=20", "recordings", v,
+                                      sizeof(v)) == 0);
+}
+
 int main(void)
 {
     printf("===== proto_http 单元测试(PC 原生, 不需要 SDK/板子)=====\n");
@@ -362,6 +403,7 @@ int main(void)
     test_path();
     test_build();
     test_u64();
+    test_query();
 
     printf("\n===== 结果: %s(%d 项失败)=====\n",
            g_fails == 0 ? "全部通过" : "有失败", g_fails);

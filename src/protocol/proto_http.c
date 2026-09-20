@@ -347,6 +347,43 @@ int proto_http_path(const char *target, char *out, size_t cap)
     return (int)n;
 }
 
+int proto_http_query(const char *target, const char *key, char *out, size_t cap)
+{
+    const char *p;
+    size_t      klen;
+
+    if (target == NULL || key == NULL || out == NULL || cap == 0) {
+        return 0;
+    }
+    p = strchr(target, '?');
+    if (p == NULL) {
+        return 0;
+    }
+    klen = strlen(key);
+    while (*p == '?' || *p == '&') {
+        p++;
+        if (strncmp(p, key, klen) == 0 && p[klen] == '=') {
+            const char *v = p + klen + 1;
+            size_t      n = 0;
+
+            while (v[n] != '\0' && v[n] != '&') {
+                if (n + 1 >= cap) {
+                    return -1;          /* 值太长: 明确失败, 不截断 */
+                }
+                out[n] = v[n];
+                n++;
+            }
+            out[n] = '\0';
+            return 1;
+        }
+        p = strchr(p, '&');             /* 换下一个键 */
+        if (p == NULL) {
+            return 0;
+        }
+    }
+    return 0;
+}
+
 /**
  * @brief 路径是不是以 `prefix` 开头, 并把剩下的一段拷出来
  *

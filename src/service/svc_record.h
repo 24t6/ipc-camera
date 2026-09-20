@@ -255,19 +255,45 @@ void svc_record_get_stats(svc_record_stats_t *out);
 /* ─────────────────── 回放服务要用的三个接口(阶段 2) ─────────────────── */
 
 /**
- * @brief 列出**当前可回放的分段**(新 → 旧)。
+ * @brief 列出**最新的一页**可回放分段(新 → 旧)。
  *
- * @param[out] out 输出数组(调用方提供, 元素类型来自 `svc_record_policy.h`)
- * @param[in]  cap 数组容量(建议 `SVC_RECORD_POLICY_MAX_FILES`)
+ * @param[out] out    输出数组(调用方提供)
+ * @param[in]  cap    数组容量(也是"这一页最多几条")
+ * @param[in]  before **游标**:只要**比这个名字更早**的分段(NULL = 从最新开始);
+ *                    翻页时把它设成上一页最后一条的名字
+ * @param[out] total  输出:**目录里一共有多少条**(可为 NULL)
  * @return 列出的个数(>=0); -1 = 目录打不开
  *
+ * @note ★ **永远给最新的一页**(2026-09-20 修的 B044):目录里分段可能上千条
+ *       (一天 1 分钟一段 = 1440 条), 而数组容量有限。原来的实现是"先填满数组再排序",
+ *       于是**留下的是随机的一批** —— 用户看到的最新段停在 22:59, 真正最新的段根本没进来。
+ *       现在:满了就**替换掉最旧的那个**, 截断丢的一定是最旧的。
  * @note **只认 `.mp4`** ⇒ 正在写的 `<stamp>.mp4.tmp` 与旁路裸流 `<stamp>.h264.tmp`
- *       天然不会出现在回放列表里(与环形覆盖的扫描用的是同一条判据)。
- * @note 排序是**目录名的字典序倒序** —— 名字是零填充时间戳 ⇒ 正好是"最新在前"。
- * @note ⚠️ **可以在别的线程调用**(回放服务就是这么用的): 它**不碰**录制线程那张
+ *       天然不会出现在回放列表里(与环形覆盖的扫描同一条判据)。
+ * @note ⚠️ **可以在别的线程调用**(回放服务就是这么用的):它**不碰**录制线程那张
  *       共享扫描表(`g_scan`/`g_del`), 用调用方的数组;改动锁定缓存时会取锁。
  */
-int svc_record_list(svc_record_policy_file_t *out, int cap);
+int svc_record_list(svc_record_policy_file_t *out, int cap, const char *before,
+                    int *total);
+
+/**
+ * @brief "现在正在录"的那一段的状态(回放页面用它显示"正在录")。
+ *
+ * @note 这一段的文件是 `<stamp>.mp4.tmp` —— **对外不可播**(没有 moov), 所以它
+ *       **不在** `svc_record_list()` 的结果里;但页面应当把它**显示出来**, 否则
+ *       用户会以为"最近这段时间没录"(2026-09-20 用户就是这么问的)。
+ */
+typedef struct {
+    int      recording;                         /**< 1 = 有一段正在写 */
+    char     name[SVC_RECORD_POLICY_NAME_MAX];  /**< 形如 `2026-09-20-14-45-35.mp4` */
+    uint64_t bytes;                             /**< 本段已写**码流**字节数 */
+    uint64_t frames;                            /**< 本段已写帧数 */
+    uint64_t raw_bytes;                         /**< 旁路裸流侧车已写字节数 */
+    uint64_t started_at;                        /**< 本段开始的 unix 秒(0 = 未知) */
+} svc_record_status_t;
+
+/** @brief 取"正在录"的状态(**任何线程可调**)。 */
+void svc_record_get_status(svc_record_status_t *out);
 
 /**
  * @brief 锁定 / 解锁一个分段(改录制目录里的 `.locked` 清单)。

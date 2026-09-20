@@ -63,6 +63,7 @@ static struct {
     int              frames_in_seg;
     int              want_close;                  /* 1 = 已达段长/段大小, 等下一个 IDR 再切 */
     uint64_t         bytes_in_seg;                /* 本段**已真正落盘**的码流字节数 */
+    uint64_t         seg_started_at;              /* 本段开始的 unix 秒(回放页面要用) */
     uint64_t         segment_bytes;               /* 每段字节上限;0 = 不限 */
     char             cur_name[SVC_RECORD_POLICY_NAME_MAX];
 
@@ -707,6 +708,7 @@ static int open_segment(void)
     g.have_pps      = 0;
     g.frames_in_seg = 0;
     g.bytes_in_seg  = 0;
+    g.seg_started_at = (uint64_t)time(NULL);      /* 回放页面要显示"这段从几点开始录" */
     g.want_close    = 0;
     LOG_INFO("录制: 开始新分段 %s(%dx%d, 旁路裸流 %s)",
              g.cur_name, g.width, g.height, (g.raw != NULL) ? "开" : "关");
@@ -1360,24 +1362,33 @@ void svc_record_get_stats(svc_record_stats_t *out)
 /* ─────────── 回放服务要用的三个接口(阶段 2) ─────────── */
 
 /**
- * @brief 扫出所有**可回放的分段**(`*.mp4`), 结果写进调用方数组
+ * @brief 扫出**最新的一页**可回放分段(`*.mp4`), 结果写进调用方数组
  *
- * @param[out] out 输出数组
- * @param[in]  cap 容量
+ * @param[out] out    输出数组(未排序)
+ * @param[in]  cap    容量
+ * @param[in]  before 只要比它更早的(NULL = 不限)
+ * @param[out] total  目录里符合条件的总条数(可为 NULL)
  * @return 个数; -1 = 目录打不开
  *
  * @note 与录制线程那条 `scan_dir()` **刻意分开**:那条用文件级静态表 `g_scan`/`g_del`
  *       (省内存)且会读 `g.cur_name`;这条只碰调用方数组, 因此**可以从别的线程调**。
  *       两份扫描的唯一共同点就是 `name_is_mp4()` 这一条判据。
+ * @note ★ **数组满了要"替换最旧的"**(B044):目录里上千条时, 只留下最新的 `cap` 条,
+ *       而不是"先到先得" —— 否则用户会看到"列表停在几小时前"。
  */
-static int scan_segments(svc_record_policy_file_t *out, int cap)
+static int scan_segments(svc_record_policy_file_t *out, int cap, const char *before,
+                         int *total)
 {
     DIR           *d;
     struct dirent *e;
     int            n = 0;
+    int            all = 0;
 
     if (out == NULL || cap <= 0) {
         return -1;
+    }
+    if (total != NULL) {
+        *total = 0;
     }
     d = opendir(g.dir);
     if (d == NULL) {
@@ -1391,28 +1402,62 @@ static int scan_segments(svc_record_policy_file_t *out, int cap)
      *   读一个几百字节的小文件, 代价可以忽略。
      */
     load_locks();
-    while ((e = readdir(d)) != NULL && n < cap) {
+    while ((e = readdir(d)) != NULL) {
+        int idx;
+
         if (!name_is_mp4(e->d_name)) {
             continue;                   /* `.mp4.tmp` / `.h264.tmp` / `.locked` 全被排除 */
         }
-        snprintf(out[n].name, sizeof(out[n].name), "%s", e->d_name);
-        out[n].size   = file_size_of(e->d_name);
-        out[n].locked = is_locked(e->d_name);
-        n++;
+        if (before != NULL && strcmp(e->d_name, before) >= 0) {
+            continue;                   /* 游标之后(更新)的不要: 翻页用 */
+        }
+        all++;
+        if (n < cap) {
+            idx = n++;
+        } else {
+            idx = svc_record_policy_oldest_index(out, n);
+            if (idx < 0 || strcmp(e->d_name, out[idx].name) <= 0) {
+                continue;               /* 比当前最旧的还旧: 丢掉 */
+            }
+        }
+        snprintf(out[idx].name, sizeof(out[idx].name), "%s", e->d_name);
+        out[idx].size   = file_size_of(e->d_name);
+        out[idx].locked = is_locked(e->d_name);
     }
     closedir(d);
+    if (total != NULL) {
+        *total = all;
+    }
     return n;
 }
 
-int svc_record_list(svc_record_policy_file_t *out, int cap)
+int svc_record_list(svc_record_policy_file_t *out, int cap, const char *before,
+                    int *total)
 {
-    int n = scan_segments(out, cap);
+    int n = scan_segments(out, cap, before, total);
 
     if (n < 0) {
         return -1;
     }
     svc_record_policy_sort(out, n, 1);           /* 新 → 旧(回放列表要这个顺序) */
     return n;
+}
+
+void svc_record_get_status(svc_record_status_t *out)
+{
+    if (out == NULL) {
+        return;
+    }
+    memset(out, 0, sizeof(*out));
+    if (g.mp4 == NULL) {
+        return;                         /* 还没开段 */
+    }
+    out->recording  = 1;
+    snprintf(out->name, sizeof(out->name), "%s", g.cur_name);
+    out->bytes      = g.bytes_in_seg;
+    out->frames     = (uint64_t)g.frames_in_seg;
+    out->raw_bytes  = g.stats.raw_bytes;
+    out->started_at = g.seg_started_at;
 }
 
 int svc_record_make_path(const char *name, char *out, size_t cap)

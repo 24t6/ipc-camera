@@ -119,6 +119,20 @@ int proto_http_parse(const char *buf, size_t len, proto_http_request_t *out);
 int proto_http_path(const char *target, char *out, size_t cap);
 
 /**
+ * @brief 从请求目标里取出**查询串中某个键的值**(形状:`?a=1&b=2`)。
+ *
+ * @param[in]  target 请求目标(如 `/recordings?limit=20&before=x.mp4`)
+ * @param[in]  key    键名(区分大小写)
+ * @param[out] out    输出缓冲(值是**原样的字节**, 不做百分号解码)
+ * @param[in]  cap    容量
+ * @return 1 = 找到(已写入); 0 = 没有这个键; -1 = 值太长放不下
+ *
+ * @note 刻意**不做 URL 解码**:我们只用它取"数字"和"文件名"(名字白名单里没有需要
+ *       转义的字符), 引一个解码器只会多一块没人测的代码。
+ */
+int proto_http_query(const char *target, const char *key, char *out, size_t cap);
+
+/**
  * @brief 判路径是哪一类, 并取出分段名。
  *
  * @param[in]  path 已去查询串的路径

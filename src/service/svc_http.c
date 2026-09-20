@@ -54,6 +54,17 @@
 /** 声明了 Content-Length 之后, 最多再等多久那个 body(毫秒) */
 #define HTTP_BODY_WAIT_MS 500
 
+/*
+ * 两个应答头常量(2026-09-20 补):
+ *   · 页面/列表/状态是**动态内容** ⇒ `no-store`, 每次都要新鲜的。
+ *     ⚠️ 少了它会出事:浏览器的**启发式缓存**可能让"刷新"仍然看到旧列表 ——
+ *     用户报的"刷新了也不行"里就有这一层(真正的 bug 是 B044, 但缓存让现象更迷惑)。
+ *   · 分段文件用 `no-cache`(可缓存但每次校验):拖动进度条会反复请求同一段的不同
+ *     Range, 全禁掉会让回退重下。
+ */
+#define HTTP_HDR_NO_STORE "Cache-Control: no-store\r\n"
+#define HTTP_HDR_FILE     "Accept-Ranges: bytes\r\nCache-Control: no-cache\r\n"
+
 /* ─────────── 模块状态 ─────────── */
 
 /** 一次最多回放多少个分段(与策略层的上限一致) */
@@ -95,12 +106,11 @@ static struct {
  *       复用连接要引入"读下一条请求"的状态机, 回放场景不值当(见 svc_http.h)。
  */
 static int send_head_only(int cfd, int status, const char *content_type,
-                          uint64_t content_length, const char *content_range)
+                          uint64_t content_length, const char *content_range,
+                          const char *extra)
 {
     int n = proto_http_build_head(g.head, sizeof(g.head), status, content_type,
-                                  content_length, content_range, 0,
-                                  (content_range != NULL)
-                                      ? "Accept-Ranges: bytes\r\n" : NULL);
+                                  content_length, content_range, 0, extra);
 
     if (n <= 0) {
         return -1;
@@ -119,7 +129,8 @@ static int send_text(int cfd, const char *text)
 {
     size_t len = strlen(text);
 
-    if (send_head_only(cfd, 200, "text/plain; charset=utf-8", len, NULL) != 0) {
+    if (send_head_only(cfd, 200, "text/plain; charset=utf-8", len, NULL,
+                       HTTP_HDR_NO_STORE) != 0) {
         return -1;
     }
     if (len > 0 && infra_tcp_write_all(cfd, text, len) != 0) {
@@ -148,7 +159,7 @@ static int send_error(int cfd, int status, const char *extra)
         body[0] = '\0';
     }
     if (send_head_only(cfd, status, "text/plain; charset=utf-8", (uint64_t)n,
-                       extra) != 0) {
+                       extra, HTTP_HDR_NO_STORE) != 0) {
         return -1;
     }
     if (n > 0 && infra_tcp_write_all(cfd, body, (size_t)n) != 0) {
@@ -197,26 +208,72 @@ static int append_entry(char *buf, size_t cap, size_t *used,
 }
 
 /**
- * @brief `GET /recordings` —— 列出现有分段(JSON)
+ * @brief 解析列表请求的分页参数(`?limit=N&before=<名字>`)
+ *
+ * @param[in]  req   请求
+ * @param[out] limit 输出:这一页最多几条(1 ~ `HTTP_SEG_MAX`)
+ * @param[out] before 输出缓冲:游标名字(没给时为空串)
+ * @param[in]  cap   `before` 的容量
+ * @return 游标指针(**没给游标时返回 NULL**)
+ *
+ * @note 抽出来是为了让 `handle_list()` 不超"代码行 ≤ 50"。
+ *       `before` 必须过名字白名单 —— 它会被拼进比较, 不能让调用方塞进奇怪的东西。
+ */
+static const char *list_page_args(const proto_http_request_t *req, uint32_t *limit,
+                                  char *before, size_t cap)
+{
+    char v[16];
+
+    *limit = (uint32_t)HTTP_SEG_MAX;
+    before[0] = '\0';
+    if (proto_http_query(req->target, "limit", v, sizeof(v)) == 1) {
+        uint32_t n = 0;
+
+        if (proto_str_parse_u32(v, &n) > 0 && n > 0) {
+            *limit = (n > (uint32_t)HTTP_SEG_MAX) ? (uint32_t)HTTP_SEG_MAX : n;
+        }
+    }
+    if (proto_http_query(req->target, "before", before, cap) == 1 &&
+        proto_http_name_ok(before)) {
+        return before;
+    }
+    return NULL;
+}
+
+/**
+ * @brief `GET /recordings` —— 列出**最新的一页**分段(JSON)
  *
  * @param[in] cfd 连接
+ * @param[in] req 请求(可带 `?limit=N&before=<名字>` 分页)
  * @return 0 成功; -1 失败
  *
  * @note 顺序是**新 → 旧**(名字是零填充时间戳 ⇒ 字典序倒序就是时间倒序)。
+ * @note ★ **分页**(B044):目录里可能上千条(一天 1 分钟一段 = 1440 条), 一次全给既
+ *       塞不进缓冲、客户端也画不动。所以:
+ *       · `limit`  = 这一页最多几条(默认 `HTTP_SEG_MAX`, 上限也是它);
+ *       · `before` = **游标**, 只要比这个名字更早的 —— 客户端拿上一页最后一条的名字来翻页;
+ *       · 响应里给 `count`(目录总数)与 `returned`(本页条数), 客户端据此知道还有没有更早的。
+ *       ⚠️ 关键:**永远给最新的一页**(不是随机一批) —— 这条曾经过错(B044)。
  */
-static int handle_list(int cfd)
+static int handle_list(int cfd, const proto_http_request_t *req)
 {
-    char   num[24];
-    size_t used = 0;
-    int    n;
-    int    i;
+    char        before[PROTO_HTTP_NAME_MAX];
+    const char *before_p;
+    size_t      used = 0;
+    uint32_t    limit = 0;
+    int         total = 0;
+    int         n;
+    int         i;
 
-    n = svc_record_list(g.segs, HTTP_SEG_MAX);
-    if (n < 0 || proto_str_u32((uint32_t)n, num, sizeof(num)) < 0) {
+    before_p = list_page_args(req, &limit, before, sizeof(before));
+    n = svc_record_list(g.segs, (int)limit, before_p, &total);
+    if (n < 0) {
         return send_error(cfd, 500, NULL);
     }
     if (proto_str_append(g.text, sizeof(g.text), &used, "{\"count\":") != 0 ||
-        proto_str_append(g.text, sizeof(g.text), &used, num) != 0 ||
+        proto_str_append_u32(g.text, sizeof(g.text), &used, (uint32_t)total) != 0 ||
+        proto_str_append(g.text, sizeof(g.text), &used, ",\"returned\":") != 0 ||
+        proto_str_append_u32(g.text, sizeof(g.text), &used, (uint32_t)n) != 0 ||
         proto_str_append(g.text, sizeof(g.text), &used, ",\"segments\":[") != 0) {
         return send_error(cfd, 500, NULL);
     }
@@ -234,7 +291,7 @@ static int handle_list(int cfd)
         return send_error(cfd, 500, NULL);
     }
     if (send_head_only(cfd, 200, "application/json; charset=utf-8", used,
-                       NULL) != 0) {
+                       NULL, HTTP_HDR_NO_STORE) != 0) {
         return -1;
     }
     if (infra_tcp_write_all(cfd, g.text, used) != 0) {
@@ -242,6 +299,104 @@ static int handle_list(int cfd)
     }
     g.stats.bytes_sent += used;
     g.stats.lists++;
+    return 0;
+}
+
+/**
+ * @brief 往 JSON 里追加直播地址(`rtsp://<Host 的主机名>:8554/live`)
+ *
+ * @param[in]     host 客户端发来的 `Host`(形如 `192.168.16.88:8080` 或 `board.local`)
+ * @param[in,out] used 已用长度
+ * @return 0 成功; -1 放不下
+ *
+ * @note 与播放列表同一条理由:服务端**不该猜自己 IP**, 用客户端给的 `Host`;
+ *       端口要按冒号切掉 —— 客户端访问的是 HTTP 端口(比如 8080), 直播在 8554,
+ *       两者本来就是两回事。
+ */
+static int append_live_uri(const char *host, size_t *used)
+{
+    char   host_only[PROTO_HTTP_HOST_MAX];
+    size_t hn = 0;
+
+    while (host[hn] != '\0' && host[hn] != ':' && hn + 1 < sizeof(host_only)) {
+        host_only[hn] = host[hn];
+        hn++;
+    }
+    host_only[hn] = '\0';
+    if (proto_str_append(g.text, sizeof(g.text), used, ",\"live_rtsp\":\"rtsp://") != 0 ||
+        proto_str_append(g.text, sizeof(g.text), used, host_only) != 0 ||
+        proto_str_append(g.text, sizeof(g.text), used, ":8554/live\"") != 0) {
+        return -1;
+    }
+    return 0;
+}
+
+/**
+ * @brief 把"正在录"的那几个字段追加进 JSON
+ *
+ * @param[in,out] used 已用长度
+ * @param[in]     st   状态
+ * @return 0 成功; -1 放不下
+ *
+ * @note 抽出来是为了让 `handle_status()` 不超"缩进 ≤ 5 层"(那条长 `&&` 链会续行到 6 层)。
+ */
+static int append_status_fields(size_t *used, const svc_record_status_t *st)
+{
+    if (proto_str_append(g.text, sizeof(g.text), used, ",\"name\":\"") != 0 ||
+        proto_str_append(g.text, sizeof(g.text), used, st->name) != 0 ||
+        proto_str_append(g.text, sizeof(g.text), used, "\",\"bytes\":") != 0 ||
+        proto_str_append_u64(g.text, sizeof(g.text), used, st->bytes) != 0 ||
+        proto_str_append(g.text, sizeof(g.text), used, ",\"frames\":") != 0 ||
+        proto_str_append_u64(g.text, sizeof(g.text), used, st->frames) != 0 ||
+        proto_str_append(g.text, sizeof(g.text), used, ",\"raw_bytes\":") != 0 ||
+        proto_str_append_u64(g.text, sizeof(g.text), used, st->raw_bytes) != 0 ||
+        proto_str_append(g.text, sizeof(g.text), used, ",\"started_at\":") != 0 ||
+        proto_str_append_u64(g.text, sizeof(g.text), used, st->started_at) != 0) {
+        return -1;
+    }
+    return 0;
+}
+
+/**
+ * @brief `GET /status` —— "现在正在录的那一段"(页面用它显示"正在录")
+ *
+ * @param[in] cfd 连接
+ * @param[in] req 请求(用 Host 拼直播地址)
+ * @return 0 成功; -1 失败
+ *
+ * @note ★ 为什么必须有这个接口:正在录的那一段是 `<stamp>.mp4.tmp`, **没有 moov、
+ *       不可播**, 所以它**不在** `GET /recordings` 里。用户看不到它, 就会以为
+ *       "最近这段时间没录"(2026-09-20 用户正是这么问的)。把它单独报出来 ——
+ *       名字、已写字节、已录帧数、从几点开始 —— 时间轴上才有"现在"。
+ */
+static int handle_status(int cfd, const proto_http_request_t *req)
+{
+    svc_record_status_t st;
+    size_t              used = 0;
+
+    svc_record_get_status(&st);
+    if (proto_str_append(g.text, sizeof(g.text), &used, "{\"recording\":") != 0 ||
+        proto_str_append(g.text, sizeof(g.text), &used, st.recording ? "1" : "0")
+            != 0) {
+        return send_error(cfd, 500, NULL);
+    }
+    if (st.recording && append_status_fields(&used, &st) != 0) {
+        return send_error(cfd, 500, NULL);
+    }
+    if (req->has_host && append_live_uri(req->host, &used) != 0) {
+        return send_error(cfd, 500, NULL);
+    }
+    if (proto_str_append(g.text, sizeof(g.text), &used, "}\n") != 0) {
+        return send_error(cfd, 500, NULL);
+    }
+    if (send_head_only(cfd, 200, "application/json; charset=utf-8", used,
+                       NULL, HTTP_HDR_NO_STORE) != 0) {
+        return -1;
+    }
+    if (infra_tcp_write_all(cfd, g.text, used) != 0) {
+        return -1;
+    }
+    g.stats.bytes_sent += used;
     return 0;
 }
 
@@ -352,7 +507,7 @@ static int send_file_head(int cfd, int status, uint64_t first, uint64_t last,
         }
     }
     return send_head_only(cfd, status, "video/mp4", len,
-                          (status == 206) ? cr : NULL);
+                          (status == 206) ? cr : NULL, HTTP_HDR_FILE);
 }
 
 /**
@@ -490,7 +645,7 @@ static int handle_lock(int cfd, const char *name, const proto_http_request_t *re
         return send_error(cfd, 500, NULL);
     }
     if (send_head_only(cfd, 200, "application/json; charset=utf-8",
-                       (uint64_t)n, NULL) != 0) {
+                       (uint64_t)n, NULL, HTTP_HDR_NO_STORE) != 0) {
         return -1;
     }
     if (infra_tcp_write_all(cfd, reply, (size_t)n) != 0) {
@@ -524,7 +679,7 @@ static int handle_playlist(int cfd, const proto_http_request_t *req)
     int         n;
     int         i;
 
-    n = svc_record_list(g.segs, HTTP_SEG_MAX);
+    n = svc_record_list(g.segs, HTTP_SEG_MAX, NULL, NULL);
     if (n < 0) {
         return send_error(cfd, 500, NULL);
     }
@@ -548,7 +703,8 @@ static int handle_playlist(int cfd, const proto_http_request_t *req)
             return send_error(cfd, 500, NULL);  /* 列表太长放不下 */
         }
     }
-    if (send_head_only(cfd, 200, "audio/x-mpegurl", used, NULL) != 0) {
+    if (send_head_only(cfd, 200, "audio/x-mpegurl", used, NULL,
+                       HTTP_HDR_NO_STORE) != 0) {
         return -1;
     }
     if (infra_tcp_write_all(cfd, g.text, used) != 0) {
@@ -571,7 +727,8 @@ static int handle_page(int cfd)
 {
     size_t len = strlen(svc_http_page_html);
 
-    if (send_head_only(cfd, 200, "text/html; charset=utf-8", len, NULL) != 0) {
+    if (send_head_only(cfd, 200, "text/html; charset=utf-8", len, NULL,
+                       HTTP_HDR_NO_STORE) != 0) {
         return -1;
     }
     if (infra_tcp_write_all(cfd, svc_http_page_html, len) != 0) {
@@ -587,8 +744,10 @@ static const char HTTP_HELP[] =
     "IPC 回放服务\n"
     "  GET  /                        回放页面(浏览器直接当客户端用)\n"
     "  GET  /help                    本帮助(纯文本)\n"
+    "  GET  /status                  正在录的那一段(JSON:名字/字节/已录时长)\n"
     "  GET  /playlist.m3u            整段回放列表(给 VLC / mpv, 旧→新)\n"
     "  GET  /recordings              列出现有分段(JSON, 新→旧)\n"
+    "        ?limit=N&before=<名字>   分页:只看某一段之前的 N 条(游标翻页)\n"
     "  GET  /recordings/<名字>        取流(支持 Range: bytes=)\n"
     "  HEAD /recordings/<名字>        只取响应头(探大小)\n"
     "  PUT  /recordings/<名字>/lock   body 1=锁定 / 0=解锁\n"
@@ -614,7 +773,7 @@ static int dispatch(int cfd, const proto_http_request_t *req,
     proto_http_path_kind_t kind;
 
     if (req->method == PROTO_HTTP_OPTIONS) {
-        return send_head_only(cfd, 204, NULL, 0, NULL);
+        return send_head_only(cfd, 204, NULL, 0, NULL, NULL);
     }
     if (proto_http_path(req->target, path, sizeof(path)) < 0) {
         return send_error(cfd, 400, NULL);
@@ -628,9 +787,12 @@ static int dispatch(int cfd, const proto_http_request_t *req,
     if (strcmp(path, "/playlist.m3u") == 0 || strcmp(path, "/playlist") == 0) {
         return handle_playlist(cfd, req);
     }
+    if (strcmp(path, "/status") == 0) {
+        return handle_status(cfd, req);
+    }
     kind = proto_http_match_path(path, name, sizeof(name));
     if (kind == PROTO_HTTP_PATH_LIST) {
-        return (req->method == PROTO_HTTP_GET) ? handle_list(cfd)
+        return (req->method == PROTO_HTTP_GET) ? handle_list(cfd, req)
                                               : send_error(cfd, 405, NULL);
     }
     if (kind == PROTO_HTTP_PATH_SEGMENT) {

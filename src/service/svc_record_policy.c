@@ -162,6 +162,32 @@ void svc_record_policy_sort(svc_record_policy_file_t *files, int count, int desc
 }
 
 /**
+ * @brief 找出数组里**名字最小(= 最旧)**的那个下标
+ *
+ * @param[in] files 分段数组
+ * @param[in] count 个数
+ * @return 下标; -1 = 空数组
+ *
+ * @note ★ 回放列表要"只给最新的一页":数组满了之后, 新来的名字若比当前最旧的更大,
+ *       就**替换掉最旧的那个**(这样截断丢的永远是最旧的, 而不是随机的)。
+ */
+int svc_record_policy_oldest_index(const svc_record_policy_file_t *files, int count)
+{
+    int i;
+    int min = 0;
+
+    if (files == NULL || count <= 0) {
+        return -1;
+    }
+    for (i = 1; i < count; i++) {
+        if (strcmp(files[i].name, files[min].name) < 0) {
+            min = i;
+        }
+    }
+    return min;
+}
+
+/**
  * @brief 这一行(长度 len)是不是 `name`(容忍行尾的 '\r' 与空格)
  *
  * @param[in] line 行首

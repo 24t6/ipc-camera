@@ -155,4 +155,18 @@ int svc_record_policy_lock_edit(char *buf, size_t cap, size_t used,
  */
 int svc_record_policy_lock_has(const char *buf, size_t used, const char *name);
 
+/**
+ * @brief 找出数组里**名字最小(= 最旧)**的那个下标
+ *
+ * @param[in] files 分段数组
+ * @param[in] count 个数
+ * @return 下标; -1 = 空数组
+ *
+ * @note ★ 用途:回放列表要"**只给最新的一页**"。目录里分段可能上千条(一天 1 分钟一段
+ *       就是 1440 条), 而数组容量有限 —— 截断时**必须丢最旧的**, 不能丢最新的。
+ *       (2026-09-20 修的 B044:原来"先填满数组再排序", 于是**留下的是随机的一批**,
+ *        用户看到的最新段停在 22:59, 真正最新的段根本没进列表。)
+ */
+int svc_record_policy_oldest_index(const svc_record_policy_file_t *files, int count);
+
 #endif /* __SVC_RECORD_POLICY_H__ */
