@@ -41,6 +41,7 @@ const char svc_http_page_html[] =
     "<meta charset='utf-8'>\n"
     "<meta name='viewport' content='width=device-width,initial-scale=1'>\n"
     "<title>IPC 监控 · 板子自带控制台</title>\n"
+    "<link rel='stylesheet' href='/app.css'>\n"
     "<style>\n"
     ":root{\n"
     "  --bg:#0b0f14; --card:#141a21; --card2:#1a222b; --line:#26313c;\n"

@@ -33,6 +33,7 @@
 #include "proto_http.h"
 #include "proto_str.h"
 #include "svc_http_page.h"
+#include "svc_http_page_css.h"
 #include "svc_live.h"
 #include "svc_media.h"
 #include "svc_net.h"
@@ -92,6 +93,7 @@
  *     Range, 全禁掉会让回退重下。
  */
 #define HTTP_HDR_NO_STORE "Cache-Control: no-store\r\n"
+#define HTTP_HDR_CACHE_DAY "Cache-Control: max-age=86400\r\n"
 #define HTTP_HDR_FILE     "Accept-Ranges: bytes\r\nCache-Control: no-cache\r\n"
 
 /* ─────────── 模块状态 ─────────── */
@@ -396,7 +398,7 @@ static http_sample_t g_hist[HTTP_HIST_N];
 static int           g_hist_n;                 /* 已填条数(<= HTTP_HIST_N) */
 static int           g_hist_head;              /* 下一个写入位置 */
 static uint64_t      g_hist_last_ms;           /* 上次采样时刻(单调毫秒) */
-static uint64_t      g_s0_frames, g_s0_bytes, g_s0_recbytes, g_s0_live;
+static uint64_t      g_s0_frames, g_s0_recbytes, g_s0_live;
 static uint64_t      g_s0_drop;
 static uint32_t      g_hist_t0;                /* 页面从"第 0 条"起算的相对秒 */
 
@@ -536,8 +538,9 @@ static int append_disk_json(size_t *used)
  */
 static uint32_t age_ms_of(const svc_sender_stats_t *ss)
 {
-    if (ss->age_samples == 0 || ss->age_last_us > 10ULL * 1000 * 1000) {
-        return 0;                       /* 没采样 / 明显是哨兵值 */
+    if (ss->age_samples == 0 || ss->age_last_us < 0 ||
+        ss->age_last_us > 10 * 1000 * 1000) {
+        return 0;                       /* 没采样 / 负的哨兵值 / 大得离谱 */
     }
     return (uint32_t)(ss->age_last_us / 1000);
 }
@@ -1192,33 +1195,66 @@ static int handle_playlist(int cfd, const proto_http_request_t *req)
 }
 
 /**
- * @brief `GET /` —— 把回放页面发出去(浏览器直接当客户端用)
+ * @brief 发一个**编译进固件的静态文本**(页面 / 样式) —— 响应头 + 正文 + 计数
  *
- * @param[in] cfd 连接
- * @return 0 成功; -1 失败
+ * @param[in] cfd       连接
+ * @param[in] body      常量字符串内容
+ * @param[in] mime      Content-Type
+ * @param[in] cache_hdr 缓存策略头(页面必须 `no-store`, 否则改了刷新看不到)
+ * @param[in] is_page   1 = 页面(只影响 `/status` 里的页面计数), 0 = 别的静态资源
+ * @return 0 成功; -1 发送失败
  *
- * @note 页面是**常量字符串**(`svc_http_page.c`), 不带任何前端构建步骤。
+ * @note 【简化上限】一次 `infra_tcp_write_all` 发完, 没有分块/续传 —— 静态资源几十 KB,
+ *       局域网一次写完; 真要断点续传走 `/recordings` 那条 Range 通路。
  */
-static int handle_page(int cfd)
+static int send_static(int cfd, const char *body, const char *mime,
+                       const char *cache_hdr, int is_page)
 {
-    size_t len = strlen(svc_http_page_html);
+    size_t len = strlen(body);
 
-    if (send_head_only(cfd, 200, "text/html; charset=utf-8", len, NULL,
-                       HTTP_HDR_NO_STORE) != 0) {
+    if (send_head_only(cfd, 200, mime, (uint64_t)len, NULL, cache_hdr) != 0) {
         return -1;
     }
-    if (infra_tcp_write_all(cfd, svc_http_page_html, len) != 0) {
+    if (infra_tcp_write_all(cfd, body, len) != 0) {
         return -1;
     }
     g.stats.bytes_sent += len;
-    g.stats.pages++;
+    if (is_page) {
+        g.stats.pages++;
+    }
     return 0;
+}
+
+/**
+ * @brief `GET /` 或 `GET /app.css` —— 把编译进固件的静态资源发出去
+ *
+ * @param[in] cfd  连接
+ * @param[in] path 已归一化的路径(调用方只在命中这两个路径时才调进来)
+ * @return 0 成功; -1 发送失败
+ *
+ * @note 页面来自 `svc_http_page.c`, 样式来自 `svc_http_page_css.h`(Water.css v2 dark,
+ *       MIT) —— 都是 C 常量字符串, **不带任何前端构建步骤**。
+ * @note 为什么样式单开一个端点、不塞进页面 HTML: ①页面 HTML 更小, 且 CSS 能被浏览器
+ *       **缓存一天**(`max-age=86400`), 下次打开不重传; ②它是**板子自己发的**,
+ *       不算外部资源(离线约束不破)。页面正相反 —— 必须 `no-store`。
+ * @note 【简化上限】两个 `if` 硬匹配, 没做表驱动; 静态资源涨到 4~5 个再抽
+ *       `{路径, 内容, MIME, 缓存头}` 的数组循环匹配 —— 升级时只动这一个函数。
+ */
+static int handle_asset(int cfd, const char *path)
+{
+    if (strcmp(path, "/app.css") == 0) {
+        return send_static(cfd, svc_http_page_css, "text/css; charset=utf-8",
+                           HTTP_HDR_CACHE_DAY, 0);
+    }
+    return send_static(cfd, svc_http_page_html, "text/html; charset=utf-8",
+                       HTTP_HDR_NO_STORE, 1);
 }
 
 /** 帮助页(纯文本, 给人看的) */
 static const char HTTP_HELP[] =
     "IPC 回放服务\n"
     "  GET  /                        回放页面(浏览器直接当客户端用)\n"
+    "  GET  /app.css                 页面样式表(CSS, 浏览器可缓存一天)\n"
     "  GET  /help                    本帮助(纯文本)\n"
     "  GET  /status                  正在录的那一段(JSON:名字/字节/已录时长)\n"
     "  GET  /recent.mp4              \"刚录的这段\"马上能看:请录制线程把当前段收尾后发出\n"
@@ -1256,8 +1292,8 @@ static int dispatch(int cfd, const proto_http_request_t *req,
     if (proto_http_path(req->target, path, sizeof(path)) < 0) {
         return send_error(cfd, 400, NULL);
     }
-    if (strcmp(path, "/") == 0) {
-        return handle_page(cfd);
+    if (strcmp(path, "/") == 0 || strcmp(path, "/app.css") == 0) {
+        return handle_asset(cfd, path);
     }
     if (strcmp(path, "/help") == 0) {
         return send_text(cfd, HTTP_HELP);
