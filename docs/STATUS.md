@@ -75,6 +75,7 @@
 
 | A23 | **页面"运行数据"面板 + `GET /stats`**(用户要的"多点数据图";范围收在**这个本地页面**上) | 后端**不新增线程、不碰 MPP**:`GET /stats` 把 media/sender/net/record/live **已有的**统计快照 + `statvfs` 磁盘 + 录制目录汇总一次吐成 JSON;另加 **1 Hz × 60 的采样环**(文件级静态 ~1.5KB,把累计计数器化成"这一秒的速率")—— ⚠️ **谁拉 `/stats` 谁顺手采**, 没人看页面就不采(不新增采样线程)。前端仍是**一个常量字符串、零构建、不引任何外部资源**:8 张 KPI 卡 + **手绘 sparkline**(Canvas, 不引图表库)+ **存储条**(已用/总量/剩余 + 按当前码率"还能录 ~N 小时")+ **客户端表**(RTSP / MJPEG / 回放 HTTP / 录制四行, 顺带把"**一帧编一次共享**"和"回放**串行**"这两个架构事实写在页面上)。**上板 7/7 通过**:`/stats` 200 + JSON 字段齐全;`segs.files` == 卡上 `ls -1 *.mp4 | wc -l`(**178 == 178**, 与文件系统对账);磁盘 **29.7 GiB / 剩 23.0 GiB / 已用 23%**;`hist` 两次请求之间**变长**且 dt 合理;`rec.cur_bytes` 与 `/status.bytes` 方向一致、差值落在"这 0.2 秒内合理增长"内(31,541 ≤ 629,145);页面 21,369 字节、数据面板元素齐全、内联 JS(12,044 字节)过 `node --check`。⚠️ 一处判据被我自己修正: 最初要求两个接口的 `cur_bytes` **完全相等** —— 那是错的(它测的是**正在长**的计数器, 两次请求之间必然变大; 第 9 次踩"口径"坑)。⚠️ 页面观感仍需人眼确认 |
 | A24 | **页面样式基底:内联 Water.css v2 dark + 新增 `/app.css` 端点**(承接 A22 后续那句"UI 还是太丑") | 选型依据:用户要"去 GitHub 找热门的 UI 做法" ⇒ Pico.css 压缩后 **83KB**(太胖)、Tailwind 需要**构建步骤**(与"一个常量字符串、零构建"冲突)⇒ 用 **Water.css v2 dark(10,106 字节, MIT)** 当"控件与排版的地板"(按钮/表格/输入框/code/滚动条), 页面自己只再写大屏布局层。**不引外部资源**(板子常没外网):CSS 由**板子自己**用 `/app.css` 发出去, 带 `Cache-Control: max-age=86400`(页面 HTML 不变大、样式可被浏览器缓存), 页面本身仍 `no-store`;实现上把页面与样式**合并**成一个 `send_static()` + `handle_asset()`(顺带把 `dispatch` 从 **51 行压回 48 行**)。**上板验证**:① `/app.css` → **200** + `Content-Type: text/css; charset=utf-8` + **`Content-Length: 10106`**(== 生成器算出的字节数)+ `Cache-Control: max-age=86400` ✅;② 落地文件 **10,106 字节**, 首字节就是 MIT 许可注释(`/*! Water.css v2 (dark) — MIT License …`)、结尾 `oration:underline}}` ✅;③ 页面(**22,665 字节**)里确实有 `<link rel='stylesheet' href='/app.css'>` ✅;④ **A22 回归 16/16、A23 回归 7/7** 仍全绿 ✅;⑤ 可复现:上游 CSS **原样入库**(SHA256 `143F43E9…675C24`)、`tools/gen_page_css.py --check` 幂等、交叉编译**我们自己的代码零告警** ✅。⚠️ 本轮只落地"样式地板" —— 大屏布局层的视觉统一与截图审计(`web-design-guidelines` / Playwright)还没做 |
+| A25 | **页面 UI v3(监控大屏风)+ 页面"源码化"**(用户:"UI 还是太丑, 尽量做 ui") | ① **结构**: 页面源码从"C 字符串里手写 HTML"改成 `tools/assets/page.html` →(生成器 `tools/gen_page_html.py`)→ `svc_http_page.c`。**为什么值得**: page.html 是标准 HTML(双击能看、能直接喂无头浏览器), 于是 UI 迭代**不必先上板** —— 生成器还负责硬约束(每行 ≤100 显示列 / 转义 / LF)与 `--check` 幂等。② **视觉**: 显式夺回 Water.css 给 `body` 的 `max-width:800px`(**这就是大屏一直没铺开的原因**); 画布 1560px、吸顶毛玻璃栏、10 张 KPI 一条铺满、16:9 画面区 + 时间轴、通道现状表, 窄屏 ≤560px 自动堆叠。③ **可访问性**(按 `vercel-labs/web-interface-guidelines` 逐条): 时间轴色块与列表行改成真 `<button>`(原来是带 onclick 的 `div`)、图标按钮 `aria-label`、toast `aria-live=polite`、`:focus-visible` 焦点环、`prefers-reduced-motion` 关动效、`color-scheme:dark`+`theme-color`、表格 `caption`、skip link。⚠️ 一条**没采纳**: "列表 >50 项要虚拟化" —— 试过 `content-visibility:auto`, 它让**全页截图里视口外的行变空白**(`innerText` 也读不到), 对"截图进简历"是净损失, 撤掉(理由写在生成器文件头)。④ 顺带: 深链 `#s=<段名>`/`#live`(状态进地址栏可分享)、内联 data: SVG 图标(消掉 favicon 404)。**上板 25/25 判据通过**(桌面 + 390×844 窄屏 + 深链, 0 运行期报错), 回归 **A19 12/12 · A20 17/17 · A22 16/16 · A23 7/7**。⚠️ 修掉两个**量出来**的 bug: `addRow()` 里 `data-name` 用在 `var main` 之前(var 提升 ⇒ `undefined.setAttribute`, 列表整体不渲染, 板上表现"KPI 有、列表空")、正在录那一行 `i=-1` 撞上 `sel=-1` 被误标选中(量到底色是 `.sel` 的 `#152a3d`)。截图证据: `work/board_dash.png` / `board_playing.png`(真录像+OSD) / `board_live.png`(真 MJPEG) / `board_mobile.png` |
 
 > A6/A7/A8/A13 都是**判别实验**(带阳性对照、有明确证伪判据),不是"跑起来看着正常"。
 
@@ -112,6 +113,17 @@
   它声称的"许可声明就是第一行"也不成立(首行是 `:root{`, MIT 要求保留版权声明) —— 记入 **B049**。
   上板判据见验收表 A24(`/app.css` 200 + 10,106 字节 + `text/css`;页面含 `<link>`;
   **A22 16/16、A23 7/7** 重跑仍绿)。⚠️ 大屏布局层的视觉统一与截图审计还没做。
+
+- **UI v3 + 页面源码化(A25, 2026-09-20 深夜)**: 用户接着说"尽量做 ui"。这一轮的**方法**比
+  样式本身更值钱 —— 把页面挪进 `tools/assets/page.html`(标准 HTML), 用
+  `tools/gen_page_html.py` 生成 C 字符串; 再配两个本机工具:
+  `work/preview_server.py`(假板子, 按板子的 JSON 形状造假数据, 并把"页面到底调了哪些接口"
+  打成**服务端访问日志**)与 `work/shot_page.py`(Playwright 驱动**系统自带 Edge**,
+  不下载 chromium: 截图 + 抓 console/pageerror + 真点按钮断言 DOM)。
+  ⇒ **20 秒就能验一遍页面, 不必先上板**; 真上板前先跑本机这一遍, 已经当场拦下一个
+  `var` 提升引起的 TypeError(见 B050)。
+  设计上最实质的一处: **Water.css 给 `body` 的 `max-width:800px` 一直压着整个布局** ——
+  之前"页面像手机版"就是这个原因, 现在显式夺回。截图见 `work/board_*.png` 与 `work/mock_*.png`。
 
 ---
 
