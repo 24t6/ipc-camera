@@ -70,6 +70,8 @@ typedef struct {
     uint64_t bytes;         /**< 广播出去的字节数(含分片头) */
     uint64_t dropped;       /**< 因为跟不上/写失败被丢掉的客户端数 */
     uint64_t frame_errors;  /**< 取 JPEG 帧失败次数 */
+    int      target_fps;    /**< 当前**配置的**目标帧率(档位;页面要显示它) */
+    int      qfactor;       /**< 当前配置的 JPEG 质量(档位) */
     int      clients;       /**< 当前客户端数 */
 } svc_live_stats_t;
 

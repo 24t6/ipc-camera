@@ -571,6 +571,27 @@ static int append_rtsp_json(size_t *used)
     return 0;
 }
 
+/** @brief `/stats` 的实时(MJPEG)**档位**那一段 JSON(页面显示"当前是几档") */
+static int append_live_json(size_t *used)
+{
+    svc_live_stats_t ls;
+
+    svc_live_get_stats(&ls);
+    if (proto_str_append(g.text, sizeof(g.text), used, ",\"live\":{\"target_fps\":") != 0 ||
+        proto_str_append_u32(g.text, sizeof(g.text), used,
+                             (uint32_t)ls.target_fps) != 0 ||
+        proto_str_append(g.text, sizeof(g.text), used, ",\"q\":") != 0 ||
+        proto_str_append_u32(g.text, sizeof(g.text), used,
+                             (uint32_t)ls.qfactor) != 0 ||
+        proto_str_append(g.text, sizeof(g.text), used, ",\"clients\":") != 0 ||
+        proto_str_append_u32(g.text, sizeof(g.text), used,
+                             (uint32_t)ls.clients) != 0 ||
+        proto_str_append(g.text, sizeof(g.text), used, "}") != 0) {
+        return -1;
+    }
+    return 0;
+}
+
 /** @brief `/stats` 的录制与回放自报数那一段 JSON */
 static int append_rec_json(size_t *used)
 {
@@ -631,6 +652,7 @@ static int handle_stats(int cfd)
         proto_str_append_u32(g.text, sizeof(g.text), &used, g_hist_t0) != 0 ||
         append_disk_json(&used) != 0 ||
         append_rtsp_json(&used) != 0 ||
+        append_live_json(&used) != 0 ||
         append_rec_json(&used) != 0 ||
         append_hist(&used) != 0) {
         return send_error(cfd, 500, NULL);

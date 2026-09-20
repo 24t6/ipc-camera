@@ -48,10 +48,11 @@
 /** 分片边界字符串(客户端按它切帧) */
 #define LIVE_BOUNDARY "ipcframe"
 
-/** 默认质量与帧率(实测 640x360/q80 ⇒ ~19KB/帧;
- * 15fps ⇒ ~2.2Mbps —— 实测编码器在 DstFrameRate=15 时约出 14~15 帧/秒) */
+/** 默认质量与帧率(实测 640x360/q80 ⇒ ~12KB/帧;
+ * **20fps ⇒ ~2.0Mbps** —— 上板实测"目标 20fps → 板子自报 20.2fps、主路/录制 30.3fps、
+ * 丢 0 错 0", 所以默认从 15 提到 20;想更省带宽用 `-live-fps 15`, 想更顺用 25) */
 #define LIVE_DEFAULT_QFACTOR 80
-#define LIVE_DEFAULT_FPS     15
+#define LIVE_DEFAULT_FPS     20
 
 /** 一个客户端槽(不缓存待发数据: 写不完这一片就丢连接) */
 typedef struct {
@@ -620,5 +621,7 @@ void svc_live_get_stats(svc_live_stats_t *out)
         return;
     }
     *out = g.stats;
-    out->clients = g.clients;
+    out->clients    = g.clients;
+    out->target_fps = g.fps;
+    out->qfactor    = g.qfactor;
 }
