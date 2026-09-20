@@ -24,6 +24,7 @@
 #include <sys/prctl.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <time.h>       /* nanosleep(与 svc_media/svc_osd 同一种睡法) */
 #include <unistd.h>
 
 #include "infra_log.h"
@@ -65,6 +66,17 @@
 
 /** "看最新"轮询等待时每次睡多久(毫秒) */
 #define HTTP_ROTATE_POLL_MS 50
+
+/**
+ * `/recent.mp4` 那条应答头缓冲的字节数。
+ *
+ * @note 容量依据(按**最坏情况**算, 数字是可复现的): `HTTP_HDR_FILE` 47 字节
+ *       + `"X-Recent-Clip: "` 15 字节 + **分段名最长 63 字节**(`PROTO_HTTP_NAME_MAX - 1`)
+ *       + 结尾 `\r\n` 2 字节 = **127 字节**, 加 NUL 是 128 ⇒ 取 **160** 还有 32 字节余量,
+ *       且远低于 §6.3 的 4KB 线。
+ * @note 为什么不直接写 `char hdrs[160]`: §2.3 要求"避免魔法数字"。
+ */
+#define HTTP_RECENT_HDR_MAX 160
 
 /*
  * 两个应答头常量(2026-09-20 补):
@@ -594,6 +606,9 @@ static int handle_file(int cfd, const char *name, const proto_http_request_t *re
  * @param[out] out 输出(形如 `<stamp>.mp4`)
  * @param[in]  cap 容量
  * @return 0 成功; -1 = 一段都没有(或目录打不开)
+ *
+ * @note 调用线程: **回放服务的 HTTP 线程**(`svc_record_list()` 本身任何线程可调)。
+ * @note 阻塞行为: 会扫一遍录制目录(几百个文件, 毫秒级), 不发网络、不写盘。
  */
 static int newest_closed(char *out, size_t cap)
 {
@@ -612,6 +627,10 @@ static int newest_closed(char *out, size_t cap)
  * @param[in] name 分段名(收尾前它是 `<name>.tmp`)
  * @return 0 = 已经收尾; -1 = 等超时(或名字非法)
  *
+ * @note 调用线程: **回放服务的 HTTP 线程**。
+ * @note 阻塞行为: ⚠️ **这里会阻塞, 最多 `HTTP_ROTATE_WAIT_MS` = 5 秒**
+ *       (每 `HTTP_ROTATE_POLL_MS` 查一次文件)。串行服务下这会占住服务线程 ——
+ *       这是"串行模型"的已知代价, 已写在 `svc_http.h` 的【简化上限】里。
  * @note 为什么用"文件出现"当判据:录制线程收尾的顺序是
  *       `MP4Close`(写 moov)→ `rename(<name>.mp4.tmp → <name>.mp4)`。所以
  *       **`<name>.mp4` 存在** 就等于"这个文件已经有 moov 了" —— 正是我们能发给播放器的条件。
@@ -630,7 +649,14 @@ static int wait_closed(const char *name)
             stat(path, &st) == 0 && S_ISREG(st.st_mode)) {
             return 0;
         }
-        usleep(HTTP_ROTATE_POLL_MS * 1000);
+        /* 睡法与 `svc_media.c` / `svc_osd.c` 保持一致: 用 `nanosleep`。
+         * (2026-09-20 复核: `usleep` 是 POSIX.1-2001 的过时接口, 后面被移出标准;
+         *  本项目别处一律用 nanosleep, 别在这里破例。) */
+        {
+            struct timespec ts = { 0, HTTP_ROTATE_POLL_MS * 1000 * 1000 };
+
+            nanosleep(&ts, NULL);
+        }
         waited += HTTP_ROTATE_POLL_MS;
     }
     return -1;
@@ -671,7 +697,7 @@ static int wait_closed(const char *name)
 static int handle_recent(int cfd, const proto_http_request_t *req)
 {
     char name[PROTO_HTTP_NAME_MAX];
-    char hdrs[160];
+    char hdrs[HTTP_RECENT_HDR_MAX];
     int  age = -1;
     int  rc;
 

@@ -188,9 +188,20 @@ static const struct option LONG_OPTS[] = {
     { NULL,         0,                 NULL, 0 }
 };
 
-/** `normalize_long_opts()` 的改写缓冲(文件级静态: 运行期不做动态分配) */
+/** `normalize_long_opts()` 的改写缓冲 */
 #define APP_LONGFIX_MAX 16
 #define APP_LONGFIX_LEN 24                          /* "--segment-mb" 才 12 字节 */
+
+/*
+ * 单横线长选项的改写缓冲(见 `normalize_long_opts()` 上面那段说明)
+ *   容量依据 : 一次启动命令行里"需要改写的参数"最多也就几个; 16 个是余量。
+ *              单个 24 字节 —— 最长的选项名 `--segment-mb` 只有 12 字节, 放得下。
+ *   内存区域 : **文件级静态**(16 × 24 = 384 字节), 运行期不做动态分配(§6.1)
+ *   唯一所有者: app_main 模块自己(只在 `parse_args()` 的解析期被填和读)
+ *   释放时机 : 进程生命周期内常驻(它被 `argv[]` 指着, 不能提前失效)
+ * @note ⚠️ 改写的是 `argv[i]` 这个**指针**, 不是原字符串 —— 原参数里可能指向
+ *       字符串字面量(不可写), 所以必须另找一块可写且**活得够久**的内存。
+ */
 static char g_longfix[APP_LONGFIX_MAX][APP_LONGFIX_LEN];
 
 /**
@@ -221,6 +232,9 @@ static int normalize_long_opts(int argc, char **argv)
         }
         for (k = 0; LONG_OPTS[k].name != NULL; k++) {
             if (strcmp(a + 1, LONG_OPTS[k].name) == 0) {
+                /* 不检查 snprintf 的返回值: 目标 24 字节, 而 `-` + 表里最长的名字
+                 * (`segment-mb`) 只有 12 字节 ⇒ **截断在数学上不可能**(§5.2 的本意
+                 * 是"别吞掉可能失败的返回值", 这里不存在这种可能)。 */
                 (void)snprintf(g_longfix[used], sizeof(g_longfix[used]),
                                "-%s", a);
                 argv[i] = g_longfix[used];      /* "-no-record" → "--no-record" */
