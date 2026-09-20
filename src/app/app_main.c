@@ -155,8 +155,14 @@ typedef struct {
  *    (2026-09-19 修的 B040):原来它们交给 `getopt()` 之后**一个都不生效** ——
  *    `-no-record` 被当成选项簇 → `-n` 不认识 → 直接打印用法退出;
  *    `-h265` 更阴, 被当成 `-h`(帮助)→ **退出码还是 0**, 脚本根本看不出错。
- *    glibc 的 `getopt_long()` **接受单横线长选项**(`-no-record` 与 `--no-record` 等价),
- *    所以文档里的写法不用改, 功能就修好了。
+ *
+ * ⚠️⚠️ **2026-09-20 补修(B045)**:上面那次只把解析器换成了 `getopt_long()`, 而
+ *    glibc 的 `getopt_long()` **只认双横线**(`--no-record`)—— 单横线的多字符参数
+ *    仍然按"选项簇"拆 ⇒ **用法和 README 里写的那套写法(`-no-record`)依旧全废**。
+ *    当时那句注释("glibc 的 getopt_long() 接受单横线长选项")是**没验过就写下的断言**。
+ *    现在用 `normalize_long_opts()` 在解析前把**已知名字**的单横线写法改写成双横线。
+ *    为什么不用 `getopt_long_only()`:它会让 `-h` 与 `-h265`/`-help` **前缀歧义**,
+ *    glibc 对歧义直接报错 ⇒ 会砸掉最常用的 `-h`。
  */
 #define OPT_H265       0x101
 #define OPT_NO_OSD     0x102
@@ -164,7 +170,7 @@ typedef struct {
 #define OPT_NO_RAW     0x104
 #define OPT_NO_HTTP    0x105
 
-/** 长选项表(单横线写法也认, 见上面的说明) */
+/** 长选项表(`--名字` 与 `-名字` 两种写法都认, 见 `normalize_long_opts()`) */
 static const struct option LONG_OPTS[] = {
     { "port",       required_argument, NULL, 'p' },
     { "bind",       required_argument, NULL, 'b' },
@@ -181,6 +187,51 @@ static const struct option LONG_OPTS[] = {
     { "help",       no_argument,       NULL, 'h' },
     { NULL,         0,                 NULL, 0 }
 };
+
+/** `normalize_long_opts()` 的改写缓冲(文件级静态: 运行期不做动态分配) */
+#define APP_LONGFIX_MAX 16
+#define APP_LONGFIX_LEN 24                          /* "--segment-mb" 才 12 字节 */
+static char g_longfix[APP_LONGFIX_MAX][APP_LONGFIX_LEN];
+
+/**
+ * @brief 把"单横线长选项"原地改写成"双横线"(写法兼容, 见上面 B045 说明)
+ *
+ * @param[in]     argc 参数个数
+ * @param[in,out] argv 参数数组(**只换指针**, 不动原字符串)
+ * @return 改写了几个
+ *
+ * @note **只认表里的完整名字**:`-no-record` 会改, `-no-rec`(缩写)不改 ——
+ *       缩写仍然要走双横线(`--no-rec`), 这条规则简单、不会和短选项打架。
+ * @note 名字对不上的(短选项 `-p`、选项簇、未知选项)一律原样交给 `getopt_long`,
+ *       所以 `-p 8554` / `-s 300` / 未知选项报错这些行为**一点没变**。
+ * @note ⚠️ 只在**启动时**调用一次, 改的是 `argv` 里的指针, 指向的静态缓冲
+ *       在进程生命周期内一直有效。
+ */
+static int normalize_long_opts(int argc, char **argv)
+{
+    int used = 0;
+    int i;
+
+    for (i = 1; i < argc && used < APP_LONGFIX_MAX; i++) {
+        const char *a = argv[i];
+        int         k;
+
+        if (a == NULL || a[0] != '-' || a[1] == '-' || a[1] == '\0') {
+            continue;                   /* `--x` / `-` / 非选项: 不动 */
+        }
+        for (k = 0; LONG_OPTS[k].name != NULL; k++) {
+            if (strcmp(a + 1, LONG_OPTS[k].name) == 0) {
+                (void)snprintf(g_longfix[used], sizeof(g_longfix[used]),
+                               "-%s", a);
+                argv[i] = g_longfix[used];      /* "-no-record" → "--no-record" */
+                used++;
+                break;
+            }
+        }
+    }
+    return used;
+}
+
 
 /**
  * @brief 打印命令行用法
@@ -232,6 +283,10 @@ static int parse_args(int argc, char **argv, app_opts_t *o)
     o->http_port   = SVC_HTTP_DEFAULT_PORT;
     o->verbose     = 0;
 
+    /* ★ 先把 `-no-record` 这类**单横线长选项**改写成 `--` 双横线(B045),
+     *   否则下面的 getopt_long() 会把它们拆成选项簇, 一个都不生效。 */
+    (void)normalize_long_opts(argc, argv);
+
     while ((opt = getopt_long(argc, argv, "p:b:r:s:m:H:hv", LONG_OPTS, NULL)) != -1) {
         switch (opt) {
         case 'p': o->port       = (uint16_t)atoi(optarg); break;
@@ -280,7 +335,7 @@ static void report(int secs)
            " | ★帧龄 现/最小/最大 %.0f/%.0f/%.0f ms 漂移 %.0f ms"
            " | OSD %llu 次/错 %llu"
            " | 录制 %llu 段/%llu 帧 删 %llu 丢 %llu 错 %llu"
-           " | 回放 %llu 请求/%llu 是206\n",
+           " | 回放 %llu 请求/%llu 是206/切段 %llu\n",
            secs,
            (unsigned long long)ms.frames,
            (unsigned long long)ss.frames_sent,
@@ -301,7 +356,8 @@ static void report(int secs)
            (unsigned long long)ms.record_dropped,
            (unsigned long long)rs.write_errors,
            (unsigned long long)hs.requests,
-           (unsigned long long)hs.partials);
+           (unsigned long long)hs.partials,
+           (unsigned long long)hs.rotates);
     fflush(stdout);
 }
 
