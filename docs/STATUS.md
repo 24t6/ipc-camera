@@ -13,7 +13,7 @@
 - **A23 数据面板 + `/stats` 7/7 ✅**(段数与卡上文件对账 178==178、磁盘 23%、采样环在走、
   页面 JS 过 `node --check`)
 
-**⚠️ 更早的验收(A4~A21)在本轮没有重跑** —— 本轮改过 `svc_http.c` / `svc_live.c` /
+**回归(本轮已重跑, 全绿)**:A19 列表/分页/锁定 **12/12**、A20 看最新 **17/17**、A23 数据面板 **7/7**、A22 实时 **16/16**(在**默认 20fps** 下)。更早的 A4~A18(录制/掉电/环形/多客户端)本轮未重跑 —— 本轮没碰那些代码路径。 —— 本轮改过 `svc_http.c` / `svc_live.c` /
 `svc_record.c` / `svc_http_page.c`。回归清单(下一步就跑):
 `work/verify_list_fix.py`(列表+分页+锁定) / `work/verify_recent.py`(看最新) /
 `work/verify_stats_panel.py`(数据面板)。
