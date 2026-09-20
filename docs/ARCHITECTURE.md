@@ -226,6 +226,8 @@ VENC 的编码缓冲有限(实测 `HI_MPI_VENC_GetStream` 后必须尽快 `Relea
 | **锁定清单缓存**(`g_locks`) | `svc_record` | 录制线程(重读) / HTTP 线程(查与改) | **互斥锁** `g_lock_mtx`,临界区只有几百字节 | 改清单用"写 `.tmp` → `fsync` → `rename`" |
 | **分段扫描表**(`g_scan`/`g_del`) | `svc_record` 录制线程 | 无 | — | **刻意不共享**:回放列表走另一条扫描,用调用方数组 |
 | **HTTP 客户端连接** | `svc_http` http 线程 | 无 | 串行处理(一次一个) | 非阻塞 + 有界读 + 有界发送(见 ADR-5) |
+| **MJPEG 编码通道**(VENC chn2 + VPSS chn2) | `svc_live` live 线程**按需**开/关 | 无 | 只有 live 线程碰它 | 最后一个客户端走 ⇒ 解绑/停收流/销毁(见 A22) |
+| **实时客户端连接**(≤4 个) | `svc_live` live 线程 | 无 | 单线程 poll 多路复用 | 写不动就丢该客户端(不缓存待发数据) |
 | **日志** | `infra_log` | 所有线程 | 互斥锁,极短临界区 | 写失败只降级不崩溃 |
 
 > **"唯一所有者"是硬约束**:任何对象同一时刻只能有一个线程能改它。
@@ -275,6 +277,7 @@ VENC 的编码缓冲有限(实测 `HI_MPI_VENC_GetStream` 后必须尽快 `Relea
 | `proto_http` | `proto_http_parse()`, `proto_http_match_path()`, `proto_http_name_ok()`, `proto_http_build_head()` | `proto_str` |
 | `svc_http` | `svc_http_start()`, `svc_http_stop()`, `svc_http_port()`, `svc_http_get_stats()` | `proto_http`, `svc_record`, `infra_netio` |
 | `svc_http_page` | 回放页面(一段常量 HTML;**浏览器就是客户端**) | 无 |
+| `svc_live` | `svc_live_start()`, `svc_live_stop()`, `svc_live_port()`, `svc_live_get_stats()` | `proto_http`, **`bsp_mpp`**(按需开/关那路 MJPEG), `infra_netio` |
 
 ---
 
@@ -291,6 +294,7 @@ ipc_camera/
 │   ├── service/   svc_media.c/h  svc_net.c/h  svc_sender.c/h  svc_osd.c/h
 │   │              svc_record.c/h  svc_record_policy.c/h  svc_record_mp4.h
 │   │              svc_http.c/h  svc_http_page.c/h  ← 阶段 2 回放服务 + 板子自带页面
+│   │              svc_live.c/h                      ← 实时画面(MJPEG, 独立端口 8081)
 │   ├── protocol/  proto_nalu.c/h  proto_rtp.c/h  proto_rtsp.c/h
 │   │              proto_sdp.c/h   proto_str.c/h   proto_http.c/h
 │   └── infra/     infra_queue.c/h  infra_netio.c/h  infra_poll.c/h  infra_log.c/h
@@ -316,6 +320,6 @@ ipc_camera/
 | 9 | **列表只给最新一页 + `?before=` 翻页 + `/status`(正在录的那段) + 页面自刷新** | ✅ 完成(A19, 修 B044) |
 | 10 | **② `/recent.mp4`**:"刚录的这段"立刻能看 —— 请录制线程在下一个 IDR 处把当前段**收尾**, 再把刚收尾的整段发出去(缺口从"段长"降到 1 秒) | ✅ 完成(A20: 上板 17/17) |
 | 11 | **命令行长选项两种横线都认**(`-no-record` == `--no-record`) | ✅ 完成(A21, 修 B045) |
-| 12 | **③ 实时画面进浏览器**:硬件 JPEG 通道 + MJPEG(`/live.mjpg`)。⚠️ 通道必须**按需启停** —— 没人取流的编码通道会拖死整条流水线(B027) | ⬜ 未开始 |
+| 12 | **③ 实时画面进浏览器**:硬件 MJPEG 通道 + `/live.mjpg`(独立端口 8081) | ✅ 完成(A22: 上板 16/16) |
 | 13 | (可选)自研 C 客户端:**SDL2 + FFmpeg**(可选 ImGui);seek 直接映射成 HTTP `Range` | ⬜ 想讲"解复用→解码→上屏"时再做 |
 | 14 | (可选)接入第三方 NVR(Frigate / ZoneMinder)证明标准可接入 | ⬜ |
