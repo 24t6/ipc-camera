@@ -78,6 +78,16 @@
  *      "摄像头在 sensor1"这一条信息同时体现在三个地方,
  *      只改一个不等于改对了一组(我漏了 ViDev,代价是排查十几轮)。
  */
+
+/*
+ * ⚠️ 为什么这里**硬编码**而不用 SDK 的 `SAMPLE_COMM_VI_GetComboDevBySensor()`:
+ *    那个函数里**没有 GC2053 的分支**,走到 `default` 就返回 **0** ——
+ *    也就是把 MipiDev 指到**空槽 sensor0**。它的报障方式还特别绕:
+ *    VI 一帧不出、日志刷 `I2C_WRITE error`、`select()` 每 2 秒报一次
+ *    `get venc stream time out`(三个症状我们都先后当成过别的原因,
+ *    见 `docs/问题与解决记录.md` 的 B001/B002/B019)。
+ *    板子实测的真相是**摄像头在 sensor1** ⇒ 直接写 1,不去改厂商 SDK。
+ */
 #define BSP_MIPI_DEV        1       /* stSnsInfo.MipiDev  */
 #define BSP_I2C_BUS         1       /* stSnsInfo.s32BusId */
 #define BSP_VI_DEV          1       /* stDevInfo.ViDev    ← 最容易漏 */
