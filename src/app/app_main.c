@@ -142,6 +142,7 @@ typedef struct {
     int         is_h265;
     int         no_osd;      /**< 1 = 不叠时间水印(默认叠) */
     int         no_record;   /**< 1 = 不录 MP4(默认录到 /mnt/sdcard) */
+    const char *rec_dir;     /**< 录制目录;默认 APP_REC_DIR。⚠️ **必须是已挂载的目录** */
     int         no_raw;      /**< 1 = 不写旁路裸流侧车(默认写;掉电后可救前一段) */
     int         no_http;     /**< 1 = 不起回放服务(默认起) */
     int         no_live;     /**< 1 = 不起实时(MJPEG)服务(默认起) */
@@ -182,6 +183,7 @@ typedef struct {
 static const struct option LONG_OPTS[] = {
     { "port",       required_argument, NULL, 'p' },
     { "bind",       required_argument, NULL, 'b' },
+    { "dir",        required_argument, NULL, 'd' },
     { "ring",       required_argument, NULL, 'r' },
     { "segment",    required_argument, NULL, 's' },
     { "segment-mb", required_argument, NULL, 'm' },
@@ -269,6 +271,8 @@ static void usage(const char *prog)
     printf("用法: %s [选项]\n"
            "  -p <端口>   RTSP 端口(默认 %d)\n"
            "  -b <地址>   监听地址(默认 0.0.0.0)\n"
+           "  -d <目录>   录制目录(默认 " APP_REC_DIR ")。⚠️ **必须是已挂载的目录**\n"
+           "              —— 不是挂载点就**拒绝录制**(卡没挂上时往里写 = 写 flash)\n"
            "  -h265       取 H.265 那一路(默认 H.264)\n"
            "  -no-osd     不叠时间水印(默认在右上角叠)\n"
            "  -no-record  不录 MP4(默认录到 " APP_REC_DIR ")\n"
@@ -302,6 +306,7 @@ static int parse_args(int argc, char **argv, app_opts_t *o)
 
     o->port        = APP_DEFAULT_PORT;
     o->bind_ip     = "0.0.0.0";
+    o->rec_dir     = APP_REC_DIR;
     o->is_h265     = 0;
     o->no_osd      = 0;
     o->no_record   = 0;
@@ -321,10 +326,11 @@ static int parse_args(int argc, char **argv, app_opts_t *o)
      *   否则下面的 getopt_long() 会把它们拆成选项簇, 一个都不生效。 */
     (void)normalize_long_opts(argc, argv);
 
-    while ((opt = getopt_long(argc, argv, "p:b:r:s:m:H:L:hv", LONG_OPTS, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "p:b:d:r:s:m:H:L:hv", LONG_OPTS, NULL)) != -1) {
         switch (opt) {
         case 'p': o->port       = (uint16_t)atoi(optarg); break;
         case 'b': o->bind_ip    = optarg;                 break;
+        case 'd': o->rec_dir    = optarg;                 break;
         case 'r': o->rec_mb     = atoi(optarg);           break;
         case 's': o->rec_seg    = atoi(optarg);           break;
         case 'm': o->rec_seg_mb = atoi(optarg);           break;
@@ -579,7 +585,7 @@ static int start_record(const app_opts_t *o, int *started)
     }
     bsp_mpp_get_encoder_size(&w, &h);
     memset(&rec, 0, sizeof(rec));
-    rec.dir            = APP_REC_DIR;
+    rec.dir            = o->rec_dir;
     rec.width          = w;
     rec.height         = h;
     rec.limit_bytes    = (o->rec_mb > 0) ? (uint64_t)o->rec_mb * 1024 * 1024 : 0;
@@ -598,7 +604,7 @@ static int start_record(const app_opts_t *o, int *started)
     *started |= 16;
     printf("录制      : %s · %dx%d · 每段 %d 秒 或 %d MB(谁先到算谁, 边界对齐关键帧)"
            " · 环形上限 %d MB · 旁路裸流 %s\n",
-           APP_REC_DIR, w, h,
+           o->rec_dir, w, h,
            (o->rec_seg > 0) ? o->rec_seg : SVC_RECORD_DEFAULT_SEGMENT_SEC,
            (o->rec_seg_mb > 0) ? o->rec_seg_mb : SVC_RECORD_DEFAULT_SEGMENT_MB,
            o->rec_mb, o->no_raw ? "关" : "开");
@@ -797,7 +803,9 @@ int main(int argc, char **argv)
     printf("编码      : %s\n", o.is_h265 ? "H.265 (VENC chn0)" : "H.264 (VENC chn1)");
     printf("RTSP 监听 : %s:%u\n", o.bind_ip, (unsigned)o.port);
     printf("OSD 水印  : %s\n", o.no_osd ? "关闭" : "右上角时间(每秒更新)");
-    printf("录制      : %s\n", o.no_record ? "关闭" : APP_REC_DIR " 的 MP4 分段");
+    printf("录制      : %s\n", o.no_record ? "关闭"
+           : "MP4 分段(见下面那行目录)");
+    printf("录制目录  : %s(⚠️ 不是挂载点会拒绝录制, 见 -d)\n", o.rec_dir);
     printf("回放服务  : %s\n", o.no_http ? "关闭"
            : "HTTP(列分段 / Range 取流 / 锁定)");
     printf("拉流地址  : rtsp://<板子IP>:%u/live\n\n", (unsigned)o.port);

@@ -356,6 +356,46 @@ static void test_lock_list(void)
     CHECK(n == -1, "★ 名字含换行 → 拒绝(否则能注入清单)");
 }
 
+/**
+ * @brief `svc_record_policy_mount_line_matches()`:一行 `/proc/mounts` 是不是把
+ *        某个目录当挂载点(2026-09-21 新增, 起因是 B053 把录像写进了 flash)
+ */
+static void test_mount_line(void)
+{
+    /* 板子上真实的 /proc/mounts 行(照抄实测输出) */
+    const char *mmc = "/dev/mmcblk0p1 /mnt/sdcard vfat rw,relatime,fmask=0022 0 0\n";
+    const char *root = "/dev/root / jffs2 rw,relatime 0 0\n";
+    const char *tmp = "tmpfs /tmp tmpfs rw,relatime 0 0\n";
+
+    printf("\n----- 挂载点判断(/proc/mounts 的一行)-----\n");
+
+    CHECK(svc_record_policy_mount_line_matches(mmc, "/mnt/sdcard") == 1,
+          "★ /mnt/sdcard 命中(卡真的挂着)");
+    CHECK(svc_record_policy_mount_line_matches(mmc, "/mnt/sdcard/") == 1,
+          "★ 尾斜杠也要命中");
+    CHECK(svc_record_policy_mount_line_matches(root, "/") == 1,
+          "★ 根挂载点命中");
+    CHECK(svc_record_policy_mount_line_matches(tmp, "/tmp") == 1,
+          "★ tmpfs 也算挂载点(它本身就是个设备)");
+
+    CHECK(svc_record_policy_mount_line_matches(mmc, "/mnt/sdcard2") == 0,
+          "★ 前缀相同但不是同一个目录 —— 不许命中(B053 要拦的正是这种)");
+    CHECK(svc_record_policy_mount_line_matches(mmc, "/mnt/sdcard/sub") == 0,
+          "★ 挂载点下面的子目录不算挂载点(它可能落在 flash 上)");
+    CHECK(svc_record_policy_mount_line_matches(mmc, "/mnt/other") == 0,
+          "别的目录不命中");
+    CHECK(svc_record_policy_mount_line_matches("", "/mnt/sdcard") == 0,
+          "空行安全返回 0");
+    CHECK(svc_record_policy_mount_line_matches("garbage\n", "/mnt/sdcard") == 0,
+          "只有一个字段的垃圾行返回 0");
+    CHECK(svc_record_policy_mount_line_matches(NULL, "/mnt/sdcard") == 0,
+          "NULL 行返回 0");
+    CHECK(svc_record_policy_mount_line_matches(mmc, NULL) == 0,
+          "NULL 路径返回 0");
+    CHECK(svc_record_policy_mount_line_matches(mmc, "") == 0,
+          "空路径返回 0");
+}
+
 int main(void)
 {
     printf("==== 录制策略(纯函数)PC 单测 ====\n");
@@ -366,6 +406,7 @@ int main(void)
     test_lock();
     test_sort();
     test_lock_list();
+    test_mount_line();
 
     printf("\n==== 结果: %d 通过 / %d 失败 ====\n", g_pass, g_fail);
     return (g_fail == 0) ? 0 : 1;

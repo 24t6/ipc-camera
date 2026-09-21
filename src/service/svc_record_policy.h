@@ -169,4 +169,23 @@ int svc_record_policy_lock_has(const char *buf, size_t used, const char *name);
  */
 int svc_record_policy_oldest_index(const svc_record_policy_file_t *files, int count);
 
+/**
+ * @brief 一行 `/proc/mounts` 的**挂载点**是不是 `path`(纯函数)
+ *
+ * @param[in] line `/proc/mounts` 的一行(形如
+ *                 `/dev/mmcblk0p1 /mnt/sdcard vfat rw,relatime 0 0`)
+ * @param[in] path 要确认的目录(容忍尾斜杠, 如 `/mnt/sdcard/`)
+ * @return 1 = 这一行说明 `path` 是个挂载点; 0 = 不是(或参数非法)
+ *
+ * @note ★ **为什么需要它**(B053, 2026-09-21):TF 卡没挂上时,`/mnt/sdcard` 只是 rootfs 里的
+ *       **一个普通空目录** —— 录制会**照样成功**(`fopen` 不报错)⇒ 录像**写进 flash**
+ *       (实测把 27 MB 的 rootfs 录到只剩 332 KB)。**挂载点不是一个路径, 是一个设备**;
+ *       要确认"这个目录后面真的有设备", 只能去查挂载表。
+ * @note 只做**字符串**比较:取第 2 个空白分隔字段与 `path` 比。**不做** `/proc/mounts`
+ *       的转义还原(它把空格写成 `\040`)—— 见 `svc_record.c` 里调用处的【简化上限】。
+ * @note 放这一层是为了**能在 PC 上单测**(本函数不碰文件系统, 只吃一段文本),
+ *       读文件那半在 `svc_record.c`。
+ */
+int svc_record_policy_mount_line_matches(const char *line, const char *path);
+
 #endif /* __SVC_RECORD_POLICY_H__ */

@@ -283,3 +283,38 @@ int svc_record_policy_lock_edit(char *buf, size_t cap, size_t used,
     buf[w] = '\0';
     return (int)w;
 }
+
+int svc_record_policy_mount_line_matches(const char *line, const char *path)
+{
+    size_t i = 0;
+    size_t n;
+    size_t pn;
+
+    if (line == NULL || path == NULL || path[0] == '\0') {
+        return 0;
+    }
+    /* 第 1 个字段是设备名, 跳过它 */
+    while (line[i] != '\0' && line[i] != ' ' && line[i] != '\t') {
+        i++;
+    }
+    while (line[i] == ' ' || line[i] == '\t') {
+        i++;
+    }
+    /* 第 2 个字段 = 挂载点; 到空白或行尾为止 */
+    n = i;
+    while (line[n] != '\0' && line[n] != ' ' && line[n] != '\t'
+           && line[n] != '\n') {
+        n++;
+    }
+    if (n == i) {
+        return 0;                       /* 没有第 2 个字段(空行/垃圾行) */
+    }
+    pn = strlen(path);
+    while (pn > 1 && path[pn - 1] == '/') {
+        pn--;                           /* 容忍 `/mnt/sdcard/` 这种尾斜杠 */
+    }
+    if (n - i != pn) {
+        return 0;                       /* 长度先比一次, 省掉整串比较 */
+    }
+    return (strncmp(line + i, path, pn) == 0) ? 1 : 0;
+}

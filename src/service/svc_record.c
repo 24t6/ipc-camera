@@ -82,6 +82,7 @@ static struct {
     uint64_t         max_seg_bytes;                     /* 见过的最大段(=预留依据) */
     int              alerted_ro;                        /* 1 = 已经报过"卡变只读" */
     int              alerted_tiny;                      /* 1 = 已经报过"盘比预留还小" */
+    int              alerted_unmounted;                 /* 1 = 已经报过"目录不再是挂载点" */
 
     svc_record_stats_t stats;
 } g;
@@ -739,6 +740,74 @@ static void cleanup_tmp_files(void)
 /* ─────────── 分段开关 ─────────── */
 
 /**
+ * @brief `dir` 到底是不是一个**挂载点** —— 也就是"这个目录后面真有设备吗"
+ *
+ * @param[in] dir 目录(如 `/mnt/sdcard`)
+ * @return 1 = 是挂载点; 0 = 不是(或确认不了 —— 见下面的 fail-closed 说明)
+ *
+ * @note ★ **为什么必须有这道闸**(B053, 2026-09-21 的事故):卡没挂上时,
+ *       `/mnt/sdcard` 只是 rootfs 里的**一个普通空目录** —— 录制会**照样成功**
+ *       (`fopen` 不报错、`statvfs` 也有数), 于是**录像被写进 flash**:
+ *       实测把 27 MB 的 rootfs 录到只剩 **332 KB**。
+ *       **"录上了" 不等于 "录对设备了"** —— 挂载点不是一个路径, 是一个设备。
+ * @note ⚠️ 读不到 `/proc/mounts` 时**返回 0(拒绝录制)** —— fail-closed:
+ *       这道闸存在的全部意义就是防"静默写 flash", 让一次 I/O 错误把它绕过去,
+ *       等于没装闸。宁可这一段不录(用户看得见), 也不写坏固件。
+ * @note 【简化上限】只按**字符串**比 `/proc/mounts` 的第 2 个字段, **不做转义还原**
+ *       (该文件把路径里的空格写成 `\040`)⇒ 路径带空格的挂载点识别不了。
+ *       我们的 `/mnt/sdcard`、`/mnt/nfs` 都没有空格;真要支持就先反转义再比。
+ * @note 只比较 == 挂载点本身(不做"前缀包含"):`/mnt/sdcard/sub` 这种子目录**不算** ——
+ *       它同样可能落在 flash 上。
+ * @note 执行线程:录制线程(开新段前)、以及 `svc_record_start()`(起线程前)。
+ */
+static int dir_is_mount_point(const char *dir)
+{
+    FILE *f;
+    char  line[512];
+    int   hit = 0;
+
+    if (dir == NULL || dir[0] == '\0') {
+        return 0;
+    }
+    f = fopen("/proc/mounts", "r");
+    if (f == NULL) {
+        LOG_ERROR("录制: 读不到 /proc/mounts —— **无法确认** %s 是否挂载, 按"
+                  "\"拒绝录制\"处理(宁可不录, 也不写 flash)", dir);
+        return 0;
+    }
+    while (fgets(line, sizeof(line), f) != NULL) {
+        if (svc_record_policy_mount_line_matches(line, dir)) {
+            hit = 1;
+            break;
+        }
+    }
+    fclose(f);
+    return hit;
+}
+
+/**
+ * @brief 开新段之前的"目录还是挂载点吗"闸门(每次开段都查一次)
+ *
+ * @return 1 = 可以开新段; 0 = 不能开(已经报过一次错, 不会每帧刷日志)
+ *
+ * @note 抽出来是为了**守住函数规模**(§9.1: 代码行 ≤ 50)——
+ *       这段逻辑塞回 `open_segment()` 会让它变成 53 行。
+ * @note 运行中把卡拔了 / 卡掉线, 之后新开的段就会落在 flash 上(B053)。
+ */
+static int segment_dir_ok(void)
+{
+    if (dir_is_mount_point(g.dir)) {
+        g.alerted_unmounted = 0;        /* 恢复正常: 下次再出问题要重新报 */
+        return 1;
+    }
+    if (!g.alerted_unmounted) {
+        g.alerted_unmounted = 1;
+        LOG_ERROR("录制: ⚠️ %s 已经不是挂载点(卡被拔了?) —— **停止开新段**", g.dir);
+    }
+    return 0;
+}
+
+/**
  * @brief 开一个新分段(用**当前时间**命名)
  *
  * @return 0 成功; -1 失败(时间取不到 / 名字放不下 / MP4Create 失败)
@@ -751,6 +820,14 @@ static int open_segment(void)
     struct tm tmv;
     time_t    now = time(NULL);
     size_t    n;
+
+    /*
+     * ★ 开新段之前**再确认一次**"这个目录还是不是挂载点"(B053):
+     *   运行中把卡拔了 / 卡掉线, 之后新开的段就会落在 flash 上。
+     */
+    if (!segment_dir_ok()) {
+        return -1;
+    }
 
     if (localtime_r(&now, &tmv) == NULL) {
         return -1;
@@ -1402,6 +1479,21 @@ int svc_record_start(const svc_record_cfg_t *cfg, void *queue)
     g.path_raw[0]    = '\0';
     g.stop_requested = 0;
     g.running        = 1;
+
+    /*
+     * ★★ B053 的闸门:录制之前先确认"那个目录是不是它以为的那个设备"。
+     *    卡没挂上时 `<dir>` 只是 rootfs 里的一个空目录 —— 录制会照样成功,
+     *    录像就写进 flash 了(实测把 27 MB 的 rootfs 录到只剩 332 KB)。
+     *    ⚠️ 返回 **0 而不是错误码**:`app_main` 把 `svc_record_start()` 的非 0 当成
+     *    "整机启动失败", 而我们只要"不录" —— 推流/回放/页面都必须照常。
+     *    没起线程 ⇒ `svc_record_is_running()` 为假, 页面与 `/status` 会如实显示"没在录"。
+     */
+    if (!dir_is_mount_point(g.dir)) {
+        g.running = 0;
+        LOG_ERROR("录制: ⚠️ %s **不是挂载点**(TF 卡没挂上?) —— 拒绝录制, "
+                  "绝不往 flash 写。推流/回放不受影响", g.dir);
+        return 0;
+    }
 
     warn_cfg();
 
