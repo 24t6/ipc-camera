@@ -293,7 +293,12 @@ function fmt(n){n=n||0;
   if(n>=1048576)return (n/1048576).toFixed(1)+' MB';
   if(n>=1024)return (n/1024).toFixed(0)+' KB';
   return n+' B';}
-function t9(s){return (s||'').substr(11,8);}
+/* 段名形如 `2026-09-21-21-01-46.mp4` —— 列表/横幅/toast 一律显示**完整日期+时间**,
+   形如 `2026-09-21 21:01:46`(冒号, 与主流 NVR/IPC 界面一致)。
+   原实现只取 `substr(11,8)`(即 `HH-MM-SS`), 于是"不知道是哪一天的"
+   (用户 2026-09-21 反馈)。⚠️ 长度不足 19 的异常名原样返回, 不截不猜。 */
+function dt(s){s=s||'';return s.length>=19?
+  s.substr(0,10)+' '+s.substr(11,8).replace(/-/g,':'):s;}
 function hm(sec){var m=Math.floor((sec||0)/60);
   return m>=60?Math.floor(m/60)+' 小时 '+(m%60)+' 分':m+' 分钟';}
 function toast(msg,bad){var d=document.createElement('div');
@@ -377,7 +382,7 @@ function drawStats(){
     ' 人 · 档位 '+lv+'fps/q'+lq+'</td><td class=n>'+(last[4]||0)+' 人</td></tr>';
   t+='<tr><td>回放 HTTP</td><td>串行: 一次只服务一个请求</td><td class=n>'+
     (http.files||0)+' 次 / '+fmt(http.bytes_sent)+'</td></tr>';
-  t+='<tr><td>录制</td><td>'+(rec.recording?'正在录 '+t9(rec.name)+
+  t+='<tr><td>录制</td><td>'+(rec.recording?'正在录 '+dt(rec.name)+
     ' · 本段 '+fmt(rec.cur_bytes):'未在录')+'</td><td class=n>'+
     (rec.segments||0)+' 段 / 删 '+(rec.deleted||0)+' / 错 '+
     (rec.write_errors||0)+'</td></tr>';
@@ -403,7 +408,7 @@ function addRow(i,rec){
   var main=document.createElement('button');main.type='button';main.className='rowmain';
   main.setAttribute('data-name',rec?rec.name:s.name);   /* 全名也给出来: 深链/自动化要它 */
   var t=document.createElement('div');t.className='t num';
-  t.textContent=rec?t9(rec.name):t9(s.name);
+  t.textContent=rec?dt(rec.name):dt(s.name);
   var m=document.createElement('div');m.className='m';
   m.appendChild(document.createTextNode(fmt(rec?rec.bytes:s.size)));
   if(s&&s.locked){var g=document.createElement('span');g.className='tag lock';
@@ -441,9 +446,9 @@ function render(){
     addRow(k,null);
     var b=document.createElement('button');b.type='button';
     b.className='blk'+(segs[k].locked?' lock':'')+(k===sel?' cur':'');
-    b.title=t9(segs[k].name)+' · '+fmt(segs[k].size)+
+    b.title=dt(segs[k].name)+' · '+fmt(segs[k].size)+
       (segs[k].locked?' · 已锁定':'');
-    b.setAttribute('aria-label','播放 '+t9(segs[k].name));
+    b.setAttribute('aria-label','播放 '+dt(segs[k].name));
     b.style.width=Math.max(0.6,segs[k].size/sumsz*100)+'%';
     b.onclick=function(x){return function(){play(x);};}(k);
     bar.appendChild(b);
@@ -469,7 +474,7 @@ async function loadStatus(){try{
   if(d.recording){reclen=d;
     var grew=Math.max(0,Math.floor((Date.now()/1000)-d.started_at));
     $('recdot').className='dot on';
-    $('stat').textContent='正在录 '+t9(d.name)+' · 已 '+hm(grew)+
+    $('stat').textContent='正在录 '+dt(d.name)+' · 已 '+hm(grew)+
       ' · '+fmt(d.bytes);
   }else{reclen=0;$('recdot').className='dot';
     $('stat').textContent='没有在录';}
@@ -489,8 +494,8 @@ function openHash(){
   for(k=0;k<segs.length;k++)if(segs[k].name===n){play(k);return;}
 }
 function play(i){var s=segs[i];if(!s)return;sel=i;liveOff();
-  showOnly('video');$('v').src=s.uri;badge('回放 '+t9(s.name));
-  $('cur').textContent=s.name;
+  showOnly('video');$('v').src=s.uri;badge('回放 '+dt(s.name));
+  $('cur').textContent=dt(s.name);
   if(location.hash.indexOf('#s='+encodeURIComponent(s.name))<0)
     location.hash='s='+encodeURIComponent(s.name);
   render();
@@ -503,7 +508,7 @@ function liveOff(){if(mode==='live'){$('live').removeAttribute('src');}
   $('livepill').hidden=true;setLiveBtn(false);
   if(mode==='live'){mode='none';showOnly(sel>=0?'video':'none');
     if(sel>=0){$('v').src=segs[sel].uri;$('v').play().catch(function(){});}
-    badge(sel>=0?'回放 '+t9(segs[sel].name):'未播放');}}
+    badge(sel>=0?'回放 '+dt(segs[sel].name):'未播放');}}
 function liveOnClick(){if(liveOn()){liveOff();$('cur').textContent='实时已关';
     return;}
   if(!liveUrl){toast('这台设备的实时画面没开(-no-live 起的)',1);return;}
@@ -520,18 +525,18 @@ async function recent(){try{
   if(!n)throw new Error('应答里没有 X-Recent-Clip');
   await loadList();
   var k=0,q;for(q=0;q<segs.length;q++)if(segs[q].name===n)k=q;
-  play(k);toast('已收尾并开始播放: '+n);
+  play(k);toast('已收尾并开始播放: '+dt(n));
  }catch(e){fail(e);}setBusy(false);
  $('brec').textContent='看最新(收尾当前段)';}
 async function lock(i){var s=segs[i];if(!s)return;
   var want=s.locked?0:1;s.locked=want;render();
   try{var r=await fetch(s.lock_uri,{method:'PUT',body:String(want)});
     if(!r.ok)throw new Error('HTTP '+r.status);
-    toast(want?'已锁定: '+t9(s.name):'已解锁: '+t9(s.name));
+    toast(want?'已锁定: '+dt(s.name):'已解锁: '+dt(s.name));
   }catch(e){s.locked=want?0:1;render();fail(e);}}
 function save(i){var s=segs[i];if(!s)return;var a=document.createElement('a');
   a.href=s.uri;a.download=s.name;document.body.appendChild(a);a.click();
-  a.remove();toast('开始下载 '+t9(s.name));}
+  a.remove();toast('开始下载 '+dt(s.name));}
 function snap(){if(!liveOn()){if(sel>=0)save(sel);
     else toast('先播放点什么, 或打开实时画面',1);return;}
   try{var im=$('live');var c=document.createElement('canvas');
