@@ -216,7 +216,7 @@ VENC 的编码缓冲有限(实测 `HI_MPI_VENC_GetStream` 后必须尽快 `Relea
 | 对象 | 唯一所有者 | 访问者 | 通信/同步 | 停止与错误恢复 |
 |---|---|---|---|---|
 | **MPP 通路**(VI/VPSS/VENC) | `svc_media` | 无(取流线程独占) | — | 退出时按反序 UnBind/Stop/Destroy |
-| **VENC fd** | `svc_media` 取流线程 | epoll | epoll 边沿触发 | 句柄失效则退出线程并标记服务不可用 |
+| **VENC 码流** | `svc_media` 取流线程 | 无 | ⚠️ **不是 epoll**:先 `HI_MPI_VENC_QueryStatus` 每 5 ms 轮询到 `u32CurPacks>0`,再 `HI_MPI_VENC_GetStream(-1)` **阻塞取**,拷完立刻 `ReleaseStream`(见 `bsp_mpp.c` 的说明) | 取流失败则退出线程并标记服务不可用 |
 | **NALU 缓冲** | 取流线程 | 队列 | 栈上固定数组 + 入队即拷贝 | 单帧超长则丢弃并计数 |
 | **发送队列** | `infra_queue` | 取流线程(生产者) / 发送线程(消费者) | 环形缓冲 + 互斥锁 + 条件变量 | 满则丢最旧 + 计数 |
 | **录制队列** | `infra_queue` | 取流线程(生产) / 录制线程(消费) | 同上 | 满则丢帧 + 计数(录制可容忍) |
@@ -250,7 +250,7 @@ VENC 的编码缓冲有限(实测 `HI_MPI_VENC_GetStream` 后必须尽快 `Relea
 
 **板子内存约束**:`mem=128M`,MMZ 384M。用户态可用约 100MB,规划占用 < 5MB 很安全。
 
-**必须监测的指标**(每 30 秒打一次日志):
+**必须监测的指标**(主线程**每 5 秒**打一次日志 —— `APP_REPORT_SEC = 5`,见 `app_main.c`):
 - 发送队列 / 录制队列**水位**
 - 丢弃帧计数
 - 各客户端发送失败计数
